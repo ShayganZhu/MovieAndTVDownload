@@ -5159,3 +5159,297 @@ def test_startup_precheck_runs_in_standalone_mode(tmp_path, monkeypatch):
     )
     d._run_pipeline()
     assert called == [1], "单独跑下载时预检必须执行"
+
+
+# ---------------------------------------------------------------------------
+# 断点续跑三处缺口（2026-10-22 复审）
+#   ① 中断/崩溃后磁盘上的成品没有上传记录 → 被磁盘扫描永久跳过、永远进不了 R2
+#   ② 启动预检对已完成的片也去重取流 → 续跑时整份 results.jsonl 重取一遍
+#   ③ 磁盘闸门关着时 kill -INT → shutdown(wait=True) 与闸门互等，进程挂死
+# ---------------------------------------------------------------------------
+
+def test_resume_precheck_skips_entries_already_finished(tmp_path, monkeypatch, capsys):
+    """🔴 ②：已上传 / 磁盘成品 / 画质判死的片不进启动预检，只有没完成的陈旧片才去重取。"""
+    now = int(time.time())
+    old = now - 999999
+    hook = _setup_pipeline_precheck(tmp_path, monkeypatch, [
+        {"tmdbId": "1", "urls": ["u"], "fetched_at": old},   # success.jsonl 里
+        {"tmdbId": "2", "urls": ["u"], "fetched_at": old},   # 磁盘上已有成品
+        {"tmdbId": "3", "urls": ["u"], "fetched_at": old},   # 画质判死
+        {"tmdbId": "4", "urls": ["u"], "fetched_at": old},   # 没完成
+    ])
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: {"1"})
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: ({"2"}, {}))
+    monkeypatch.setattr(d, "load_dead_ids", lambda *a, **kw: {"3"})
+    monkeypatch.setattr(d, "S3_ENABLED", False)
+
+    d._run_pipeline()
+
+    assert [e["tmdbId"] for e in hook.dispatched] == ["4"]
+    assert "其中 3 个已完成，不再投递" in capsys.readouterr().out
+
+
+def test_resume_sync_precheck_skips_entries_already_finished(tmp_path, monkeypatch):
+    """单独跑下载（同步预检）同理：已完成的片不交给 refresh_stale_entries。"""
+    now = int(time.time())
+    _setup_pipeline_precheck(tmp_path, monkeypatch, [
+        {"tmdbId": "1", "urls": ["u"], "fetched_at": now - 999999},
+        {"tmdbId": "4", "urls": ["u"], "fetched_at": now - 999999},
+    ])
+    monkeypatch.setattr(d, "ListEntrySource", d._ListEntrySource)
+    monkeypatch.setattr(d, "async_refetch_hook", None)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: {"1"})
+    seen = []
+    monkeypatch.setattr(
+        d, "refresh_stale_entries",
+        lambda entries, counts: seen.extend(e["tmdbId"] for e in entries) or entries,
+    )
+    d._run_pipeline()
+    assert seen == ["4"]
+
+
+def _setup_stranded(tmp_path, monkeypatch, entries=()):
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "async_refetch_hook", None)
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    inp = tmp_path / "in.jsonl"
+    inp.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(inp))
+    uploads = []
+    monkeypatch.setattr(
+        d, "upload_one_entry",
+        lambda info: uploads.append(dict(info)) or (info["tmdbId"], True, info),
+    )
+    return uploads
+
+
+def _put_mp4(tmdb_id, year, size=1024):
+    folder = d.movie_dir(tmdb_id, year)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{tmdb_id}.mp4")
+    with open(path, "wb") as fh:
+        fh.write(b"x" * size)
+    return path
+
+
+def test_stranded_mp4_without_any_record_is_uploaded_on_startup(tmp_path, monkeypatch):
+    """🔴 ①：磁盘上有成品、success.jsonl 里没记录 → 不重下，但必须送去上传。"""
+    uploads = _setup_stranded(tmp_path, monkeypatch, [
+        {"tmdbId": 55, "title": "Stranded", "year": 2001, "urls": ["u"]},
+    ])
+    path = _put_mp4("55", 2001)
+    downloads = []
+    monkeypatch.setattr(d, "process_one_entry",
+                        lambda e, ids: downloads.append(e) or ("55", False, {"error": "x"}))
+
+    d._run_pipeline()
+
+    assert downloads == [], "成品已在本地，绝不能重下"
+    assert len(uploads) == 1
+    job = uploads[0]
+    assert job["tmdbId"] == "55" and job["final_path"] == path
+    assert job["year"] == 2001, "year 取自目录名，对象键要与本地目录同构"
+    assert d.build_s3_key(job["tmdbId"], job["year"]).endswith("movies/2001/55/55.mp4")
+    assert job["title"] == "Stranded"
+    assert job["file_size_bytes"] == 1024
+
+
+def test_stranded_covers_upload_failed_but_not_uploaded(tmp_path, monkeypatch):
+    """uploaded:false（上传失败/降级）的也要接走；uploaded:true 的绝不重传；
+    unknown_year 目录也能还原出同一个对象键。"""
+    uploads = _setup_stranded(tmp_path, monkeypatch)
+    _put_mp4("1", 2001)
+    _put_mp4("2", 2002)
+    _put_mp4("3", None)
+    with open(d.SUCCESS_LOG, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "1", "uploaded": False}) + "\n")
+        fh.write(json.dumps({"tmdbId": "2", "uploaded": True}) + "\n")
+
+    d._run_pipeline()
+
+    got = sorted((u["tmdbId"], u["year"]) for u in uploads)
+    assert got == [("1", 2001), ("3", None)]
+    assert d.build_s3_key("3", None).endswith("movies/unknown_year/3/3.mp4")
+
+
+def test_stranded_scan_is_skipped_when_upload_disabled(tmp_path, monkeypatch):
+    """不开上传时成品本就留本地，不该被当成滞留去"补传"。"""
+    uploads = _setup_stranded(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "S3_ENABLED", False)
+    _put_mp4("55", 2001)
+    d._run_pipeline()
+    assert uploads == []
+
+
+def test_stranded_uploads_respect_upload_slots_and_all_get_submitted(tmp_path, monkeypatch):
+    """滞留成品走同一个反压信号量：槽位只有 1 个时也必须一部不漏地传完，且不泄漏配额。"""
+    _setup_stranded(tmp_path, monkeypatch)
+    sem = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(d, "upload_semaphore", sem)
+    concurrent = []
+    active = []
+    lock = threading.Lock()
+
+    def slow_upload(info):
+        with lock:
+            active.append(1)
+            concurrent.append(len(active))
+        time.sleep(0.05)
+        with lock:
+            active.pop()
+        return info["tmdbId"], True, info
+
+    monkeypatch.setattr(d, "upload_one_entry", slow_upload)
+    for tid in ("1", "2", "3", "4"):
+        _put_mp4(tid, 2001)
+
+    d._run_pipeline()
+
+    assert len(concurrent) == 4, "4 部都必须被上传"
+    assert max(concurrent) == 1, "必须受上传槽位限制"
+    assert sem.acquire(blocking=False), "配额必须全部归还"
+
+
+def test_interrupted_conversion_is_uploaded_by_the_next_run(tmp_path, monkeypatch):
+    """🔴 ① 端到端：中断时在途的转封装被线程池跑完、成品落进 downloads/ 却没人上传；
+    下一次启动必须把它接走上传，而不是当成已完成永久跳过。"""
+    uploads = _setup_stranded(tmp_path, monkeypatch, [
+        {"tmdbId": "77", "year": 2002, "urls": ["u"]},
+    ])
+    monkeypatch.setattr(d, "interrupted", threading.Event())
+    monkeypatch.setattr(d, "process_one_entry",
+                        lambda e, ids: ("77", True, {"tmdbId": "77", "year": 2002}))
+    conv_started = threading.Event()
+
+    def fake_finalize(job, ids):
+        conv_started.set()
+        time.sleep(0.3)  # 模拟 ffmpeg 转封装耗时
+        path = _put_mp4("77", 2002, size=2048)
+        return "77", True, {"tmdbId": "77", "year": 2002, "final_path": path}
+
+    monkeypatch.setattr(d, "finalize_one_entry", fake_finalize)
+    real_wait = d.wait
+
+    def wait_then_sigint(fs, **kw):
+        if conv_started.is_set():
+            d.interrupted.set()            # 信号处理器会做的事
+            raise KeyboardInterrupt()
+        return real_wait(fs, **kw)
+
+    monkeypatch.setattr(d, "wait", wait_then_sigint)
+    with pytest.raises(KeyboardInterrupt):
+        d._run_pipeline()
+    assert uploads == [], "前提：中断那次没有上传"
+    assert not os.path.exists(d.SUCCESS_LOG), "前提：中断那次也没写台账"
+
+    # 第二次运行（续跑）
+    monkeypatch.setattr(d, "wait", real_wait)
+    monkeypatch.setattr(d, "interrupted", threading.Event())
+    downloads = []
+    monkeypatch.setattr(d, "process_one_entry",
+                        lambda e, ids: downloads.append(e) or ("77", False, {"error": "x"}))
+    d._run_pipeline()
+
+    assert downloads == [], "成品已在本地，绝不能重下"
+    assert [u["tmdbId"] for u in uploads] == ["77"]
+
+
+def test_disk_gate_returns_immediately_on_interrupt(monkeypatch):
+    """🔴 ③：闸门关着时收到中断，wait_for_disk_gate 必须立刻放行，不等 disk_monitor_stop。"""
+    monkeypatch.setattr(d, "DISK_GUARD_ENABLED", True)
+    monkeypatch.setattr(d, "DISK_CHECK_INTERVAL", 0.01)
+    monkeypatch.setattr(d, "disk_gate", threading.Event())          # 闸门关闭
+    monkeypatch.setattr(d, "disk_monitor_stop", threading.Event())  # 监控仍在跑
+    flag = threading.Event()
+    flag.set()
+    monkeypatch.setattr(d, "interrupted", flag)
+
+    # 放线程里跑：一旦退化成死等，用例应当失败而不是把整个测试套件挂住。
+    t = threading.Thread(target=d.wait_for_disk_gate, daemon=True)
+    t.start()
+    t.join(1)
+    hung = t.is_alive()
+    d.disk_monitor_stop.set()  # 无论成败都放走线程
+    t.join(1)
+    assert not hung, "收到中断后必须立刻放行"
+
+
+def test_process_one_entry_does_not_start_after_interrupt(tmp_path, monkeypatch):
+    """线程池收尾时排队的任务仍会被执行：中断后不得再开下，判可重试失败、释放 ID 锁。"""
+    _isolate_logs(tmp_path, monkeypatch)
+    flag = threading.Event()
+    flag.set()
+    monkeypatch.setattr(d, "interrupted", flag)
+    monkeypatch.setattr(d, "DISK_GUARD_ENABLED", False)
+
+    def boom(*a, **kw):
+        raise AssertionError("中断后不该再发任何请求")
+
+    monkeypatch.setattr(d, "parse_master_playlist", boom)
+    monkeypatch.setattr(d, "_download_mp4_direct", boom)
+
+    tid, ok, info = d.process_one_entry(
+        {"tmdbId": "9", "urls": ["https://x/master.m3u8"]}, set()
+    )
+    assert (tid, ok) == ("9", False)
+    assert info == {"error": "已取消（收到中断信号）", "retriable": True}
+    assert "9" not in d.processing_ids
+
+
+def test_sigint_while_disk_gate_closed_does_not_hang(tmp_path, monkeypatch):
+    """🔴 ③ 端到端：闸门关着时 kill -INT，_run_pipeline 必须能退出。
+
+    修复前：with 退出的 shutdown(wait=True) 等卡在闸门上的下载线程，闸门要到
+    main() 的 finally 才放行（在 _run_pipeline 返回之后），上传已停磁盘也降不下来
+    → 永久互等，只能再发一次信号硬杀。
+    """
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "async_refetch_hook", None)
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    monkeypatch.setattr(d, "DISK_GUARD_ENABLED", True)
+    monkeypatch.setattr(d, "DISK_CHECK_INTERVAL", 0.02)
+    gate = threading.Event()
+    stop = threading.Event()
+    monkeypatch.setattr(d, "disk_gate", gate)
+    monkeypatch.setattr(d, "disk_monitor_stop", stop)
+    monkeypatch.setattr(d, "interrupted", threading.Event())
+    inp = tmp_path / "in.jsonl"
+    inp.write_text(json.dumps({"tmdbId": "88", "urls": ["u"]}) + "\n")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(inp))
+    at_gate = threading.Event()
+
+    def fake_process(entry, ids):
+        at_gate.set()
+        d.wait_for_disk_gate()
+        return "88", False, {"error": "x", "retriable": True}
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+    real_wait = d.wait
+
+    def wait_then_sigint(fs, **kw):
+        if at_gate.wait(1):
+            d.interrupted.set()
+            raise KeyboardInterrupt()
+        return real_wait(fs, **kw)
+
+    monkeypatch.setattr(d, "wait", wait_then_sigint)
+
+    def run():
+        try:
+            d._run_pipeline()
+        except KeyboardInterrupt:
+            pass
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(3)
+    hung = t.is_alive()
+    stop.set()
+    gate.set()
+    t.join(3)
+    assert not hung, "中断后 3 秒内必须退出，不能卡在 shutdown(wait=True) 上"

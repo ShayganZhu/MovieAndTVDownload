@@ -543,12 +543,18 @@ def disk_monitor_loop():
 def wait_for_disk_gate():
     """开新片前调用：磁盘吃紧时在此阻塞，直到放行或监控线程停止。
     只阻塞尚未开始的下载，不影响已在跑的任务。未开启兜底时立即返回。
+
+    收到进程级中断时立即返回：此刻再等磁盘放行毫无意义（任务马上就要收尾），
+    而 disk_monitor_stop 要到 main() 的 finally 才置位——那时主线程正卡在
+    `with ThreadPoolExecutor` 退出的 shutdown(wait=True) 上等这些 worker，
+    闸门又因上传已停而永远等不到回落，两边互等就是死结（只能再发一次信号硬杀）。
+    返回后调用方会在下载入口处再判一次 interrupted，不会真的开下。
     """
     if not DISK_GUARD_ENABLED:
         return
     while not disk_gate.wait(timeout=DISK_CHECK_INTERVAL):
-        # 若监控线程已停止（主流程退出中），不再苦等，放行让任务自然收尾。
-        if disk_monitor_stop.is_set():
+        # 若监控线程已停止（主流程退出中）或收到中断，不再苦等，放行让任务自然收尾。
+        if disk_monitor_stop.is_set() or interrupted.is_set():
             return
 
 
@@ -1035,33 +1041,48 @@ def load_success_log_ids():
     return processed
 
 
-def scan_downloaded_mp4_ids():
+def load_uploaded_ids():
+    """SUCCESS_LOG 中**已确认上传进 R2** 的 ID（任一条记录 uploaded 为真即算）。
+
+    与 load_success_log_ids 的区别：后者含 uploaded:false 的片（上传失败/降级，
+    成品还留在本地等补传），这里只要真正进了 R2 的。用于启动时找出磁盘上
+    "有成品却没传上去"的片（见 find_stranded_uploads）。
     """
-    扫描目标目录下已经落盘的非空 MP4。
+    uploaded = set()
+    if not os.path.exists(SUCCESS_LOG):
+        return uploaded
 
-    目录结构 {BASE_DIR}/{FOLDER_PREFIX}/{year}/{tmdbId}/{tmdbId}.mp4，故按
-    「year 层 -> tmdbId 层」两级 scandir，**ID 取自目录名**（不再从文件名反解），
-    这样同目录下的 meta.json / subs/ 等非视频资产天然不参与去重判定。
+    with open(SUCCESS_LOG, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if data.get("uploaded") is True:
+                normalized_id = normalize_tmdb_id(data.get("tmdbId"))
+                if normalized_id:
+                    uploaded.add(normalized_id)
+    return uploaded
 
-    返回 (ID 集合, 重复文件字典)。同一 ID 出现在多个 year 目录时只报告，
-    不自动删除已有文件。
 
-    顺带清理 0 字节 mp4：那是移动中断留下的残骸，既不是有效成品也不该被
-    误判为"已下载"而永久跳过该片。只删大小为 0 的，有内容的一律不动。
+def _iter_movie_mp4s():
+    """遍历 {BASE_DIR}/{FOLDER_PREFIX}/{year}/{tmdbId}/{tmdbId}.mp4。
+
+    逐个产出 (year 目录名, tmdbId, mp4 路径, 字节数)；视频不存在的影片目录
+    （只有 meta/字幕，或目录空）不产出。ID 与 year 都取自目录名。
     """
-    downloaded_ids = set()
-    locations = {}
-    orphan_count = 0
-
     root = os.path.join(BASE_DIR, FOLDER_PREFIX) if FOLDER_PREFIX else BASE_DIR
     if not os.path.isdir(root):
-        return downloaded_ids, {}
+        return
 
     try:
         year_entries = list(os.scandir(root))
     except OSError as exc:
         print(f"警告: 无法扫描目标目录 {root}: {exc}")
-        return downloaded_ids, {}
+        return
 
     for year_entry in year_entries:
         if not year_entry.is_dir(follow_symlinks=False):
@@ -1085,17 +1106,74 @@ def scan_downloaded_mp4_ids():
             try:
                 size = os.stat(mp4_path, follow_symlinks=False).st_size
             except OSError:
-                # 视频不存在（只有 meta/字幕，或目录空）：不算已下载。
                 continue
+            yield year_entry.name, tmdb_id, mp4_path, size
 
-            if size <= 0:
-                # 0 字节孤儿：移动中断留下的残骸，直接清掉。
-                remove_file(mp4_path)
-                orphan_count += 1
-                continue
 
-            downloaded_ids.add(tmdb_id)
-            locations.setdefault(tmdb_id, []).append(mp4_path)
+def find_stranded_uploads(candidate_ids, titles=None):
+    """把"磁盘上有成品、却没有上传成功记录"的片整理成上传任务（success_info）。
+
+    这类片的来路（S3 开启时）：
+      - 中断时在途的转封装：`with ThreadPoolExecutor` 退出会把它跑完并移进
+        downloads/，但主循环已不在，没人提交上传，也没写任何台账；
+      - kill -9 / OOM / 断电打在"成品已落地、上传未完成"之间；
+      - 上传失败或槽位超时降级（有 uploaded:false 记录 + pending），而补传只在
+        正常收尾时自动跑——全量跑多半是被 kill -INT 停下的，轮不到它。
+    它们都已在磁盘扫描的跳过集里（不会重下），若不在这里接走，就永远进不了 R2。
+
+    candidate_ids：只考虑这些 ID（调用方传 磁盘成品 − 已上传）。为空时不碰磁盘。
+    titles：可选 {tmdbId: title}，仅用于日志与 success 记录。
+    """
+    candidates = set(candidate_ids or ())
+    if not candidates:
+        return []
+    titles = titles or {}
+    jobs = []
+    for year_name, tmdb_id, mp4_path, size in _iter_movie_mp4s():
+        if tmdb_id not in candidates or size <= 0:
+            continue
+        candidates.discard(tmdb_id)  # 同一 ID 多个 year 目录：只接第一个
+        jobs.append({
+            "tmdbId": tmdb_id,
+            "title": titles.get(tmdb_id) or "",
+            # year 取自目录名，build_s3_key 经 year_segment 还原出同一段，
+            # 保证对象键与本地目录严格同构（unknown_year 目录同理）。
+            "year": int(year_name) if year_name.isdigit() else None,
+            "final_path": mp4_path,
+            "file_size_bytes": size,
+            "stranded": True,
+        })
+    return jobs
+
+
+def scan_downloaded_mp4_ids():
+    """
+    扫描目标目录下已经落盘的非空 MP4。
+
+    目录结构 {BASE_DIR}/{FOLDER_PREFIX}/{year}/{tmdbId}/{tmdbId}.mp4，故按
+    「year 层 -> tmdbId 层」两级 scandir，**ID 取自目录名**（不再从文件名反解），
+    这样同目录下的 meta.json / subs/ 等非视频资产天然不参与去重判定。
+
+    返回 (ID 集合, 重复文件字典)。同一 ID 出现在多个 year 目录时只报告，
+    不自动删除已有文件。
+
+    顺带清理 0 字节 mp4：那是移动中断留下的残骸，既不是有效成品也不该被
+    误判为"已下载"而永久跳过该片。只删大小为 0 的，有内容的一律不动。
+    """
+    downloaded_ids = set()
+    locations = {}
+    orphan_count = 0
+
+    # 视频不存在（只有 meta/字幕，或目录空）的影片目录 _iter_movie_mp4s 不产出：不算已下载。
+    for _year_name, tmdb_id, mp4_path, size in _iter_movie_mp4s():
+        if size <= 0:
+            # 0 字节孤儿：移动中断留下的残骸，直接清掉。
+            remove_file(mp4_path)
+            orphan_count += 1
+            continue
+
+        downloaded_ids.add(tmdb_id)
+        locations.setdefault(tmdb_id, []).append(mp4_path)
 
     if orphan_count:
         print(f"已清理 {orphan_count} 个 0 字节 mp4 孤儿（移动中断留下的残骸）")
@@ -4321,6 +4399,14 @@ def process_one_entry(entry, processed_ids):
         # 磁盘水位兜底：仅在此处（尚未开始任何下载动作前）阻塞。磁盘吃紧时新片
         # 在闸门前等待，不会占用 temp/带宽；已在跑的下载不受影响。
         wait_for_disk_gate()
+        # 中断后不再开新片：线程池退出时排队中的任务仍会被逐个执行，此刻开下
+        # 只会白白发出 playlist 请求、拖慢收尾，还会在 temp 留下待清理的残骸。
+        # 判为可重试失败，下次运行照常重下。
+        # （wait_for_disk_gate 收到中断会提前返回，故这一判必须在它之后。）
+        if interrupted.is_set():
+            return tmdb_id, False, {
+                "error": "已取消（收到中断信号）", "retriable": True,
+            }
 
         print(f"\n开始处理: {tmdb_id} - {title}")
         os.makedirs(TEMP_DIR, exist_ok=True)
@@ -5045,13 +5131,39 @@ def _run_pipeline(run_volume=None):
         ):
             entry_by_id[normalized_id] = entry
 
-    entries = list(entry_by_id.values())
+    # 已完成的片（success / 磁盘成品 / 画质判死）读入时就剔除，不进本次的任何环节。
+    # process_one_entry 入口本也会拦下它们，但启动预检发生在那之前：不剔除的话，
+    # 续跑时 results.jsonl 里所有超过 stale_after_seconds 的条目——绝大多数早已
+    # 下完上传——都会被投去重新取流，白烧代理与源站配额（源站 429 按全局配额计，
+    # 直接挤占主取流），重取结果还会再往 results.jsonl 追加一份。
+    entries = [
+        entry for normalized_id, entry in entry_by_id.items()
+        if normalized_id not in processed_ids
+    ]
+    already_done_count = len(entry_by_id) - len(entries)
 
     print(
-        f"共读取 {len(entries)} 个去重后的条目；"
-        f"输入文件内跳过 {duplicate_input_count} 个重复 ID（按 fetched_at 取最新）"
+        f"共读取 {len(entry_by_id)} 个去重后的条目"
+        + (f"（其中 {already_done_count} 个已完成，不再投递）" if already_done_count else "")
+        + f"；输入文件内跳过 {duplicate_input_count} 个重复 ID（按 fetched_at 取最新）"
         + (f"；跳过 {invalid_input_count} 个缺 tmdbId 的行" if invalid_input_count else "")
     )
+
+    # 磁盘上有成品、却没有上传成功记录的片（来路见 find_stranded_uploads）：
+    # 它们在跳过集里不会重下，只能在这里直接接进上传阶段，否则永远进不了 R2。
+    # 不开上传时成品本就留本地，无需处理。
+    stranded_uploads = []
+    if S3_ENABLED:
+        stranded_uploads = find_stranded_uploads(
+            disk_ids - load_uploaded_ids(),
+            {tid: entry.get("title") or "" for tid, entry in entry_by_id.items()},
+        )
+        if stranded_uploads:
+            print(
+                f"发现 {len(stranded_uploads)} 部成品已在本地、但没有上传成功记录"
+                f"（上次中断 / 崩溃 / 上传失败留下），本次直接补传",
+                flush=True,
+            )
 
     ignored_errors = {
         "already processed successfully",
@@ -5395,6 +5507,41 @@ def _run_pipeline(run_volume=None):
             ThreadPoolExecutor(max_workers=CONVERT_WORKERS) as conversion_executor, \
             ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as upload_executor:
 
+        stranded_queue = list(stranded_uploads)
+
+        def submit_stranded_uploads(block=False):
+            """把滞留成品逐个交给上传池，与转封装产出的新成品共用同一套反压。
+
+            主循环里只做非阻塞投递（block=False）：上传槽位被占满就留到下次，
+            绝不能为补传卡住下载与转封装的推进。收尾排空时才允许阻塞等槽位，
+            等满 UPLOAD_SLOT_WAIT_TIMEOUT 仍拿不到就放弃——成品仍在本地、仍无
+            上传记录，下次启动会再被找出来，不丢。
+            """
+            while stranded_queue:
+                if block:
+                    acquired = upload_semaphore.acquire(timeout=UPLOAD_SLOT_WAIT_TIMEOUT)
+                else:
+                    acquired = upload_semaphore.acquire(blocking=False)
+                if not acquired:
+                    return
+                info = stranded_queue.pop(0)
+                # 与转封装分支同理：submit 失败必须立即归还配额，否则信号量泄漏。
+                try:
+                    upload_future = upload_executor.submit(upload_one_entry, info)
+                except Exception as exc:
+                    upload_semaphore.release()
+                    print(f"滞留成品上传提交失败: {info['tmdbId']}: {exc}", flush=True)
+                    continue
+                upload_future.add_done_callback(
+                    lambda _f: upload_semaphore.release()
+                )
+                upload_future_to_entry[upload_future] = info
+                stage_of[upload_future] = "upload"
+                pending.add(upload_future)
+                stats["uploads"] += 1
+
+        submit_stranded_uploads()
+
         current_batch = entries
         round_no = 1
         # 每部片已被就地重取几次（跨轮累计），防"取流-过期-重取"无限空转。
@@ -5493,6 +5640,8 @@ def _run_pipeline(run_volume=None):
             # 但不阻塞本轮判定——这正是方案 A 的并行精髓。
             # 循环条件涵盖“还有在途下载”或“来源尚未耗尽”，二者皆空才收尾。
             while round_download_futures or not source_exhausted:
+                # 滞留成品：上传槽位一有空就补投（非阻塞，不拖慢下载侧）。
+                submit_stranded_uploads()
                 if not pending:
                     # 仅流式来源会走到这里：`round_download_futures ⊆ pending`
                     # （两者的 add/discard 严格成对），故 pending 空即本轮无在途
@@ -5713,12 +5862,28 @@ def _run_pipeline(run_volume=None):
 
         # 多轮下载结束，但 pending 里可能还有末轮的转封装/上传在途 -> 显式排空，
         # 确保所有失败/成功记录都在循环内被处理（而非交给 with 退出时静默等待）。
-        if pending:
+        if pending or stranded_queue:
             print(
-                f"\n下载轮次结束，等待剩余 {len(pending)} 个转封装/上传任务完成...",
+                f"\n下载轮次结束，等待剩余 {len(pending)} 个转封装/上传任务完成"
+                + (f"，另有 {len(stranded_queue)} 部滞留成品待补传"
+                   if stranded_queue else "")
+                + "...",
                 flush=True,
             )
-        while pending:
+        while pending or stranded_queue:
+            # 下载侧已收工，滞留成品可以等槽位了。但 pending 非空时仍用非阻塞：
+            # 阻塞会把已完成 future 的结论处理一并拖住。pending 为空时必须阻塞——
+            # 上传 future 先唤醒 wait、后才执行释放信号量的回调，非阻塞会扑空空转。
+            submit_stranded_uploads(block=not pending)
+            if not pending:
+                # 已无在途上传占用配额却仍等满超时没拿到槽位（理论上不会发生）。
+                # 不死等：成品仍在本地、仍无上传记录，下次启动会再被找出来。
+                print(
+                    f"⚠️ 上传槽位迟迟拿不到，{len(stranded_queue)} 部滞留成品"
+                    f"留待下次运行补传",
+                    flush=True,
+                )
+                break
             done, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in done:
                 pending.discard(future)
