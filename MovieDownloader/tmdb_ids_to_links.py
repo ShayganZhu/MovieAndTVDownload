@@ -104,9 +104,22 @@ VIDLINK_DOWNLOAD_HEADERS = {"User-Agent": "okhttp/4.9.3"}
 
 VIDEASY_API_HEADERS = {"Accept": "*/*", "Origin": "https://player.videasy.to",
                        "Referer": "https://player.videasy.to/", "User-Agent": UA}
-# videasy 的 vsrc 路由已下线（404 Route not found）；m4uhd 需要 title/year 才能检索，
-# 缺元数据时只走 cdn（见 _fetch_videasy）
-VIDEASY_SERVERS = ("cdn", "m4uhd")
+# videasy 接口域名：2026-10 由 api.speedracelight.com 迁到 api.wecollege.net
+# （旧域名恒 502，整批 0 成功），server 也从 cdn/m4uhd 换成按城市命名的十几个。
+VIDEASY_HOST = _CFG.get("videasy_host", "https://api.wecollege.net").rstrip("/")
+# 逐个请求的 server。每多一个，每部片就多一次 sources + 一次 dec 请求，故只取
+# 出流主机互不相同的几个（2026-10-22 实测）：
+#   miami   → moon.zenoak.top，1080/720/480/2160 多档（与 vidup 同一后端）
+#   phoenix → sun.paleoak.top，1080p（另一台主机，moon 故障时的退路）
+# 暂未启用 dallas（e2e.majorplay.net，独立主机）：它的地址形如 .../config-xxx.json?…&type=m3u8，
+# 不以 .m3u8 结尾，_find_media_urls 认不出，下载侧能否直接拉也未验证，接入前须单独验证。
+# 缺片名时只走第一个（各 server 都按片名检索，缺了多半直接 500）。
+VIDEASY_SERVERS = tuple(_CFG.get("videasy_servers") or ("miami", "phoenix"))
+# server 用这几种方式表达"没有这部片"：404 / 空响应 / 500 + 下列文案（不区分大小写）。
+# 实测各 server 措辞不一："Sources not found"、"phoenix api 404"、
+# "dallas: title not found on idlix"。其余 500（如 "proxy unreachable"、
+# "embed extract failed"）是该 server 自身故障，按瞬时处理。
+_VIDEASY_EMPTY_MARKERS = ("not found", "no streams available", "api 404")
 
 # 2026-09-08 电影版 300 部 dead 抽样实测（详见 AGENTS.md §10）：
 #   videasy 11.7%（独占 11）、vidfast 8.0%（独占 0）、vidlink 6.7%（独占 5），ANY 13.3%
@@ -185,7 +198,7 @@ def build_proxy():
 def load_movie_metadata():
     """返回 (元数据表, 检索表)：
       元数据表 tmdb_id -> 写进 results.jsonl 的静态字段；
-      检索表   tmdb_id -> {title, year, imdb}，仅供 videasy 的 m4uhd 服务器按片名检索用，
+      检索表   tmdb_id -> {title, year, imdb}，仅供 videasy 各 server 按片名检索用，
                不写进结果（primary_title 不是 results.jsonl 契约的一部分）。"""
     meta_path = resolve_file(_CFG.get("metadata"), "movies.jsonl")
     table = {}
@@ -439,7 +452,8 @@ def _parse_captions(items, where="", headers=None):
 
 def _fetch_vidup_like(session, site, api_name, tmdb_id):
     """vidup.to / vidfast.vc 同构链路：
-    页面正则 → enc-{api} → servers POST → dec-{api} → 逐 server stream POST → dec-{api} 取 url。"""
+    页面正则 → enc-{api}(stage1) → stage1 POST → enc-{api}(stage2) → servers POST →
+    dec-{api} → 逐 server stream POST → dec-{api} 取 url。"""
     page_headers, api_headers = _site_headers(site)
 
     # 1. 获取页面，提取加密文本
@@ -459,10 +473,28 @@ def _fetch_vidup_like(session, site, api_name, tmdb_id):
         # 页面 200 但提取不到加密文本：可能撞上 Cloudflare 挑战页/半截 HTML，换 IP 重试
         raise Exception(f"Extract failed (retriable) for {tmdb_id}")
 
-    # 2. 调用 enc-{api} 获取 parts（text 来自页面正则，可能含 +/= 等保留字符，必须编码）
-    enc_url = f"{API}/enc-{api_name}?text={quote(text, safe='')}"
-    resp = _check(session.get(enc_url, timeout=TIMEOUT, headers=api_headers), f"enc-{api_name}")
-    parts = validate(_json(resp, f"enc-{api_name}"), enc_url)
+    # 2. 两阶段 enc 换出 servers/stream（2026-10 enc-dec 接口改版，旧的一步式
+    #    `enc-{api}?text=` 起一律 400 "Expected query: text, stage"，vidup/vidfast 全挂）：
+    #    stage=1 → 得到一个站内地址（+ 可能的 CSRF token），POST 它拿回一段密文；
+    #    stage=2 → 用这段密文换出 servers/stream/token，之后的流程与改版前相同。
+    #    text 来自页面正则/站点响应，可能含 +/= 等保留字符，必须编码。
+    stage1_url = f"{API}/enc-{api_name}?text={quote(text, safe='')}&stage=1"
+    resp = _check(session.get(stage1_url, timeout=TIMEOUT, headers=api_headers),
+                  f"enc-{api_name}(stage1)")
+    stage1 = validate(_json(resp, f"enc-{api_name}(stage1)"), stage1_url)
+    if not isinstance(stage1, dict) or not stage1.get("stage1"):
+        raise Exception(f"API Error at {stage1_url}: missing stage1 in result")
+    stage1_headers = dict(api_headers)
+    if stage1.get("token"):
+        stage1_headers["X-CSRF-Token"] = stage1["token"]
+    # 站内地址的状态码不参与判死（它不是"该片无源"的证据），出错一律按瞬时处理。
+    resp = _check(session.post(stage1["stage1"], headers=stage1_headers, timeout=TIMEOUT),
+                  "stage1")
+
+    enc_url = f"{API}/enc-{api_name}?text={quote(resp.text, safe='')}&stage=2"
+    resp = _check(session.get(enc_url, timeout=TIMEOUT, headers=api_headers),
+                  f"enc-{api_name}(stage2)")
+    parts = validate(_json(resp, f"enc-{api_name}(stage2)"), enc_url)
     if not isinstance(parts, dict):
         raise Exception(f"API Error at {enc_url}: result is not an object")
     servers = parts.get('servers')
@@ -625,22 +657,25 @@ def _fetch_vidlink(session, tmdb_id):
 
 
 def _fetch_videasy(session, tmdb_id):
-    """videasy（player.videasy.to）：seed → /{cdn|m4uhd}/sources-with-title → dec-videasy。
+    """videasy（player.videasy.to）：seed → /{server}/sources → dec-videasy。
     2026-09-08 电影版实测命中率最高（11.7%）、独占最多（11 部）。
-    m4uhd 靠 title/year 检索，缺元数据时只走 cdn（否则必然 500 Required parameters not found）。"""
+    各 server 按 title/year 检索，缺元数据时只走第一个 server。
+
+    seed 每部片只取一次、各 server 复用：seed 接口限流很紧（同一出口 IP 短时间
+    十几次就 429），且有效期 30 秒，够跑完几个 server。"""
     meta = _MOVIE_SEARCH_META.get(str(tmdb_id), {})
     title = meta.get("title") or ""
     year = meta.get("year") or ""
     imdb = meta.get("imdb") or ""
 
-    resp = _check(session.get(f"https://api.speedracelight.com/seed?mediaId={quote(str(tmdb_id), safe='')}",
+    resp = _check(session.get(f"{VIDEASY_HOST}/seed?mediaId={quote(str(tmdb_id), safe='')}",
                               headers=VIDEASY_API_HEADERS, timeout=TIMEOUT), "videasy-seed")
     seed = _json(resp, "videasy-seed").get("seed")
     if not seed:
         raise Exception(f"videasy: 未拿到 seed for {tmdb_id}")
 
     enc_title = quote(quote(title, safe=""), safe="")
-    servers = VIDEASY_SERVERS if title else ("cdn",)
+    servers = VIDEASY_SERVERS if title else VIDEASY_SERVERS[:1]
     urls = []
     seen_urls = set()
     captions = []
@@ -648,15 +683,17 @@ def _fetch_videasy(session, tmdb_id):
     errors = []
     for sv in servers:
         try:
-            url = (f"https://api.speedracelight.com/{sv}/sources-with-title?title={enc_title}"
+            url = (f"{VIDEASY_HOST}/{sv}/sources?title={enc_title}"
                    f"&mediaType=movie&year={year}&tmdbId={quote(str(tmdb_id), safe='')}"
                    f"&imdbId={quote(str(imdb), safe='')}&enc=2&seed={quote(str(seed), safe='')}")
             resp = session.get(url, headers=VIDEASY_API_HEADERS, timeout=TIMEOUT)
-            # 源站对"无此片"的表达：404 / 空响应 / 500 + "No streams available"
+            # 源站对"无此片"的表达：404 / 空响应 / 500 + 无源文案（见 _VIDEASY_EMPTY_MARKERS）
             if resp.status_code == 404 or not resp.text.strip():
                 empty += 1
                 continue
-            if resp.status_code == 500 and "No streams available" in resp.text:
+            if resp.status_code == 500 and any(
+                marker in resp.text.lower() for marker in _VIDEASY_EMPTY_MARKERS
+            ):
                 empty += 1
                 continue
             _check(resp, f"videasy-{sv}")
@@ -667,7 +704,7 @@ def _fetch_videasy(session, tmdb_id):
             # 🔑 字幕在 decoded.subtitles[] 里（§12.25，实测命中率 23.7%）。
             # 必须在 _find_media_urls 之前单独取：那个正则只捞 m3u8|mp4，
             # 字幕是 .vtt/.srt，会被静默丢弃 —— 这正是此前拿不到字幕的原因。
-            # cdn 常给多语种（含 zh-CN），m4uhd 给 playhq 中转的 srt。
+            # 多数 server 给 1 条英文，个别给多语种。
             if isinstance(decoded, dict) and not captions:
                 captions = _parse_captions(
                     decoded.get("subtitles"), f"videasy/{sv} {tmdb_id}"

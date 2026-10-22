@@ -40,7 +40,7 @@ def _install_fake_session(monkeypatch, *, vidup_streams=(), vidup_page_status=20
                           vidfast_streams=(), vidfast_page_status=404,
                           vidlink_resp=None, videasy_seed="SEED",
                           videasy_sources=None, videasy_seed_status=200,
-                          videasy_decoded=None):
+                          videasy_decoded=None, vidup_stage1_status=200):
     """四家取流源的假 Session，按域名路由。
 
     默认：vidup 按 vidup_streams 出流；vidfast 页面 404（无源）；
@@ -51,7 +51,8 @@ def _install_fake_session(monkeypatch, *, vidup_streams=(), vidup_page_status=20
 
     sites = {
         "vidup": {"host": "https://vidup.to/", "base": "https://x",
-                  "status": vidup_page_status, "streams": list(vidup_streams)},
+                  "status": vidup_page_status, "streams": list(vidup_streams),
+                  "stage1_status": vidup_stage1_status},
         "vidfast": {"host": "https://vidfast.vc/", "base": "https://y",
                     "status": vidfast_page_status, "streams": list(vidfast_streams)},
     }
@@ -72,30 +73,48 @@ def _install_fake_session(monkeypatch, *, vidup_streams=(), vidup_page_status=20
                 if url.startswith(site["host"]):
                     seen["order"].append(name)
                     return _FakeResp(site["status"], text="<x>\\\"en\\\":\\\"TXT\\\"</x>")
-            if "/enc-vidup" in url:
-                return _ok({"servers": "https://x/servers", "stream": "https://x/stream",
-                            "token": "tok"})
-            if "/enc-vidfast" in url:
-                return _ok({"servers": "https://y/servers", "stream": "https://y/stream",
-                            "token": "tok"})
+            # enc-dec 2026-10 改版后的两阶段 enc：stage=1 给站内地址，stage=2 用
+            # POST 它拿回的密文（S1TEXT）换出 servers/stream；缺 stage 一律 400。
+            for name, site in sites.items():
+                if f"/enc-{name}?" not in url:
+                    continue
+                if url.endswith("&stage=1"):
+                    return _ok({"stage1": site["base"] + "/stage1", "token": "tok1"})
+                if url.endswith("&stage=2"):
+                    assert "text=S1TEXT&" in url, "stage2 必须用 stage1 POST 拿回的密文"
+                    return _ok({"servers": site["base"] + "/servers",
+                                "stream": site["base"] + "/stream", "token": "tok"})
+                return _FakeResp(200, {"status": 400, "result": "",
+                                       "error": "Expected query: text, stage"})
             if "/enc-vidlink" in url:
                 seen["order"].append("vidlink")
                 return _ok("ENCTID")
             if url.startswith("https://vidlink.pro/api/b/movie/"):
                 seen["headers"]["vidlink"] = headers
                 return vidlink_resp if vidlink_resp is not None else _FakeResp(200, None, "null")
-            if "speedracelight.com/seed" in url:
+            if url.startswith(f"{m.VIDEASY_HOST}/seed?"):
                 seen["order"].append("videasy")
+                seen.setdefault("videasy_seeds", 0)
+                seen["videasy_seeds"] += 1
                 return _FakeResp(videasy_seed_status, {"seed": videasy_seed})
-            if "sources-with-title" in url:
-                if videasy_sources is None:
+            if url.startswith(f"{m.VIDEASY_HOST}/") and "/sources?" in url:
+                seen.setdefault("videasy_servers", []).append(
+                    url[len(m.VIDEASY_HOST) + 1:].split("/", 1)[0]
+                )
+                sources = videasy_sources
+                if isinstance(sources, dict):  # 按 server 分别给响应
+                    sources = sources.get(seen["videasy_servers"][-1])
+                if sources is None:
                     return _FakeResp(404, text="")
-                return videasy_sources
+                return sources
             raise AssertionError(f"unexpected GET {url}")
 
         def post(self, url, headers=None, json=None, timeout=None):
             seen["urls"].append(url)
             for name, site in sites.items():
+                if url == site["base"] + "/stage1":
+                    seen["headers"][f"{name}-stage1"] = headers
+                    return _FakeResp(site.get("stage1_status", 200), text="S1TEXT")
                 if url == site["base"] + "/servers":
                     return _FakeResp(200, text="ENC")
                 if url.startswith(site["base"] + "/stream/"):
@@ -177,6 +196,39 @@ def test_http_status_error_carries_structured_status():
 
 
 # -------------------------------------------------------------- 各 provider
+
+def test_vidup_uses_two_stage_enc(monkeypatch):
+    """🔴 2026-10 enc-dec 改版：一步式 enc-vidup 一律 400，必须走两阶段——
+    stage=1 拿站内地址（带它给的 CSRF token POST 过去），再用拿回的密文请求
+    stage=2 换出 servers/stream。实跑中旧代码因此整批 0 成功。"""
+    seen = _install_fake_session(monkeypatch, vidup_streams=[{"url": "https://a/m.m3u8"}])
+    status, result = m.process_tmdb_id("42", providers=["vidup"])
+    assert status == "ok" and result["urls"][0]["url"] == "https://a/m.m3u8"
+
+    urls = seen["urls"]
+    stage1 = next(i for i, u in enumerate(urls) if "/enc-vidup?" in u and u.endswith("&stage=1"))
+    post1 = urls.index("https://x/stage1")
+    stage2 = next(i for i, u in enumerate(urls) if "/enc-vidup?" in u and u.endswith("&stage=2"))
+    assert stage1 < post1 < stage2 < urls.index("https://x/servers")
+    assert seen["headers"]["vidup-stage1"]["X-CSRF-Token"] == "tok1"
+
+
+def test_vidup_stage1_failure_is_retriable_not_dead(monkeypatch):
+    """站内 stage1 地址出错不是"该片无源"的证据，只能按瞬时处理，绝不能判死。"""
+    _install_fake_session(monkeypatch, vidup_streams=[{"url": "https://a/m.m3u8"}],
+                          vidup_stage1_status=404)
+    status, _ = m.process_tmdb_id("42", providers=["vidup"])
+    assert status == "retry"
+
+
+def test_vidup_like_fetch_is_shared_by_vidfast(monkeypatch):
+    """vidfast 与 vidup 同构（enc-vidfast 同样改成了两阶段），共用一套实现。"""
+    seen = _install_fake_session(monkeypatch, vidfast_streams=[{"url": "https://c/m.m3u8"}],
+                                 vidfast_page_status=200)
+    status, result = m.process_tmdb_id("42", providers=["vidfast"])
+    assert status == "ok" and result["urls"][0]["provider"] == "vidfast"
+    assert any("/enc-vidfast?" in u and u.endswith("&stage=2") for u in seen["urls"])
+
 
 def test_vidup_collects_all_server_urls_and_dedupes(monkeypatch):
     _install_fake_session(monkeypatch, vidup_streams=[
@@ -487,6 +539,66 @@ def test_videasy_no_streams_500_is_nosource(monkeypatch):
     )
     status, _ = m.process_tmdb_id("42", providers=["videasy"])
     assert status == "dead"
+
+
+def _with_title(monkeypatch, tid="42"):
+    monkeypatch.setitem(m._MOVIE_SEARCH_META, tid,
+                        {"title": "Inception", "year": 2010, "imdb": "tt1375666"})
+
+
+def test_videasy_uses_new_host_and_reuses_one_seed_across_servers(monkeypatch):
+    """🔴 2026-10 videasy 迁到 api.wecollege.net、server 改名。seed 接口限流很紧
+    （同一出口 IP 十几次就 429），一部片只能取一次 seed、各 server 复用。"""
+    _with_title(monkeypatch)
+    seen = _install_fake_session(monkeypatch, videasy_sources=_FakeResp(200, text="PAYLOAD"))
+    status, _ = m.process_tmdb_id("42", providers=["videasy"])
+    assert status == "ok"
+    assert seen["videasy_seeds"] == 1
+    assert seen["videasy_servers"] == list(m.VIDEASY_SERVERS)
+    assert m.VIDEASY_HOST == "https://api.wecollege.net"
+
+
+def test_videasy_without_title_only_queries_first_server(monkeypatch):
+    """各 server 按片名检索，缺元数据时只走第一个，不白打其余几个。"""
+    monkeypatch.delitem(m._MOVIE_SEARCH_META, "42", raising=False)
+    seen = _install_fake_session(monkeypatch, videasy_sources=_FakeResp(200, text="PAYLOAD"))
+    m.process_tmdb_id("42", providers=["videasy"])
+    assert seen["videasy_servers"] == [m.VIDEASY_SERVERS[0]]
+
+
+def test_videasy_sources_not_found_500_is_nosource(monkeypatch):
+    """新接口用 500 + "Sources not found" 表达没有这部片：各 server 都这么说才判无源。"""
+    _with_title(monkeypatch)
+    body = _FakeResp(500, text='{"error":"Error","message":"Sources not found"}')
+    _install_fake_session(monkeypatch, videasy_sources=body)
+    status, _ = m.process_tmdb_id("42", providers=["videasy"])
+    assert status == "dead"
+
+
+@pytest.mark.parametrize("message", [
+    "Sources not found", "phoenix api 404", "dallas: title not found on idlix",
+])
+def test_videasy_each_servers_not_found_wording_is_nosource(monkeypatch, message):
+    """实测各 server 表达"没有这部片"的措辞各不相同，都必须认成无源——否则没源的片
+    永远被当成瞬时错误，反复重试、永不判死（服务器验证里 30/40 部因此卡住）。"""
+    _with_title(monkeypatch)
+    body = _FakeResp(500, text=json.dumps({"error": "Error", "message": message}))
+    _install_fake_session(monkeypatch, videasy_sources=body)
+    status, _ = m.process_tmdb_id("42", providers=["videasy"])
+    assert status == "dead"
+
+
+def test_videasy_server_side_500_is_transient(monkeypatch):
+    """其余 500（"proxy unreachable"、"embed extract failed"）是该 server 自身故障，
+    不是无源证据：只要有一个 server 这样，整片按瞬时处理，绝不判死。"""
+    _with_title(monkeypatch)
+    not_found = _FakeResp(500, text='{"message":"Sources not found"}')
+    broken = _FakeResp(500, text='{"message":"rido: proxy unreachable"}')
+    first, *rest = m.VIDEASY_SERVERS
+    sources = {first: broken, **{sv: not_found for sv in rest}}
+    _install_fake_session(monkeypatch, videasy_sources=sources)
+    status, _ = m.process_tmdb_id("42", providers=["videasy"])
+    assert status == "retry"
 
 
 def test_find_media_urls_walks_nested_structures():

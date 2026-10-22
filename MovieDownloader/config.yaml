@@ -139,6 +139,13 @@ tmdb_ids_to_links:
   #      不要用单批数据判断谁更重要；但 vidfast 的 0 从未波动。
   # 可用 --providers a,b 在命令行覆盖，便于单独验证某一家的实际贡献。
   providers: [vidup, videasy, vidlink]
+  # videasy 接口域名与逐个请求的 server（2026-10 上游迁到 api.wecollege.net，server 改为城市名）。
+  # 只取出流主机互不相同的几个：每多一个，每部片就多一次 sources + 一次 dec 请求。
+  #   miami → moon.zenoak.top 多档含 4K；phoenix → sun.paleoak.top
+  #   dallas（e2e.majorplay.net，独立主机）暂不启用：地址不以 .m3u8 结尾，接入前须单独验证。
+  # 上游再改名/迁域名时只改这里即可。
+  videasy_host: "https://api.wecollege.net"
+  videasy_servers: [miami, phoenix]
   # 并发线程数：同时解析多少个 tmdb_id。配合住宅代理分散 IP。
   # 提速优化：无源404已改为不重试（省2/3请求），任务变纯IO等待，可拉高并发；50 实测更稳
   max_workers: 50
