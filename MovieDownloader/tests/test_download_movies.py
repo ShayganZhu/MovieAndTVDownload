@@ -5809,10 +5809,16 @@ def _fake_scene(monkeypatch, frame_boxes, duration=1000.0):
     current = {}
 
     def grab(path, ts):
-        current["boxes"] = next(frames)
+        # 采样阶段逐帧给出；之后的调用是证据截图重抽，返回带时间点的标记，
+        # 便于断言"证据确实取自触发判定的帧"。
+        current["boxes"] = next(frames, "EVIDENCE")
+        if current["boxes"] == "EVIDENCE":
+            return ("evidence", round(ts, 1))
         if current["boxes"] is None:
             return None
-        return rng.integers(0, 255, (180, 320, 3), dtype=np.uint8)
+        # 每帧一个随机灰度的纯色画面：周边像素随时间在变，但没有任何边缘，
+        # 不会凭空抽出台标或台标候选。
+        return np.full((180, 320, 3), int(rng.integers(0, 255)), np.uint8)
 
     monkeypatch.setattr(d, "_grab_frame", grab)
     monkeypatch.setattr(
@@ -5895,6 +5901,7 @@ def test_recurring_scene_sign_at_varying_positions_is_not_a_watermark(monkeypatc
     scan = d.detect_overlays("x.mp4")[0]
     assert scan["verdict"] == "clean", scan
     assert scan["roaming_texts"][0]["text"] == "joesdiner", "记进台账供校准"
+    assert scan["near_miss"] == ["watermark"], "常驻文字没判成水印 → 临门槛，存截图人工核对"
 
 
 @_needs_cv2
@@ -5913,6 +5920,107 @@ def test_fixed_watermark_with_occasional_ocr_misses_is_still_caught(monkeypatch)
     scan = d.detect_overlays("x.mp4")[0]
     assert scan["reasons"] == ["watermark"], scan
     assert scan["watermark_texts"][0]["presence"] == 0.75
+
+
+def _sample_ts(index, count, duration=1000.0):
+    start, end = d._OVERLAY_SPAN
+    return round(duration * (start + (end - start) * (index + 0.5) / count), 1)
+
+
+@_needs_cv2
+def test_hardsub_evidence_comes_from_subtitle_hit_frames(monkeypatch):
+    """证据截图必须取自触发判定的字幕命中帧（复审实测：旧逻辑存下的是"任何有字的帧"，
+    361227 的截图里有一张是公交车车身上的字，不是字幕）。"""
+    hits = [2, 5, 9, 13, 17, 19]
+    lines = ["alpha", "bravo", "charlie", "delta", "echoes", "foxtrot"]
+    boxes = [[] for _ in range(20)]
+    boxes[0] = [{"text": "sanisidrosrl", "x0": 0.4, "x1": 0.9, "y0": 0.2, "y1": 0.3}]  # 场景字
+    for line, index in zip(lines, hits):
+        boxes[index] = [_sub_box(line)]
+    _fake_scene(monkeypatch, boxes)
+    scan, evidence = d.detect_overlays("x.mp4")
+    assert scan["reasons"] == ["hardsub"]
+    expected = [_sample_ts(i, 20) for i in (2, 9, 13, 19)]  # 6 个命中帧里均匀挑 4 个
+    assert [e[1] for e in evidence] == expected == scan["evidence_times"]
+
+
+@_needs_cv2
+def test_watermark_evidence_comes_from_watermark_frames(monkeypatch):
+    """文字水印的证据取自水印所在帧，不取没有水印的帧。"""
+    boxes = [[] for _ in range(4)] + [[_corner_box("piratesite")] for _ in range(16)]
+    _fake_scene(monkeypatch, boxes)
+    scan, evidence = d.detect_overlays("x.mp4")
+    assert scan["reasons"] == ["watermark"]
+    no_watermark = {_sample_ts(i, 20) for i in range(4)}
+    assert evidence and not ({e[1] for e in evidence} & no_watermark)
+
+
+@_needs_cv2
+def test_near_miss_hardsub_is_flagged_with_evidence(monkeypatch):
+    """复审实测的漏判形态（626979：占比 0.15 < 0.2，但成句的不同文本有 14 条）：
+    不判死，但标 near_miss 并按命中帧存截图，供人工核对。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_HIT_RATIO", 0.2)
+    monkeypatch.setattr(d, "HARDSUB_MIN_DISTINCT_TEXTS", 5)
+    boxes = [[] for _ in range(20)]
+    for index, line in zip((3, 8, 14), ("alpha", "bravo", "charlie")):
+        boxes[index] = [_sub_box(line)]
+    _fake_scene(monkeypatch, boxes)
+    scan, evidence = d.detect_overlays("x.mp4")
+    assert scan["verdict"] == "clean" and scan["near_miss"] == ["hardsub"]
+    assert [e[1] for e in evidence] == [_sample_ts(i, 20) for i in (3, 8, 14)]
+
+
+@_needs_cv2
+def test_clean_film_grabs_no_evidence(monkeypatch):
+    """干净且不临门槛的片不重抽任何截图（省一次次 ffmpeg 调用）。"""
+    _fake_scene(monkeypatch, [[] for _ in range(20)])
+    scan, evidence = d.detect_overlays("x.mp4")
+    assert scan["verdict"] == "clean" and scan["near_miss"] == []
+    assert evidence == [] and scan["evidence_times"] == []
+
+
+@_needs_cv2
+def test_logo_peak_ignores_letterbox_lines():
+    """复审实测：宽银幕片的"角落边缘常驻比例"被黑边分界线抬到 0.9，画面里却没有台标。
+    统计这个校准值时必须先剔除分界线（判定本就剔除了，记账也要同口径）。"""
+    import cv2
+    import numpy as np
+
+    rng = np.random.default_rng(3)
+    grays = []
+    for _ in range(30):
+        frame = cv2.GaussianBlur(
+            cv2.resize(rng.integers(0, 255, (17, 30), dtype=np.uint8), (480, 270)), (0, 0), 3
+        )
+        frame[:33] = 0
+        frame[-33:] = 0
+        grays.append(frame)
+    stack = np.stack(grays).astype(np.float32)
+    logo, peak, near = d._find_static_logo(grays, stack.std(axis=0), stack.mean(axis=0))
+    assert logo is None and near is False
+    assert peak < d.WATERMARK_LOGO_PRESENCE * d._NEAR_MISS_LOGO_FRACTION, peak
+
+
+def test_near_miss_film_is_delivered_with_evidence_in_its_own_folder(sandbox, monkeypatch):
+    """临门槛的片照常交付、不判死；截图存到 near_miss/ 子目录（与判死的分开），台账有记录。"""
+    import numpy as np
+
+    job = _overlay_job(sandbox, monkeypatch)
+    monkeypatch.setattr(d, "HARDSUB_ACTION", "kill")
+    d._reset_overlay_stats()
+    scan = dict(_scan(), near_miss=["hardsub"], hit_ratio=0.15, distinct_texts=14)
+    frames = [np.full((54, 96, 3), 128, np.uint8) for _ in range(2)]
+    monkeypatch.setattr(d, "detect_overlays", lambda p: (scan, frames))
+
+    _, ok, info = d.finalize_one_entry(job, set())
+
+    assert ok is True and os.path.exists(info["final_path"])
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == []
+    folder = os.path.join(d.HARDSUB_EVIDENCE_DIR, "near_miss", "66")
+    assert sorted(os.listdir(folder)) == ["1.jpg", "2.jpg"]
+    record = _read_jsonl(d.HARDSUB_SCAN_LOG)[0]
+    assert record["near_miss"] == ["hardsub"] and record["evidence_dir"] == folder
+    assert d.overlay_stats["near_miss"] == 1 and d.overlay_stats["rejected"] == 0
 
 
 @_needs_cv2

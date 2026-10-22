@@ -4762,10 +4762,18 @@ _WATERMARK_POSITION_TOLERANCE = 0.05   # 框中心偏离常驻位置不超过画
 _LOGO_CORNER = (0.25, 0.22)        # 台标搜索区：四角各占宽 25%、高 22%
 # 整行/整列的静止边缘占比超过它 = 宽银幕/画中框的黑边分界线，不是台标，先剔除。
 _LOGO_LINE_FRACTION = 0.4
+_LOGO_LINE_PRESENCE = 0.5          # 认分界线时用的常驻度（低于台标门槛，抖动的线也能认出）
 _LOGO_MIN_EDGE_PIXELS = 40         # 台标的静止边缘像素下限（480 宽小图上）
 _RING_DYNAMIC_STD = 10.0           # 周边像素随时间的标准差中位数 ≥ 它 → 背景在变（固定机位实测约 2）
 _RING_DARK = (24.0, 6.0)           # 周边均值 ≤ 24 且标准差 ≤ 6 → 均匀黑边
-_OVERLAY_EVIDENCE_KEEP = 4         # 每部判死片保留几张证据截图
+_OVERLAY_EVIDENCE_KEEP = 4         # 每部判死 / 临门槛的片保留几张证据截图
+# 临门槛：没判死、但离门槛不远的片也存截图并在台账标 near_miss，供人工核对有没有漏判。
+#   硬字幕：字幕帧占比 ≥ 门槛的一半，且不同文本 ≥ 门槛的一半（漏判的典型形态是对白少
+#           的片，占比略低于门槛、文本却成句地多）
+#   水印：  有常驻文字但因周边不变 / 位置不固定没判；或把台标常驻门槛放宽到 85% 才找得到
+#           形状像台标的图形
+_NEAR_MISS_FRACTION = 0.5
+_NEAR_MISS_LOGO_FRACTION = 0.85
 _HARDSUB_MARKER = "检测到硬字幕"
 _WATERMARK_MARKER = "检测到水印"
 
@@ -4774,7 +4782,9 @@ _hardsub_local = threading.local()
 _overlay_stats_lock = threading.Lock()
 # 本次运行的检测计数（_run_pipeline 开头清零、收尾打印）：比例统计的现场口径，
 # 跨运行的完整口径在 HARDSUB_SCAN_LOG。同时带硬字幕和水印的片两项各计一次。
-overlay_stats = {"checked": 0, "hardsub": 0, "watermark": 0, "rejected": 0, "unknown": 0}
+overlay_stats = {
+    "checked": 0, "hardsub": 0, "watermark": 0, "rejected": 0, "unknown": 0, "near_miss": 0,
+}
 
 
 def _reset_overlay_stats():
@@ -4894,7 +4904,10 @@ def _background_is_dynamic(std_map, mean_map, x0, y0, x1, y1):
 def _find_static_logo(grays, std_map, mean_map):
     """在四角找逐帧边缘位置几乎不变、周边画面在变的紧凑图形（台标）。
 
-    返回 (台标信息或 None, 角落里最高的边缘常驻比例)。后者供门槛校准。
+    返回 (台标信息或 None, 角落里最高的边缘常驻比例, 是否有临门槛的台标候选)。
+    峰值供门槛校准（已剔除黑边分界线）；临门槛候选 = 常驻门槛放宽到 85% 才找得到、
+    形状与周边条件都满足的图形——比单个像素的峰值稳得多，不会被纹理里偶然常驻的
+    零星边缘触发。
     """
     import cv2
     import numpy as np
@@ -4907,35 +4920,58 @@ def _find_static_logo(grays, std_map, mean_map):
     corner[:corner_h, :corner_w] = corner[:corner_h, -corner_w:] = True
     corner[-corner_h:, :corner_w] = corner[-corner_h:, -corner_w:] = True
 
-    static = presence >= WATERMARK_LOGO_PRESENCE
-    # 宽银幕/画中框的黑边分界线横贯整行整列，不是台标。
-    static[static.mean(axis=1) >= _LOGO_LINE_FRACTION, :] = False
-    static[:, static.mean(axis=0) >= _LOGO_LINE_FRACTION] = False
-    static &= corner
-    peak = float(presence[corner].max()) if corner.any() else 0.0
+    # 宽银幕/画中框的黑边分界线横贯整行整列，不是台标。用比台标门槛低的常驻度来认
+    # 它（分界线在相邻两行间抖动时，单行的常驻度会低于台标门槛），并向两侧各扩一行：
+    # 既从台标候选里剔除，也不让它虚抬下面记的峰值——实测宽银幕片的峰值曾被分界线
+    # 抬到 0.9，而画面里根本没有台标，拿它校准门槛会误导人。
+    frequent = presence >= _LOGO_LINE_PRESENCE
+    line_rows = np.convolve(frequent.mean(axis=1) >= _LOGO_LINE_FRACTION, [1, 1, 1], "same") > 0
+    line_cols = np.convolve(frequent.mean(axis=0) >= _LOGO_LINE_FRACTION, [1, 1, 1], "same") > 0
+    usable = corner.copy()
+    usable[line_rows, :] = False
+    usable[:, line_cols] = False
+    peak = float(presence[usable].max()) if usable.any() else 0.0
 
-    # 膨胀把字形/图形的零散笔画连成一块再找连通域。
-    merged = cv2.dilate(static.astype(np.uint8), np.ones((5, 5), np.uint8))
-    count, _labels, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
-    for label in range(1, count):
-        x, y, box_w, box_h, _area = (int(v) for v in stats[label])
-        if box_w < 0.02 * width or box_h < 0.02 * height:
-            continue
-        if max(box_w / box_h, box_h / box_w) > 8:
-            continue
-        if int(static[y:y + box_h, x:x + box_w].sum()) < _LOGO_MIN_EDGE_PIXELS:
-            continue
-        dynamic, ring_std = _background_is_dynamic(
-            std_map, mean_map, x / width, y / height,
-            (x + box_w) / width, (y + box_h) / height,
-        )
-        if dynamic:
-            return {
-                "bbox": [round(x / width, 3), round(y / height, 3),
-                         round(box_w / width, 3), round(box_h / height, 3)],
-                "ring_std": round(ring_std, 1),
-            }, peak
-    return None, peak
+    def candidates(threshold):
+        """常驻度 ≥ threshold 的静止边缘里，形状像台标且周边画面在变的图形。"""
+        static = (presence >= threshold) & usable
+        # 膨胀把字形/图形的零散笔画连成一块再找连通域。
+        merged = cv2.dilate(static.astype(np.uint8), np.ones((5, 5), np.uint8))
+        count, _labels, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
+        for label in range(1, count):
+            x, y, box_w, box_h, _area = (int(v) for v in stats[label])
+            if box_w < 0.02 * width or box_h < 0.02 * height:
+                continue
+            if max(box_w / box_h, box_h / box_w) > 8:
+                continue
+            if int(static[y:y + box_h, x:x + box_w].sum()) < _LOGO_MIN_EDGE_PIXELS:
+                continue
+            dynamic, ring_std = _background_is_dynamic(
+                std_map, mean_map, x / width, y / height,
+                (x + box_w) / width, (y + box_h) / height,
+            )
+            if dynamic:
+                yield {
+                    "bbox": [round(x / width, 3), round(y / height, 3),
+                             round(box_w / width, 3), round(box_h / height, 3)],
+                    "ring_std": round(ring_std, 1),
+                }
+
+    logo = next(candidates(WATERMARK_LOGO_PRESENCE), None)
+    near = logo is None and next(
+        candidates(WATERMARK_LOGO_PRESENCE * _NEAR_MISS_LOGO_FRACTION), None
+    ) is not None
+    return logo, peak, near
+
+
+def _spread(items, count):
+    """从有序列表里均匀挑至多 count 个（首尾都取到），保持顺序。"""
+    items = list(items)
+    if len(items) <= count:
+        return items
+    if count <= 1:
+        return items[:count]
+    return [items[round(i * (len(items) - 1) / (count - 1))] for i in range(count)]
 
 
 def _is_subtitle_box(box):
@@ -4965,9 +5001,8 @@ def detect_overlays(path):
 
     start, end = _OVERLAY_SPAN
     frame_boxes = []
+    frame_times = []  # 与 frame_boxes 对齐：成功抽到的帧的时间点，证据截图按它重抽
     grays = []
-    text_frames = []
-    plain_frames = []
     for index in range(HARDSUB_SAMPLE_FRAMES):
         timestamp = duration * (start + (end - start) * (index + 0.5) / HARDSUB_SAMPLE_FRAMES)
         frame = _grab_frame(path, timestamp)
@@ -4975,6 +5010,7 @@ def detect_overlays(path):
             continue
         boxes = _ocr_text_boxes(frame)
         frame_boxes.append(boxes)
+        frame_times.append(timestamp)
         small_h = max(1, round(frame.shape[0] * _STATIC_FRAME_WIDTH / frame.shape[1]))
         if grays:
             small_h = grays[0].shape[0]  # 个别帧尺寸异常时对齐第一帧，保证能堆叠
@@ -4982,11 +5018,6 @@ def detect_overlays(path):
             cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (_STATIC_FRAME_WIDTH, small_h),
             interpolation=cv2.INTER_AREA,
         ))
-        # 证据截图：优先留有文字的帧；纯图形台标没有文字，退而留普通帧。
-        if boxes and len(text_frames) < _OVERLAY_EVIDENCE_KEEP:
-            text_frames.append(frame)
-        elif len(plain_frames) < _OVERLAY_EVIDENCE_KEEP:
-            plain_frames.append(frame)
 
     sampled = len(frame_boxes)
     if sampled < max(1, HARDSUB_SAMPLE_FRAMES // 2):
@@ -5003,6 +5034,7 @@ def detect_overlays(path):
     #   几秒），无论是不是水印都从硬字幕统计里剔除；周边画面在变的才算文字水印。
     persistent = set()
     watermark_texts = []
+    watermark_frames = set()   # 文字水印（及没判成水印的常驻文字）出现的帧，证据截图用
     # 常驻但不判水印的文字，记下来供门槛校准：周边画面不变（固定机位的招牌等）、
     # 位置不固定（不同镜头里反复拍到的招牌/店名）。
     static_texts = []
@@ -5025,6 +5057,7 @@ def detect_overlays(path):
             and abs(cy - anchor_y) <= _WATERMARK_POSITION_TOLERANCE
         ]
         anchored_presence = len({box["frame"] for box in anchored}) / sampled
+        watermark_frames |= {box["frame"] for box in anchored}
         if anchored_presence < WATERMARK_TEXT_PRESENCE:
             roaming_texts.append({
                 "text": cluster["text"], "presence": round(presence, 3),
@@ -5043,19 +5076,20 @@ def detect_overlays(path):
         (watermark_texts if dynamic else static_texts).append(item)
 
     # ② 图形台标
-    logo, logo_peak = _find_static_logo(grays, std_map, mean_map)
+    logo, logo_peak, logo_near = _find_static_logo(grays, std_map, mean_map)
 
     # ③ 硬字幕：剔除常驻文字后的底部居中文字框
-    hit_frames = 0
+    hit_indexes = []
     hit_clusters = set()
-    for boxes in frame_boxes:
+    for index, boxes in enumerate(frame_boxes):
         subtitle_clusters = {
             box["cluster"] for box in boxes
             if box["cluster"] not in persistent and _is_subtitle_box(box)
         }
         if subtitle_clusters:
-            hit_frames += 1
+            hit_indexes.append(index)
             hit_clusters |= subtitle_clusters
+    hit_frames = len(hit_indexes)
     hit_ratio = hit_frames / sampled
     is_hardsub = (
         hit_ratio >= HARDSUB_MIN_HIT_RATIO
@@ -5064,6 +5098,40 @@ def detect_overlays(path):
     is_watermark = WATERMARK_CHECK_ENABLED and bool(watermark_texts or logo)
 
     reasons = (["hardsub"] if is_hardsub else []) + (["watermark"] if is_watermark else [])
+    near_miss = []
+    if not is_hardsub and (
+        hit_ratio >= HARDSUB_MIN_HIT_RATIO * _NEAR_MISS_FRACTION
+        and len(hit_clusters) >= math.ceil(HARDSUB_MIN_DISTINCT_TEXTS * _NEAR_MISS_FRACTION)
+    ):
+        near_miss.append("hardsub")
+    if not is_watermark and (static_texts or roaming_texts or logo_near):
+        near_miss.append("watermark")
+
+    # 证据截图：只在判死或临门槛时抽，且只抽**触发判定**的那些帧——字幕命中帧、
+    # 水印文字所在帧。只有找不到这类帧时（纯图形台标：没有文字，但每帧都在）才
+    # 均匀取几帧兜底。按时间点重抽，不必在抽帧时把几十张整帧留在内存里。
+    evidence = []
+    evidence_times = []
+    concerned = set(reasons) | set(near_miss)
+    if concerned:
+        picked = []
+        trigger_lists = []
+        if "hardsub" in concerned:
+            trigger_lists.append(hit_indexes)
+        if "watermark" in concerned:
+            trigger_lists.append(sorted(watermark_frames))
+        for indexes in trigger_lists or [[]]:
+            for index in _spread(indexes, _OVERLAY_EVIDENCE_KEEP):
+                if index not in picked and len(picked) < _OVERLAY_EVIDENCE_KEEP:
+                    picked.append(index)
+        if not picked:
+            picked = _spread(range(sampled), _OVERLAY_EVIDENCE_KEEP)
+        for index in picked:
+            frame = _grab_frame(path, frame_times[index])
+            if frame is not None:
+                evidence.append(frame)
+                evidence_times.append(round(frame_times[index], 1))
+
     return {
         "verdict": "+".join(reasons) or "clean",
         "reasons": reasons,
@@ -5077,18 +5145,24 @@ def detect_overlays(path):
         "watermark_logo": logo,
         "static_texts": static_texts,
         "roaming_texts": roaming_texts,
-        # 角落里最高的边缘常驻比例：没判出台标时也记下，门槛校准用。
+        # 角落里最高的边缘常驻比例（已剔除黑边分界线）：没判出台标时也记下，门槛校准用。
         "logo_peak_presence": round(logo_peak, 3),
-    }, (text_frames or plain_frames)
+        "near_miss": near_miss,
+        "evidence_times": evidence_times,
+    }, evidence
 
 
-def _save_overlay_evidence(tmdb_id, frames):
-    """保存证据截图到 {evidence_dir}/{tmdbId}/。成品会被删掉，这是事后人工
-    核对有没有误判的唯一依据。失败只告警。"""
+def _save_overlay_evidence(tmdb_id, frames, near_miss=False):
+    """保存证据截图：判死的片到 {evidence_dir}/{tmdbId}/（成品会被删掉，这是事后人工
+    核对有没有误判的唯一依据），临门槛的片到 {evidence_dir}/near_miss/{tmdbId}/
+    （核对有没有漏判）。没有截图时不建空目录。失败只告警。"""
+    if not frames:
+        return None
     try:
         import cv2
 
-        folder = os.path.join(HARDSUB_EVIDENCE_DIR, safe_file_token(tmdb_id))
+        parts = ["near_miss"] if near_miss else []
+        folder = os.path.join(HARDSUB_EVIDENCE_DIR, *parts, safe_file_token(tmdb_id))
         os.makedirs(folder, exist_ok=True)
         for index, frame in enumerate(frames, 1):
             cv2.imwrite(os.path.join(folder, f"{index}.jpg"), frame)
@@ -5150,6 +5224,7 @@ def check_overlays(tmdb_id, title, path):
         scan, evidence = {"verdict": "unknown", "reasons": [], "error": str(exc)}, []
 
     reasons = scan.get("reasons") or []
+    near_miss = scan.get("near_miss") or []
     with _overlay_stats_lock:
         overlay_stats["checked"] += 1
         if scan.get("verdict") == "unknown":
@@ -5158,6 +5233,8 @@ def check_overlays(tmdb_id, title, path):
             overlay_stats[reason] += 1
         if reasons:
             overlay_stats["rejected"] += 1
+        elif near_miss:
+            overlay_stats["near_miss"] += 1
 
     record = {
         "tmdbId": tmdb_id,
@@ -5168,6 +5245,8 @@ def check_overlays(tmdb_id, title, path):
     }
     if reasons:
         record["evidence_dir"] = _save_overlay_evidence(tmdb_id, evidence)
+    elif near_miss:
+        record["evidence_dir"] = _save_overlay_evidence(tmdb_id, evidence, near_miss=True)
     write_log(HARDSUB_SCAN_LOG, record)
 
     if scan.get("verdict") == "unknown":
@@ -5175,6 +5254,10 @@ def check_overlays(tmdb_id, title, path):
               f"{scan.get('error')}", flush=True)
         return []
     if not reasons:
+        if near_miss:
+            label = "、".join({"hardsub": "硬字幕", "watermark": "水印"}[r] for r in near_miss)
+            print(f"  [{tmdb_id}] {label}临门槛（未判死，照常交付），已存截图待人工核对",
+                  flush=True)
         return []
     summary = _overlay_summary(scan)
     if HARDSUB_ACTION != "kill":
@@ -6653,6 +6736,9 @@ def _run_pipeline(run_volume=None):
                 f"{overlay_stats['rejected']} 部（{overlay_stats['rejected'] / checked:.1%}）"
                 + (f"，检测失败按没有放行 {overlay_stats['unknown']} 部"
                    if overlay_stats["unknown"] else "")
+                + (f"，临门槛 {overlay_stats['near_miss']} 部（截图在 "
+                   f"{os.path.join(HARDSUB_EVIDENCE_DIR, 'near_miss')}，待人工核对）"
+                   if overlay_stats["near_miss"] else "")
                 + ("" if HARDSUB_ACTION == "kill" else "（记录模式，未删除）")
             )
 
