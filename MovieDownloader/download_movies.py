@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import difflib
 import json
 import functools
 import hashlib
@@ -288,14 +289,20 @@ CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
 # 字幕，但**只剥不剔**——这类字幕不在画面里，去掉它对影片零损失，不值得为它
 # 丢片。详见 convert_ts_to_mp4。
 STRIP_CLOSED_CAPTIONS = bool(_CFG.get("strip_closed_captions", True))
-# 硬字幕（烧在画面里的字幕）检测。业务口径：带硬字幕的片一概不要——检出即
-# 就地删除、不上传、整片判死，不再换节点尝试。检测放在转封装之后、移入成品
-# 目录之前（下载后检测）：先拿到真实比例，再决定要不要挪到下载前。详见
-# check_hardsub。
+# 画面叠加物检测：硬字幕（烧在画面里的字幕）+ 水印（文字水印、台标）。业务口径：
+# 带硬字幕或水印的片一概不要——检出即就地删除、不上传、整片判死，不再换节点尝试。
+# 检测放在转封装之后、移入成品目录之前（下载后检测）：先拿到真实比例，再决定要不要
+# 挪到下载前。两者共用一套抽帧，配置都在 hardsub_check 段。详见 check_overlays。
 _HARDSUB_CFG = _CFG.get("hardsub_check", {}) or {}
+# 总开关：关掉则硬字幕与水印都不检测（不抽帧）。
 HARDSUB_CHECK_ENABLED = bool(_HARDSUB_CFG.get("enabled", True))
 # kill = 检出即删除并判死；record = 只检测、记台账与证据帧，照常交付（校准门槛用）。
 HARDSUB_ACTION = str(_HARDSUB_CFG.get("action", "kill")).strip().lower()
+# 水印判定开关（在总开关打开时才生效）与两条常驻门槛：同一串文字 / 角落里同一个
+# 静止图形，出现在不少于该比例的抽样帧里才算水印。
+WATERMARK_CHECK_ENABLED = bool(_HARDSUB_CFG.get("watermark_enabled", True))
+WATERMARK_TEXT_PRESENCE = float(_HARDSUB_CFG.get("watermark_text_presence", 0.3))
+WATERMARK_LOGO_PRESENCE = float(_HARDSUB_CFG.get("watermark_logo_presence", 0.8))
 HARDSUB_SAMPLE_FRAMES = max(1, int(_HARDSUB_CFG.get("sample_frames", 60)))
 HARDSUB_MIN_HIT_RATIO = float(_HARDSUB_CFG.get("min_hit_ratio", 0.2))
 HARDSUB_MIN_DISTINCT_TEXTS = max(1, int(_HARDSUB_CFG.get("min_distinct_texts", 5)))
@@ -1545,9 +1552,9 @@ def dead_record_passes_now(record):
        这批记录会被无条件放回。而实跑中"未知分辨率"占比高达 44%（§12.18），
        量级不小。故 height 缺失时在模式 A 下**一律不放回**。
     """
-    # 硬字幕判死与画质门槛无关，调门槛救不回来：永不放回。
-    # （它也没有码率依据，不先拦下的话会落进下面"没有依据 → 放回"那条。）
-    if record.get("reason_class") == "hardsub":
+    # 硬字幕/水印判死与画质门槛无关，调门槛救不回来：永不放回。
+    # （它们也没有码率依据，不先拦下的话会落进下面"没有依据 → 放回"那条。）
+    if record.get("reason_class") in ("hardsub", "watermark"):
         return False
 
     evidence = record.get("evidence") or {}
@@ -2118,6 +2125,59 @@ def remove_upload_failure_from_log(tmdb_id):
                 else:
                     file.write(json.dumps(record, ensure_ascii=False) + "\n")
         os.replace(tmp_path, FAILED_LOG)
+
+
+def load_pending_ids():
+    """upload_pending.jsonl 里登记过的 tmdbId（待补传）。"""
+    ids = set()
+    if not os.path.exists(UPLOAD_PENDING_LOG):
+        return ids
+    with pending_lock:
+        with open(UPLOAD_PENDING_LOG, "r", encoding="utf-8") as file:
+            for line in file:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                normalized_id = normalize_tmdb_id(record.get("tmdbId"))
+                if normalized_id:
+                    ids.add(normalized_id)
+    return ids
+
+
+def remove_pending_record(tmdb_id):
+    """从 upload_pending.jsonl 删除该片的全部记录（补传已成功，留着只会误导）。
+
+    pending_lock 保护，读全量 -> 过滤 -> 写临时文件 -> os.replace 原子替换；
+    无法解析的行原样保留。
+    """
+    tmdb_id = str(tmdb_id)
+    with pending_lock:
+        if not os.path.exists(UPLOAD_PENDING_LOG):
+            return
+        kept = []
+        changed = False
+        with open(UPLOAD_PENDING_LOG, "r", encoding="utf-8") as file:
+            for line in file:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError:
+                    kept.append(stripped)
+                    continue
+                if str(record.get("tmdbId")) == tmdb_id:
+                    changed = True
+                    continue
+                kept.append(stripped)
+        if not changed:
+            return
+        tmp_path = UPLOAD_PENDING_LOG + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            for line in kept:
+                file.write(line + "\n")
+        os.replace(tmp_path, UPLOAD_PENDING_LOG)
 
 
 def _still_needs_refetch(record, done_ids, dead_ids):
@@ -4668,36 +4728,56 @@ def _resolve_final_resolution(resolution, final_path, label):
     return probed
 
 
-# ---------- 硬字幕检测（下载后、移入成品目录前） ----------
-# 做法：在片长 10%~90% 区间均匀抽帧（避开片头片尾的演职员表），只截画面底部、
-# 用 OCR 找"像字幕"的文字框；整片满足两条才判有硬字幕：
-#   ① 像字幕的帧占比 ≥ min_hit_ratio —— 正常对白片字幕在屏时间约三到五成；
-#      原片自带的外语强制字幕只零星出现，达不到门槛，不会被误判；
-#   ② 不同文本数 ≥ min_distinct_texts —— 字幕内容一直在变，台标/水印/固定
-#      标语是同一串字，靠这条排除。
-# 检测出错一律按"无硬字幕"放行：检测故障不能变成丢片。
+# ---------- 画面叠加物检测：硬字幕 + 水印（下载后、移入成品目录前） ----------
+# 业务口径：带硬字幕或水印的片一概不要——检出即就地删除、不上传、整片判死，
+# 不再换节点尝试。检测出错一律按"没有"放行：检测故障不能变成丢片。
+#
+# 同一套抽帧（片长 10%~90% 均匀抽 N 帧，避开片头片尾的演职员表），三路判定：
+#   ① 文字水印：整帧 OCR，相似文本归为一类。同一串字压在不同背景上会被识别成
+#      好几个变体（实测半透明网址水印 60 帧认出 8 种写法），不按相似度合并的话
+#      会被当成"内容一直在变"的字幕。某一类出现在 ≥ watermark_text_presence 的
+#      抽样帧里、且周边画面在变 → 文字水印。
+#   ② 图形水印（台标）：四角区域里逐帧边缘位置几乎不变（≥ watermark_logo_presence
+#      的帧都在）的紧凑图形、且周边画面在变 → 图形水印。纯图形 OCR 认不出，靠这一路。
+#   ③ 硬字幕：画面底部 30%、水平居中、字号合理的文字框，先剔除①里的常驻文字，
+#      再看：字幕帧占比 ≥ min_hit_ratio 且不同文本类数 ≥ min_distinct_texts。
+#      原片自带的外语强制字幕只零星出现，达不到占比门槛，不会被误判。
+#
+# "周边画面在变"是防误杀的关键：固定机位的片子（舞台剧录像等）背景里的招牌、
+# 门框同样常驻不动，但它们周边的像素随时间也几乎不变；真正的叠加物压在不断切换
+# 的画面上。宽银幕黑边里的水印周边是均匀黑色，单独认作"压在黑边上"。
 
-_HARDSUB_SPAN = (0.10, 0.90)          # 抽帧区间（占片长比例）
-_HARDSUB_CROP_RATIO = 0.30            # 只看画面底部 30%（含宽银幕黑边里的字幕）
-_HARDSUB_CROP_WIDTH = 960             # 截图缩放宽度：字幕仍清晰可读，OCR 快一倍以上
+_OVERLAY_SPAN = (0.10, 0.90)       # 抽帧区间（占片长比例）
+_OVERLAY_FRAME_WIDTH = 960         # OCR 用的帧宽：字幕与水印仍清晰可读
+_STATIC_FRAME_WIDTH = 480          # 静止分析用的灰度小图宽度
+_HARDSUB_BOTTOM = 0.70             # 硬字幕只看画面底部 30%（含宽银幕黑边里的字幕）
 # "像字幕"的文字框几何条件，均相对整帧：框中心横坐标居中、框高在字幕字号范围内。
 _HARDSUB_CENTER_RANGE = (0.30, 0.70)
 _HARDSUB_BOX_HEIGHT_RANGE = (0.02, 0.10)
-_HARDSUB_EVIDENCE_KEEP = 4            # 每部判定为硬字幕的片保留几张证据截图
+_TEXT_SIMILARITY = 0.75            # 两串文字相似度 ≥ 它视为同一句（吸收 OCR 抖动）
+_WATERMARK_MIN_TEXT_LEN = 4        # 太短的文字（"ok"、"no"）不拿来判水印
+_LOGO_CORNER = (0.25, 0.22)        # 台标搜索区：四角各占宽 25%、高 22%
+# 整行/整列的静止边缘占比超过它 = 宽银幕/画中框的黑边分界线，不是台标，先剔除。
+_LOGO_LINE_FRACTION = 0.4
+_LOGO_MIN_EDGE_PIXELS = 40         # 台标的静止边缘像素下限（480 宽小图上）
+_RING_DYNAMIC_STD = 10.0           # 周边像素随时间的标准差中位数 ≥ 它 → 背景在变（固定机位实测约 2）
+_RING_DARK = (24.0, 6.0)           # 周边均值 ≤ 24 且标准差 ≤ 6 → 均匀黑边
+_OVERLAY_EVIDENCE_KEEP = 4         # 每部判死片保留几张证据截图
 _HARDSUB_MARKER = "检测到硬字幕"
+_WATERMARK_MARKER = "检测到水印"
 
 # OCR 引擎按线程各建一份：模型加载只要零点几秒，且避免多线程共用一个会话。
 _hardsub_local = threading.local()
-_hardsub_stats_lock = threading.Lock()
+_overlay_stats_lock = threading.Lock()
 # 本次运行的检测计数（_run_pipeline 开头清零、收尾打印）：比例统计的现场口径，
-# 跨运行的完整口径在 HARDSUB_SCAN_LOG。
-hardsub_stats = {"checked": 0, "hardsub": 0, "unknown": 0}
+# 跨运行的完整口径在 HARDSUB_SCAN_LOG。同时带硬字幕和水印的片两项各计一次。
+overlay_stats = {"checked": 0, "hardsub": 0, "watermark": 0, "rejected": 0, "unknown": 0}
 
 
-def _reset_hardsub_stats():
-    with _hardsub_stats_lock:
-        for key in hardsub_stats:
-            hardsub_stats[key] = 0
+def _reset_overlay_stats():
+    with _overlay_stats_lock:
+        for key in overlay_stats:
+            overlay_stats[key] = 0
 
 
 def _hardsub_engine():
@@ -4706,28 +4786,25 @@ def _hardsub_engine():
         from rapidocr_onnxruntime import RapidOCR
 
         # 线程数要限：转封装池有多个线程同时检测，onnxruntime 默认会吃满全部核。
-        # 检测模型按"长边不超过截图宽度"缩放：默认的"短边至少 736"会把 960×162
-        # 的底部截图放大到四千多像素宽，实测每帧 0.77s；改后 0.045s，结论不变。
+        # 检测模型按"长边不超过帧宽"缩放：默认的"短边至少 736"会把小图放大到
+        # 几千像素宽，实测每帧慢十几倍、结论不变。
         engine = RapidOCR(
             intra_op_num_threads=HARDSUB_OCR_THREADS, inter_op_num_threads=1,
-            det_limit_type="max", det_limit_side_len=_HARDSUB_CROP_WIDTH,
+            det_limit_type="max", det_limit_side_len=_OVERLAY_FRAME_WIDTH,
         )
         _hardsub_local.engine = engine
     return engine
 
 
-def _grab_bottom_crop(path, timestamp):
-    """抽 timestamp 秒处一帧的底部区域并缩放，返回 BGR 图像；失败返回 None。"""
+def _grab_frame(path, timestamp):
+    """抽 timestamp 秒处一帧并缩放到 _OVERLAY_FRAME_WIDTH 宽，返回 BGR 图像；失败返回 None。"""
     import cv2
     import numpy as np
 
-    vf = (
-        f"crop=iw:ih*{_HARDSUB_CROP_RATIO}:0:ih*{1 - _HARDSUB_CROP_RATIO},"
-        f"scale={_HARDSUB_CROP_WIDTH}:-2"
-    )
     command = [
         "ffmpeg", "-v", "error", "-ss", f"{timestamp:.3f}", "-i", path,
-        "-frames:v", "1", "-vf", vf, "-f", "image2pipe", "-c:v", "png", "-",
+        "-frames:v", "1", "-vf", f"scale={_OVERLAY_FRAME_WIDTH}:-2",
+        "-f", "image2pipe", "-c:v", "bmp", "-",
     ]
     try:
         result = subprocess.run(command, capture_output=True, timeout=60)
@@ -4743,78 +4820,246 @@ def _normalize_sub_text(text):
     return re.sub(r"[\W_]+", "", str(text or "")).lower()
 
 
-def _subtitle_text_in(crop):
-    """截图里像字幕的文字（多个框拼成一句）；没有返回空串。"""
-    result, _ = _hardsub_engine()(crop, use_cls=False)
-    height, width = crop.shape[:2]
-    texts = []
+def _ocr_text_boxes(frame):
+    """整帧 OCR，返回置信度达标的文字框。坐标与框高都是相对整帧的比例。"""
+    result, _ = _hardsub_engine()(frame, use_cls=False)
+    height, width = frame.shape[:2]
+    boxes = []
     for box, text, score in result or []:
         if score < HARDSUB_MIN_TEXT_SCORE:
             continue
+        normalized = _normalize_sub_text(text)
+        if len(normalized) < 2:
+            continue
         xs = [point[0] for point in box]
         ys = [point[1] for point in box]
-        center_x = (min(xs) + max(xs)) / 2 / width
-        # 截图只是整帧底部的一段，框高要换算回整帧比例。
-        box_height = (max(ys) - min(ys)) / height * _HARDSUB_CROP_RATIO
-        if not (_HARDSUB_CENTER_RANGE[0] <= center_x <= _HARDSUB_CENTER_RANGE[1]):
-            continue
-        if not (_HARDSUB_BOX_HEIGHT_RANGE[0] <= box_height <= _HARDSUB_BOX_HEIGHT_RANGE[1]):
-            continue
-        normalized = _normalize_sub_text(text)
-        if len(normalized) >= 2:
-            texts.append(normalized)
-    return "".join(texts)
+        boxes.append({
+            "text": normalized,
+            "x0": min(xs) / width, "x1": max(xs) / width,
+            "y0": min(ys) / height, "y1": max(ys) / height,
+        })
+    return boxes
 
 
-def detect_hardsub(path):
-    """抽帧检测一部片有没有硬字幕。
+def _cluster_texts(frame_boxes):
+    """把各帧的文字框按相似度归类，并给每个框标上类序号 box["cluster"]。
 
-    返回 (结论字典, 证据截图列表)。结论 verdict 为 hardsub / clean / unknown
-    （探测不到时长、抽到的帧不足一半时为 unknown，调用方按无字幕放行）。
+    返回各类：[{"text": 代表文本, "frames": 出现过的帧序号集合, "boxes": [...]}]。
     """
+    clusters = []
+    for index, boxes in enumerate(frame_boxes):
+        for box in boxes:
+            for cluster_id, cluster in enumerate(clusters):
+                if difflib.SequenceMatcher(
+                    None, cluster["text"], box["text"]
+                ).ratio() >= _TEXT_SIMILARITY:
+                    break
+            else:
+                cluster_id = len(clusters)
+                clusters.append({"text": box["text"], "frames": set(), "boxes": []})
+            box["cluster"] = cluster_id
+            clusters[cluster_id]["frames"].add(index)
+            clusters[cluster_id]["boxes"].append(box)
+    return clusters
+
+
+def _background_is_dynamic(std_map, mean_map, x0, y0, x1, y1):
+    """区域 (x0,y0)-(x1,y1)（相对整帧的比例）的周边像素是否随时间在变。
+
+    返回 (是否在变, 周边标准差中位数)。周边是均匀黑边（宽银幕黑边上的水印）也算。
+    """
+    import numpy as np
+
+    height, width = std_map.shape
+    bx0, by0 = max(0, int(x0 * width)), max(0, int(y0 * height))
+    bx1 = min(width, max(bx0 + 1, int(math.ceil(x1 * width))))
+    by1 = min(height, max(by0 + 1, int(math.ceil(y1 * height))))
+    pad = max(4, int(max(bx1 - bx0, by1 - by0) * 0.5))
+    rx0, ry0 = max(0, bx0 - pad), max(0, by0 - pad)
+    rx1, ry1 = min(width, bx1 + pad), min(height, by1 + pad)
+    ring = np.ones((ry1 - ry0, rx1 - rx0), bool)
+    ring[by0 - ry0:by1 - ry0, bx0 - rx0:bx1 - rx0] = False
+    if not ring.any():
+        return False, 0.0
+    ring_std = float(np.median(std_map[ry0:ry1, rx0:rx1][ring]))
+    ring_mean = float(np.median(mean_map[ry0:ry1, rx0:rx1][ring]))
+    dark_border = ring_mean <= _RING_DARK[0] and ring_std <= _RING_DARK[1]
+    return ring_std >= _RING_DYNAMIC_STD or dark_border, ring_std
+
+
+def _find_static_logo(grays, std_map, mean_map):
+    """在四角找逐帧边缘位置几乎不变、周边画面在变的紧凑图形（台标）。
+
+    返回 (台标信息或 None, 角落里最高的边缘常驻比例)。后者供门槛校准。
+    """
+    import cv2
+    import numpy as np
+
+    presence = np.mean([cv2.Canny(gray, 60, 160) > 0 for gray in grays], axis=0)
+    height, width = presence.shape
+    corner = np.zeros((height, width), bool)
+    corner_w = max(1, int(width * _LOGO_CORNER[0]))
+    corner_h = max(1, int(height * _LOGO_CORNER[1]))
+    corner[:corner_h, :corner_w] = corner[:corner_h, -corner_w:] = True
+    corner[-corner_h:, :corner_w] = corner[-corner_h:, -corner_w:] = True
+
+    static = presence >= WATERMARK_LOGO_PRESENCE
+    # 宽银幕/画中框的黑边分界线横贯整行整列，不是台标。
+    static[static.mean(axis=1) >= _LOGO_LINE_FRACTION, :] = False
+    static[:, static.mean(axis=0) >= _LOGO_LINE_FRACTION] = False
+    static &= corner
+    peak = float(presence[corner].max()) if corner.any() else 0.0
+
+    # 膨胀把字形/图形的零散笔画连成一块再找连通域。
+    merged = cv2.dilate(static.astype(np.uint8), np.ones((5, 5), np.uint8))
+    count, _labels, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
+    for label in range(1, count):
+        x, y, box_w, box_h, _area = (int(v) for v in stats[label])
+        if box_w < 0.02 * width or box_h < 0.02 * height:
+            continue
+        if max(box_w / box_h, box_h / box_w) > 8:
+            continue
+        if int(static[y:y + box_h, x:x + box_w].sum()) < _LOGO_MIN_EDGE_PIXELS:
+            continue
+        dynamic, ring_std = _background_is_dynamic(
+            std_map, mean_map, x / width, y / height,
+            (x + box_w) / width, (y + box_h) / height,
+        )
+        if dynamic:
+            return {
+                "bbox": [round(x / width, 3), round(y / height, 3),
+                         round(box_w / width, 3), round(box_h / height, 3)],
+                "ring_std": round(ring_std, 1),
+            }, peak
+    return None, peak
+
+
+def _is_subtitle_box(box):
+    center_x = (box["x0"] + box["x1"]) / 2
+    center_y = (box["y0"] + box["y1"]) / 2
+    box_height = box["y1"] - box["y0"]
+    return (
+        center_y >= _HARDSUB_BOTTOM
+        and _HARDSUB_CENTER_RANGE[0] <= center_x <= _HARDSUB_CENTER_RANGE[1]
+        and _HARDSUB_BOX_HEIGHT_RANGE[0] <= box_height <= _HARDSUB_BOX_HEIGHT_RANGE[1]
+    )
+
+
+def detect_overlays(path):
+    """抽帧检测一部片有没有硬字幕 / 水印。
+
+    返回 (结论字典, 证据截图列表)。结论 verdict 为 hardsub / watermark /
+    hardsub+watermark / clean / unknown（读不到片长、抽到的帧不足一半时为
+    unknown，调用方按"没有"放行）。reasons 列出判死理由。
+    """
+    import cv2
+    import numpy as np
+
     duration = _probe_duration(path)
     if not duration or duration <= 0:
-        return {"verdict": "unknown", "error": "无法读取片长"}, []
+        return {"verdict": "unknown", "reasons": [], "error": "无法读取片长"}, []
 
-    start, end = _HARDSUB_SPAN
-    sampled = 0
-    hit_texts = []
-    evidence = []
+    start, end = _OVERLAY_SPAN
+    frame_boxes = []
+    grays = []
+    text_frames = []
+    plain_frames = []
     for index in range(HARDSUB_SAMPLE_FRAMES):
         timestamp = duration * (start + (end - start) * (index + 0.5) / HARDSUB_SAMPLE_FRAMES)
-        crop = _grab_bottom_crop(path, timestamp)
-        if crop is None:
+        frame = _grab_frame(path, timestamp)
+        if frame is None:
             continue
-        sampled += 1
-        text = _subtitle_text_in(crop)
-        if text:
-            hit_texts.append(text)
-            if len(evidence) < _HARDSUB_EVIDENCE_KEEP:
-                evidence.append(crop)
+        boxes = _ocr_text_boxes(frame)
+        frame_boxes.append(boxes)
+        small_h = max(1, round(frame.shape[0] * _STATIC_FRAME_WIDTH / frame.shape[1]))
+        if grays:
+            small_h = grays[0].shape[0]  # 个别帧尺寸异常时对齐第一帧，保证能堆叠
+        grays.append(cv2.resize(
+            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (_STATIC_FRAME_WIDTH, small_h),
+            interpolation=cv2.INTER_AREA,
+        ))
+        # 证据截图：优先留有文字的帧；纯图形台标没有文字，退而留普通帧。
+        if boxes and len(text_frames) < _OVERLAY_EVIDENCE_KEEP:
+            text_frames.append(frame)
+        elif len(plain_frames) < _OVERLAY_EVIDENCE_KEEP:
+            plain_frames.append(frame)
 
+    sampled = len(frame_boxes)
     if sampled < max(1, HARDSUB_SAMPLE_FRAMES // 2):
         return {
-            "verdict": "unknown", "sampled": sampled,
+            "verdict": "unknown", "reasons": [], "sampled": sampled,
             "error": f"只抽到 {sampled}/{HARDSUB_SAMPLE_FRAMES} 帧",
         }, []
 
-    hit_ratio = len(hit_texts) / sampled
-    distinct = len(set(hit_texts))
+    stack = np.stack(grays).astype(np.float32)
+    std_map, mean_map = stack.std(axis=0), stack.mean(axis=0)
+    clusters = _cluster_texts(frame_boxes)
+
+    # ① 常驻文字：出现在足够多抽样帧里的那几类。它们不可能是字幕（一句字幕只在屏
+    #   几秒），无论是不是水印都从硬字幕统计里剔除；周边画面在变的才算文字水印。
+    persistent = set()
+    watermark_texts = []
+    # 常驻但周边画面不变的文字（固定机位的招牌等）：不判水印，记下来供门槛校准。
+    static_texts = []
+    for cluster_id, cluster in enumerate(clusters):
+        presence = len(cluster["frames"]) / sampled
+        if presence < WATERMARK_TEXT_PRESENCE:
+            continue
+        persistent.add(cluster_id)
+        if len(cluster["text"]) < _WATERMARK_MIN_TEXT_LEN:
+            continue
+        # 位置取各帧框的中位数：水印偶尔挪位，中位数仍落在它常驻的地方。
+        dynamic, ring_std = _background_is_dynamic(
+            std_map, mean_map,
+            *(float(np.median([box[key] for box in cluster["boxes"]]))
+              for key in ("x0", "y0", "x1", "y1")),
+        )
+        item = {
+            "text": cluster["text"], "presence": round(presence, 3),
+            "ring_std": round(ring_std, 1),
+        }
+        (watermark_texts if dynamic else static_texts).append(item)
+
+    # ② 图形台标
+    logo, logo_peak = _find_static_logo(grays, std_map, mean_map)
+
+    # ③ 硬字幕：剔除常驻文字后的底部居中文字框
+    hit_frames = 0
+    hit_clusters = set()
+    for boxes in frame_boxes:
+        subtitle_clusters = {
+            box["cluster"] for box in boxes
+            if box["cluster"] not in persistent and _is_subtitle_box(box)
+        }
+        if subtitle_clusters:
+            hit_frames += 1
+            hit_clusters |= subtitle_clusters
+    hit_ratio = hit_frames / sampled
     is_hardsub = (
-        hit_ratio >= HARDSUB_MIN_HIT_RATIO and distinct >= HARDSUB_MIN_DISTINCT_TEXTS
+        hit_ratio >= HARDSUB_MIN_HIT_RATIO
+        and len(hit_clusters) >= HARDSUB_MIN_DISTINCT_TEXTS
     )
+    is_watermark = WATERMARK_CHECK_ENABLED and bool(watermark_texts or logo)
+
+    reasons = (["hardsub"] if is_hardsub else []) + (["watermark"] if is_watermark else [])
     return {
-        "verdict": "hardsub" if is_hardsub else "clean",
+        "verdict": "+".join(reasons) or "clean",
+        "reasons": reasons,
         "sampled": sampled,
-        "hits": len(hit_texts),
+        "hits": hit_frames,
         "hit_ratio": round(hit_ratio, 3),
-        "distinct_texts": distinct,
+        "distinct_texts": len(hit_clusters),
         # 少量样例供人工复核（已归一化，只留字母数字汉字）。
-        "examples": list(dict.fromkeys(hit_texts))[:5],
-    }, evidence
+        "examples": [clusters[cid]["text"] for cid in sorted(hit_clusters)][:5],
+        "watermark_texts": watermark_texts,
+        "watermark_logo": logo,
+        "static_texts": static_texts,
+        # 角落里最高的边缘常驻比例：没判出台标时也记下，门槛校准用。
+        "logo_peak_presence": round(logo_peak, 3),
+    }, (text_frames or plain_frames)
 
 
-def _save_hardsub_evidence(tmdb_id, crops):
+def _save_overlay_evidence(tmdb_id, frames):
     """保存证据截图到 {evidence_dir}/{tmdbId}/。成品会被删掉，这是事后人工
     核对有没有误判的唯一依据。失败只告警。"""
     try:
@@ -4822,52 +5067,74 @@ def _save_hardsub_evidence(tmdb_id, crops):
 
         folder = os.path.join(HARDSUB_EVIDENCE_DIR, safe_file_token(tmdb_id))
         os.makedirs(folder, exist_ok=True)
-        for index, crop in enumerate(crops, 1):
-            cv2.imwrite(os.path.join(folder, f"{index}.jpg"), crop)
+        for index, frame in enumerate(frames, 1):
+            cv2.imwrite(os.path.join(folder, f"{index}.jpg"), frame)
         return folder
     except Exception as exc:  # noqa: BLE001
-        print(f"  [{tmdb_id}] ⚠️ 硬字幕证据截图保存失败: {exc}", flush=True)
+        print(f"  [{tmdb_id}] ⚠️ 证据截图保存失败: {exc}", flush=True)
         return None
 
 
-def record_hardsub_dead(tmdb_id, title, scan):
-    """把硬字幕片记进 DOWNLOAD_DEAD_LOG（纯追加，读取端按 id 聚合）。
+def _overlay_summary(scan):
+    """一句话描述判死依据，用于日志与判死记录。"""
+    parts = []
+    if "hardsub" in scan.get("reasons", []):
+        parts.append(f"{_HARDSUB_MARKER}（字幕帧占比 {scan.get('hit_ratio')}，"
+                     f"不同文本 {scan.get('distinct_texts')} 条）")
+    if "watermark" in scan.get("reasons", []):
+        what = [f"文字「{item['text']}」" for item in scan.get("watermark_texts") or []]
+        if scan.get("watermark_logo"):
+            what.append(f"角落台标 {scan['watermark_logo']['bbox']}")
+        parts.append(f"{_WATERMARK_MARKER}（{'、'.join(what)}）")
+    return "；".join(parts)
 
-    reason_class="hardsub" 是关键：`--retry-dead` 复判只针对画质门槛，
-    硬字幕片永不放回（见 dead_record_passes_now）。
+
+def record_overlay_dead(tmdb_id, title, scan):
+    """把硬字幕/水印片记进 DOWNLOAD_DEAD_LOG（纯追加，读取端按 id 聚合）。
+
+    reason_class 为 hardsub 或 watermark（两者都有时记 hardsub，reasons 里列全）。
+    关键在于它不是 quality：`--retry-dead` 复判只针对画质门槛，这两类永不放回
+    （见 dead_record_passes_now）。
     """
+    reasons = scan.get("reasons") or []
     write_log(DOWNLOAD_DEAD_LOG, {
         "tmdbId": tmdb_id,
         "title": title or "",
         "dead_at": int(time.time()),
-        "reason_class": "hardsub",
-        "error": f"{_HARDSUB_MARKER}（字幕帧占比 {scan.get('hit_ratio')}，"
-                 f"不同文本 {scan.get('distinct_texts')} 条）",
+        "reason_class": "hardsub" if "hardsub" in reasons else "watermark",
+        "reasons": reasons,
+        "error": _overlay_summary(scan),
         "evidence": {
             key: scan.get(key)
-            for key in ("sampled", "hits", "hit_ratio", "distinct_texts", "examples")
+            for key in ("sampled", "hits", "hit_ratio", "distinct_texts", "examples",
+                        "watermark_texts", "watermark_logo")
         },
     })
 
 
-def check_hardsub(tmdb_id, title, path):
-    """检测并按配置处置。返回 True 表示该片判为硬字幕且应删除判死（action=kill）。
+def check_overlays(tmdb_id, title, path):
+    """检测硬字幕/水印并按配置处置。返回应判死的理由列表（空列表 = 照常交付）。
 
-    每部片的结论都写进 HARDSUB_SCAN_LOG（比例统计与门槛校准用）；判为硬字幕的
-    片另存证据截图。检测本身任何异常都按"无硬字幕"放行。
+    每部片的结论都写进 HARDSUB_SCAN_LOG（比例统计与门槛校准用）；判出问题的片
+    另存证据截图。检测本身任何异常都按"没有"放行。只有 action=kill 时才返回
+    非空列表（record 模式照常交付）。
     """
     if not HARDSUB_CHECK_ENABLED:
-        return False
+        return []
     try:
-        scan, evidence = detect_hardsub(path)
+        scan, evidence = detect_overlays(path)
     except Exception as exc:  # noqa: BLE001 - 检测故障不能变成丢片
-        scan, evidence = {"verdict": "unknown", "error": str(exc)}, []
+        scan, evidence = {"verdict": "unknown", "reasons": [], "error": str(exc)}, []
 
-    verdict = scan.get("verdict")
-    with _hardsub_stats_lock:
-        hardsub_stats["checked"] += 1
-        if verdict in ("hardsub", "unknown"):
-            hardsub_stats[verdict] += 1
+    reasons = scan.get("reasons") or []
+    with _overlay_stats_lock:
+        overlay_stats["checked"] += 1
+        if scan.get("verdict") == "unknown":
+            overlay_stats["unknown"] += 1
+        for reason in reasons:
+            overlay_stats[reason] += 1
+        if reasons:
+            overlay_stats["rejected"] += 1
 
     record = {
         "tmdbId": tmdb_id,
@@ -4876,25 +5143,23 @@ def check_hardsub(tmdb_id, title, path):
         "action": HARDSUB_ACTION,
         **scan,
     }
-    if verdict == "hardsub":
-        record["evidence_dir"] = _save_hardsub_evidence(tmdb_id, evidence)
+    if reasons:
+        record["evidence_dir"] = _save_overlay_evidence(tmdb_id, evidence)
     write_log(HARDSUB_SCAN_LOG, record)
 
-    if verdict == "unknown":
-        print(f"  [{tmdb_id}] ⚠️ 硬字幕检测失败，按无字幕放行: "
+    if scan.get("verdict") == "unknown":
+        print(f"  [{tmdb_id}] ⚠️ 硬字幕/水印检测失败，按没有放行: "
               f"{scan.get('error')}", flush=True)
-        return False
-    if verdict != "hardsub":
-        return False
+        return []
+    if not reasons:
+        return []
+    summary = _overlay_summary(scan)
     if HARDSUB_ACTION != "kill":
-        print(f"  [{tmdb_id}] {_HARDSUB_MARKER}（记录模式，照常交付）："
-              f"字幕帧占比 {scan['hit_ratio']}，不同文本 {scan['distinct_texts']} 条",
-              flush=True)
-        return False
-    record_hardsub_dead(tmdb_id, title, scan)
-    print(f"  [{tmdb_id}] {_HARDSUB_MARKER}：字幕帧占比 {scan['hit_ratio']}，"
-          f"不同文本 {scan['distinct_texts']} 条 → 删除成品并判死", flush=True)
-    return True
+        print(f"  [{tmdb_id}] {summary}（记录模式，照常交付）", flush=True)
+        return []
+    record_overlay_dead(tmdb_id, title, scan)
+    print(f"  [{tmdb_id}] {summary} → 删除成品并判死", flush=True)
+    return reasons
 
 
 def finalize_one_entry(conversion_job, processed_ids):
@@ -4909,7 +5174,7 @@ def finalize_one_entry(conversion_job, processed_ids):
     temp_mp4 = conversion_job["temp_mp4"]
     cleanup_paths = conversion_job["cleanup_paths"]
     completed = False
-    hardsub_dead = False
+    overlay_dead = False
 
     try:
         print(f"  [{tmdb_id}] 开始转封装为 MP4...", flush=True)
@@ -4917,15 +5182,20 @@ def finalize_one_entry(conversion_job, processed_ids):
         if not convert_ts_to_mp4(final_ts, temp_mp4):
             raise RuntimeError("FFmpeg 转换失败")
 
-        # 硬字幕：在移入成品目录之前查。判死的片就地删掉，不进 downloads/、
+        # 硬字幕/水印：在移入成品目录之前查。判死的片就地删掉，不进 downloads/、
         # 不存字幕与 meta、不上传；整片判死，不再换节点尝试（业务口径）。
-        if check_hardsub(tmdb_id, conversion_job["title"], temp_mp4):
+        reasons = check_overlays(tmdb_id, conversion_job["title"], temp_mp4)
+        if reasons:
             remove_file(temp_mp4)
-            hardsub_dead = True
+            overlay_dead = True
+            labels = "、".join(
+                {"hardsub": _HARDSUB_MARKER, "watermark": _WATERMARK_MARKER}[r]
+                for r in reasons
+            )
             return tmdb_id, False, {
-                "error": f"{_HARDSUB_MARKER}，已删除成品并判死"
-                         f"（不上传、不再尝试其它节点）",
-                "hardsub": True,
+                "error": f"{labels}，已删除成品并判死（不上传、不再尝试其它节点）",
+                # 失败台账的 stage 用它：两者都有时记 hardsub，与判死记录口径一致。
+                "overlay_reject": "hardsub" if "hardsub" in reasons else "watermark",
             }
 
         print(f"  [{tmdb_id}] 转封装完成，准备移动文件", flush=True)
@@ -4990,10 +5260,10 @@ def finalize_one_entry(conversion_job, processed_ids):
         for path in cleanup_paths:
             remove_file(path)
         # 成品已落地即登记去重（成败上传都不再重下）；失败则释放 ID 锁允许重试。
-        # 硬字幕判死同样登记：本次运行里重取回来的新链接也不该再下它。
+        # 硬字幕/水印判死同样登记：本次运行里重取回来的新链接也不该再下它。
         with processing_lock:
             processing_ids.discard(normalized_id)
-            if completed or hardsub_dead:
+            if completed or overlay_dead:
                 processed_ids.add(normalized_id)
 
 
@@ -5178,6 +5448,26 @@ def upload_one_entry(success_info):
 
 
 
+def _upload_stranded(info):
+    """补传一部滞留成品（上传线程里跑，不占主循环）。
+
+    之前留过上传失败台账的片（had_upload_record），成功后与 reupload 同口径收尾：
+    success.jsonl 收成一条 uploaded:true、failed.jsonl 删掉 stage=upload 的行、
+    pending 删掉该片。否则"failed.jsonl 里没有 upload 阶段的行 ⇒ 全部已上传"这条
+    约定被打破，pending 也要等到某次正常收尾才清。台账收尾失败只告警——视频已经
+    进了 R2，这只是记账。
+    """
+    tmdb_id, ok, record = upload_one_entry(info)
+    if ok and record.get("uploaded") and info.get("had_upload_record"):
+        try:
+            update_success_log(tmdb_id, record)
+            remove_upload_failure_from_log(tmdb_id)
+            remove_pending_record(tmdb_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [{tmdb_id}] ⚠️ 补传成功但清理旧台账失败: {exc}", flush=True)
+    return tmdb_id, ok, record
+
+
 # ---------- 主函数 ----------
 def preflight_check_s3():
     """开启 s3 上传时的启动前预检：任一不过则写日志并退出，避免每部片静默失败进 pending。
@@ -5263,11 +5553,33 @@ def preflight_check_ffmpeg():
     print("[ffmpeg 预检通过] ffmpeg 与 ffprobe 均已就绪", flush=True)
 
 
-def preflight_check_hardsub():
-    """启用硬字幕检测时预检 action 取值与 OCR 依赖：不满足就 fail-fast 退出。
+_OCR_SELF_TEST_TEXT = "OCR SELF TEST"
 
-    不能在运行中才发现：缺依赖时每部片都会"检测失败按无字幕放行"，带硬字幕的
-    片照样被上传，而用户以为过滤在生效。
+
+def _ocr_self_test():
+    """在一张画好已知文字的图上真跑一次 OCR，返回 (是否认出, 实际认出的文字)。
+
+    只 import 成功不够：onnxruntime 建会话失败、与机器指令集不兼容、库升级后
+    调用方式变了，这些都要到真推理时才暴露。
+    """
+    import cv2
+    import numpy as np
+
+    image = np.full((120, 640, 3), 30, np.uint8)
+    cv2.putText(image, _OCR_SELF_TEST_TEXT, (40, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                1.6, (255, 255, 255), 3, cv2.LINE_AA)
+    texts = [box["text"] for box in _ocr_text_boxes(image)]
+    expected = _normalize_sub_text(_OCR_SELF_TEST_TEXT)
+    return any(expected in text for text in texts), texts
+
+
+def preflight_check_hardsub():
+    """启用硬字幕/水印检测时预检 action 取值、OCR 依赖与 OCR 是否真能用：不满足就
+    fail-fast 退出。
+
+    不能在运行中才发现：OCR 用不了时每部片都会"检测失败按没有放行"，带硬字幕或
+    水印的片照样被上传，而用户以为过滤在生效（全量跑多半被 kill -INT 停下，
+    收尾统计也看不到）。
     """
     if not HARDSUB_CHECK_ENABLED:
         return
@@ -5280,11 +5592,23 @@ def preflight_check_hardsub():
             importlib.import_module("rapidocr_onnxruntime")
             importlib.import_module("cv2")
         except Exception as exc:  # noqa: BLE001
-            reason = (f"硬字幕检测依赖缺失（{exc}）。请先 "
-                      f"`pip install -r requirements.txt`，"
+            reason = (f"硬字幕/水印检测依赖缺失（{exc}）。请先 "
+                      f"`pip install -r requirements.txt`；Linux 上若报 libGL.so.1 "
+                      f"缺失，再执行 `apt install -y libgl1 libglib2.0-0`。"
                       f"或在 config.yaml 里关闭 hardsub_check.enabled")
+    if reason is None:
+        try:
+            recognized, texts = _ocr_self_test()
+            if not recognized:
+                reason = (f"OCR 自检没认出测试文字「{_OCR_SELF_TEST_TEXT}」"
+                          f"（实际认出 {texts}），检测结果不可信")
+        except Exception as exc:  # noqa: BLE001
+            reason = f"OCR 自检运行失败（{type(exc).__name__}: {exc}）"
+        finally:
+            # 自检在主线程建了一份引擎；主线程不做检测，释放掉省内存。
+            _hardsub_local.__dict__.pop("engine", None)
     if reason:
-        print(f"[硬字幕检测预检失败] {reason}", flush=True)
+        print(f"[硬字幕/水印检测预检失败] {reason}", flush=True)
         write_log(FAILED_LOG, {
             "stage": "preflight",
             "error": reason,
@@ -5292,8 +5616,9 @@ def preflight_check_hardsub():
         })
         release_main_lock()
         sys.exit(1)
-    print(f"[硬字幕检测预检通过] 动作 {HARDSUB_ACTION}，每部抽 "
-          f"{HARDSUB_SAMPLE_FRAMES} 帧", flush=True)
+    print(f"[硬字幕/水印检测预检通过] OCR 自检正常，动作 {HARDSUB_ACTION}，每部抽 "
+          f"{HARDSUB_SAMPLE_FRAMES} 帧，水印判定"
+          f"{'开启' if WATERMARK_CHECK_ENABLED else '关闭'}", flush=True)
 
 
 def install_interrupt_handler():
@@ -5431,7 +5756,7 @@ def _run_pipeline(run_volume=None):
     """
     clean_temp_directory()
     print("已清理 temp 目录中的旧临时文件")
-    _reset_hardsub_stats()
+    _reset_overlay_stats()
 
     logged_ids = load_success_log_ids()
     disk_ids, duplicate_files = scan_downloaded_mp4_ids()
@@ -5539,6 +5864,12 @@ def _run_pipeline(run_volume=None):
             disk_ids - load_uploaded_ids(),
             {tid: entry.get("title") or "" for tid, entry in entry_by_id.items()},
         )
+        # 之前留过上传失败台账的（success.jsonl 有 uploaded:false 或 pending 有记录），
+        # 补传成功后要把那些台账一并清掉，见 _upload_stranded。
+        if stranded_uploads:
+            had_record = logged_ids | load_pending_ids()
+            for job in stranded_uploads:
+                job["had_upload_record"] = job["tmdbId"] in had_record
         if stranded_uploads:
             print(
                 f"发现 {len(stranded_uploads)} 部成品已在本地、但没有上传成功记录"
@@ -5761,17 +6092,19 @@ def _run_pipeline(run_volume=None):
                 info = {"error": str(exc)}
 
             if not conversion_success:
-                # 硬字幕判死单独标 stage：它不是转封装故障，统计与排查时要分开看。
-                hardsub = bool(info.get("hardsub"))
+                # 硬字幕/水印判死单独标 stage：它不是转封装故障，统计与排查时要分开看。
+                overlay = info.get("overlay_reject")
                 write_log(FAILED_LOG, {
                     "tmdbId": tmdb_id,
                     "title": entry.get("title") or "",
                     "urls": entry.get("urls", []),
                     "error": info.get("error", "未知错误"),
-                    "stage": "hardsub" if hardsub else "conversion",
+                    "stage": overlay or "conversion",
                 })
-                print(f"{'硬字幕判死' if hardsub else '转封装失败'}: "
-                      f"{tmdb_id}: {info.get('error', '未知错误')}")
+                label = {"hardsub": "硬字幕判死", "watermark": "水印判死"}.get(
+                    overlay, "转封装失败"
+                )
+                print(f"{label}: {tmdb_id}: {info.get('error', '未知错误')}")
                 return
 
             # 转封装成功 -> 立即提交上传。反压：先 acquire 信号量（限制
@@ -5911,7 +6244,7 @@ def _run_pipeline(run_volume=None):
                 info = stranded_queue.pop(0)
                 # 与转封装分支同理：submit 失败必须立即归还配额，否则信号量泄漏。
                 try:
-                    upload_future = upload_executor.submit(upload_one_entry, info)
+                    upload_future = upload_executor.submit(_upload_stranded, info)
                 except Exception as exc:
                     upload_semaphore.release()
                     print(f"滞留成品上传提交失败: {info['tmdbId']}: {exc}", flush=True)
@@ -6284,14 +6617,17 @@ def _run_pipeline(run_volume=None):
         )
         print_upload_volume("本次上传成功", volume)
 
-        # 硬字幕比例：决定日后要不要把检测挪到下载前的依据（完整台账见 scan_log）。
-        if hardsub_stats["checked"]:
-            checked = hardsub_stats["checked"]
+        # 硬字幕/水印比例：决定日后要不要把检测挪到下载前的依据（完整台账见 scan_log）。
+        if overlay_stats["checked"]:
+            checked = overlay_stats["checked"]
             print(
-                f"\n硬字幕检测：已检测 {checked} 部，判定带硬字幕 "
-                f"{hardsub_stats['hardsub']} 部（{hardsub_stats['hardsub'] / checked:.1%}）"
-                + (f"，检测失败按无字幕放行 {hardsub_stats['unknown']} 部"
-                   if hardsub_stats["unknown"] else "")
+                f"\n硬字幕/水印检测：已检测 {checked} 部，"
+                f"硬字幕 {overlay_stats['hardsub']} 部（{overlay_stats['hardsub'] / checked:.1%}），"
+                f"水印 {overlay_stats['watermark']} 部（{overlay_stats['watermark'] / checked:.1%}），"
+                f"合计{'判死' if HARDSUB_ACTION == 'kill' else '检出'} "
+                f"{overlay_stats['rejected']} 部（{overlay_stats['rejected'] / checked:.1%}）"
+                + (f"，检测失败按没有放行 {overlay_stats['unknown']} 部"
+                   if overlay_stats["unknown"] else "")
                 + ("" if HARDSUB_ACTION == "kill" else "（记录模式，未删除）")
             )
 

@@ -527,20 +527,26 @@ download_movies:
   # 只剥不剔：检测到就去掉字幕、照常交付这部片。目前只支持 H.264；其它编码
   # 检测到隐藏字幕时原样保留并记日志，绝不因此放弃该片。
   strip_closed_captions: true
-  # 硬字幕（烧在画面里的字幕）检测：转封装之后、移入 downloads/ 之前抽帧 OCR。
-  # 判为硬字幕的片：就地删除、不上传、整片判死（download_dead.jsonl，
-  # reason_class=hardsub，--retry-dead 永不放回），不再换节点尝试。
-  # 检测出错一律按无字幕放行。依赖 rapidocr_onnxruntime（见 requirements.txt）。
+  # 画面叠加物检测：硬字幕（烧在画面里的字幕）+ 水印（文字水印、角落台标）。
+  # 转封装之后、移入 downloads/ 之前，在片长 10%~90% 均匀抽帧做 OCR 与静止区域分析。
+  # 检出任一项的片：就地删除、不上传、整片判死（download_dead.jsonl，
+  # reason_class=hardsub/watermark，--retry-dead 永不放回），不再换节点尝试。
+  # 检测出错一律按没有放行。依赖 rapidocr_onnxruntime（见 requirements.txt）。
   hardsub_check:
-    enabled: true
+    enabled: true             # 总开关：关掉则硬字幕与水印都不检测
     action: kill              # kill=检出即删除判死；record=只检测记账、照常交付（校准门槛用）
-    sample_frames: 60         # 每部在片长 10%~90% 均匀抽帧数（只看画面底部 30%）
+    sample_frames: 60         # 每部在片长 10%~90% 均匀抽帧数
+    # -- 硬字幕：画面底部 30%、水平居中、字号合理的文字（先剔除常驻文字） --
     min_hit_ratio: 0.2        # 像字幕的帧占比门槛（对白片字幕在屏约三到五成）
-    min_distinct_texts: 5     # 不同文本数门槛（排除台标/水印这类固定文字）
-    min_text_score: 0.8       # OCR 置信度下限
+    min_distinct_texts: 5     # 不同文本数门槛（相似文本归为一类后计数）
+    min_text_score: 0.8       # OCR 置信度下限（硬字幕与文字水印共用）
+    # -- 水印：常驻画面、且周边画面在变（固定机位的招牌/门框不算） --
+    watermark_enabled: true
+    watermark_text_presence: 0.3   # 同一串文字出现在 ≥ 该比例的抽样帧 → 文字水印
+    watermark_logo_presence: 0.8   # 四角同一静止图形出现在 ≥ 该比例的抽样帧 → 台标
     ocr_threads: 2            # 每个检测线程的 OCR 线程数（转封装池多线程并发检测）
     scan_log: "hardsub_scan.jsonl"     # 每部片的检测结论（比例统计与门槛校准用）
-    evidence_dir: "hardsub_evidence"   # 判为硬字幕的片的证据截图（成品删除后人工复核用）
+    evidence_dir: "hardsub_evidence"   # 判死片的证据截图（成品删除后人工复核用）
   # ---- playlist(master/media)解析阶段的请求重试 ----
   # 源站临时 5xx 抽风时，这一层若过早放弃会直接判整部影片失败。
   #

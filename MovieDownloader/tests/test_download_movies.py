@@ -5647,9 +5647,9 @@ def test_probe_codec_takes_first_line_of_duplicated_output(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 硬字幕检测（下载后、移入成品目录前）
-#   业务口径：带硬字幕的片就地删除、不上传、整片判死，不再换节点尝试；
-#   检测出错按无字幕放行；--retry-dead 永不放回。
+# 画面叠加物检测：硬字幕 + 水印（下载后、移入成品目录前）
+#   业务口径：带硬字幕或水印的片就地删除、不上传、整片判死，不再换节点尝试；
+#   检测出错按没有放行；--retry-dead 永不放回。
 # ---------------------------------------------------------------------------
 
 def _ocr_available():
@@ -5673,30 +5673,62 @@ _SUB_LINES = [
 
 
 def _make_overlay_video(tmp_path, kind, seconds=60, w=640, h=360):
-    """合成测试片：sub=底部居中、每 2 秒换一句的字幕（一半时间在屏）；
-    logo=一直不变的居中标语 + 角落台标；clean=无字。1 帧/秒编码，够抽帧用。"""
+    """合成测试片（1 帧/秒编码，够抽帧用）。背景是逐帧随机的模糊纹理——与真实影片
+    一样画面不断切换；static_scene 例外，模拟固定机位。
+
+      sub          底部居中、每 2 秒换一句的字幕（一半时间在屏）
+      semi_wm      半透明的居中网址水印（OCR 会认出多种变体）
+      logo_graphic 右上角的纯图形台标（没有文字，OCR 认不出）
+      letterbox    宽银幕黑边、无任何叠加物（黑边分界线横贯全宽，不能当台标）
+      static_scene 固定机位：带 "HOTEL" 招牌与门框的静止背景 + 一个走动的人
+    """
     import cv2
     import numpy as np
 
+    rng = np.random.default_rng(11)
+    font = cv2.FONT_HERSHEY_SIMPLEX
     frames = tmp_path / f"{kind}_frames"
     frames.mkdir()
-    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    def texture():
+        base = rng.integers(0, 255, (h // 16, w // 16, 3), dtype=np.uint8)
+        return cv2.GaussianBlur(cv2.resize(base, (w, h), interpolation=cv2.INTER_CUBIC), (0, 0), 4)
+
+    static_bg = None
+    if kind == "static_scene":
+        static_bg = texture()
+        cv2.rectangle(static_bg, (30, 20), (160, 60), (40, 40, 160), -1)
+        cv2.putText(static_bg, "HOTEL", (42, 52), font, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.rectangle(static_bg, (520, 280), (620, 350), (90, 90, 90), 4)
+
     for s in range(seconds):
-        img = np.zeros((h, w, 3), np.uint8)
-        img[:] = (40 + s % 60, 70, 100 + (s * 3) % 100)
-        cv2.circle(img, (w // 2 + int(80 * np.sin(s / 7)), h // 2 - 40), 45, (200, 180, 60), -1)
+        if kind == "static_scene":
+            img = static_bg.copy()
+            cv2.circle(img, (w // 2 + int(60 * np.sin(s / 5)), h // 2), 30, (0, 200, 255), -1)
+        else:
+            img = texture()
         if kind == "sub" and (s // 2) % 2 == 0:
             text = _SUB_LINES[(s // 4) % len(_SUB_LINES)]
             (tw, _), _ = cv2.getTextSize(text, font, 0.8, 2)
             org = ((w - tw) // 2, int(h * 0.92))
             cv2.putText(img, text, org, font, 0.8, (0, 0, 0), 6, cv2.LINE_AA)
             cv2.putText(img, text, org, font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-        if kind == "logo":
-            text = "WATCH FREE ON STREAMHUB"
-            (tw, _), _ = cv2.getTextSize(text, font, 0.7, 2)
-            cv2.putText(img, text, ((w - tw) // 2, int(h * 0.93)), font, 0.7,
-                        (230, 230, 230), 2, cv2.LINE_AA)
-            cv2.putText(img, "HBO", (int(w * 0.88), int(h * 0.95)), font, 0.6, (255, 255, 255), 2)
+        if kind == "semi_wm":
+            overlay = img.copy()
+            text = "WWW.FREEMOVIES-HD.COM"
+            (tw, _), _ = cv2.getTextSize(text, font, 0.8, 2)
+            cv2.putText(overlay, text, ((w - tw) // 2, int(h * 0.88)), font, 0.8,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+            img = cv2.addWeighted(overlay, 0.45, img, 0.55, 0)
+        if kind == "logo_graphic":
+            x, y = int(w * 0.85), int(h * 0.06)
+            cv2.circle(img, (x + 18, y + 18), 15, (240, 240, 240), 3)
+            cv2.rectangle(img, (x + 8, y + 10), (x + 28, y + 26), (240, 240, 240), 2)
+            cv2.line(img, (x + 40, y + 4), (x + 40, y + 32), (240, 240, 240), 2)
+        if kind == "letterbox":
+            bar = int(h * 0.12)
+            img[:bar] = 0
+            img[-bar:] = 0
         cv2.imwrite(str(frames / f"{s:04d}.png"), img)
     out = tmp_path / f"{kind}.mp4"
     subprocess.run(
@@ -5708,71 +5740,160 @@ def _make_overlay_video(tmp_path, kind, seconds=60, w=640, h=360):
     return str(out)
 
 
-@_needs_ocr
-def test_hardsub_detector_flags_changing_bottom_subtitles(tmp_path, monkeypatch):
-    """🔴 真 OCR 端到端：底部居中、内容不断变化的字幕 → 判为硬字幕，并带回证据截图。"""
+@pytest.fixture
+def _fast_overlay(monkeypatch):
     monkeypatch.setattr(d, "HARDSUB_SAMPLE_FRAMES", 20)
-    scan, evidence = d.detect_hardsub(_make_overlay_video(tmp_path, "sub"))
-    assert scan["verdict"] == "hardsub", scan
+    monkeypatch.setattr(d, "WATERMARK_CHECK_ENABLED", True)
+
+
+@_needs_ocr
+def test_overlay_detector_flags_changing_bottom_subtitles(tmp_path, _fast_overlay):
+    """🔴 真 OCR 端到端：底部居中、内容不断变化的字幕 → 硬字幕（不是水印），带证据截图。"""
+    scan, evidence = d.detect_overlays(_make_overlay_video(tmp_path, "sub"))
+    assert scan["reasons"] == ["hardsub"], scan
     assert scan["hit_ratio"] >= d.HARDSUB_MIN_HIT_RATIO
     assert scan["distinct_texts"] >= d.HARDSUB_MIN_DISTINCT_TEXTS
     assert 0 < len(evidence) <= 4
 
 
 @_needs_ocr
-def test_hardsub_detector_ignores_static_overlay_and_clean_video(tmp_path, monkeypatch):
-    """一直不变的标语/台标（同一串字）与干净画面都不能判成硬字幕——误判就是永久丢片。"""
-    monkeypatch.setattr(d, "HARDSUB_SAMPLE_FRAMES", 20)
-    logo, _ = d.detect_hardsub(_make_overlay_video(tmp_path, "logo"))
-    assert logo["verdict"] == "clean", logo
-    assert logo["distinct_texts"] <= 1, "固定文字只能算一条文本"
-    clean, _ = d.detect_hardsub(_make_overlay_video(tmp_path, "clean"))
-    assert clean["verdict"] == "clean" and clean["hits"] == 0, clean
+def test_overlay_detector_flags_semi_transparent_text_watermark(tmp_path, _fast_overlay):
+    """🔴 复审实测过的场景：半透明网址水印被 OCR 认成多种变体。必须归成同一类、
+    判为水印，且不能被当成"不断变化的字幕"算进硬字幕。"""
+    scan, _ = d.detect_overlays(_make_overlay_video(tmp_path, "semi_wm"))
+    assert scan["reasons"] == ["watermark"], scan
+    assert len(scan["watermark_texts"]) == 1
+    assert "freemovies" in scan["watermark_texts"][0]["text"]
+    assert scan["distinct_texts"] == 0, "常驻文字必须从硬字幕统计里剔除"
 
 
-def _fake_frames(monkeypatch, texts, duration=1000.0):
-    """让检测器"看到"给定的逐帧字幕文本（None 表示抽帧失败）。"""
+@_needs_ocr
+def test_overlay_detector_flags_graphic_corner_logo(tmp_path, _fast_overlay):
+    """没有文字的角落台标 OCR 认不出，靠静止边缘分析抓。"""
+    scan, evidence = d.detect_overlays(_make_overlay_video(tmp_path, "logo_graphic"))
+    assert scan["reasons"] == ["watermark"], scan
+    x, y, _, _ = scan["watermark_logo"]["bbox"]
+    assert x > 0.75 and y < 0.22, "应定位在右上角"
+    assert evidence, "纯图形台标也要留证据截图"
+
+
+@_needs_ocr
+def test_overlay_detector_keeps_letterbox_and_fixed_camera_films(tmp_path, _fast_overlay):
+    """防误杀：宽银幕黑边分界线横贯全宽、固定机位里的招牌与门框也常驻不动，
+    但都不是叠加物，必须判 clean。"""
+    letterbox, _ = d.detect_overlays(_make_overlay_video(tmp_path, "letterbox"))
+    assert letterbox["verdict"] == "clean", letterbox
+    static, _ = d.detect_overlays(_make_overlay_video(tmp_path, "static_scene"))
+    assert static["verdict"] == "clean", static
+    assert static["watermark_logo"] is None
+
+
+def _fake_scene(monkeypatch, frame_boxes, duration=1000.0):
+    """让检测器"看到"给定的逐帧 OCR 结果（None 表示抽帧失败）。帧本身是逐帧随机的
+    噪声图（周边画面在变），保证不会抽出图形台标。"""
+    import numpy as np
+
+    rng = np.random.default_rng(5)
     monkeypatch.setattr(d, "_probe_duration", lambda p: duration)
-    frames = iter(texts)
+    frames = iter(frame_boxes)
     current = {}
 
     def grab(path, ts):
-        current["text"] = next(frames)
-        return None if current["text"] is None else object()
+        current["boxes"] = next(frames)
+        if current["boxes"] is None:
+            return None
+        return rng.integers(0, 255, (180, 320, 3), dtype=np.uint8)
 
-    monkeypatch.setattr(d, "_grab_bottom_crop", grab)
-    monkeypatch.setattr(d, "_subtitle_text_in", lambda crop: current["text"])
-    monkeypatch.setattr(d, "HARDSUB_SAMPLE_FRAMES", len(texts))
+    monkeypatch.setattr(d, "_grab_frame", grab)
+    monkeypatch.setattr(
+        d, "_ocr_text_boxes", lambda frame: [dict(b) for b in current["boxes"]]
+    )
+    monkeypatch.setattr(d, "HARDSUB_SAMPLE_FRAMES", len(frame_boxes))
+    monkeypatch.setattr(d, "WATERMARK_CHECK_ENABLED", True)
 
 
+def _sub_box(text):
+    """底部居中、字号正常的文字框（像字幕）。"""
+    return {"text": text, "x0": 0.35, "x1": 0.65, "y0": 0.88, "y1": 0.93}
+
+
+def _corner_box(text):
+    return {"text": text, "x0": 0.85, "x1": 0.95, "y0": 0.03, "y1": 0.07}
+
+
+_needs_cv2 = pytest.mark.skipif(not _ocr_available(), reason="需要 opencv / numpy")
+
+
+@_needs_cv2
 def test_hardsub_needs_both_hit_ratio_and_distinct_texts(monkeypatch):
-    """两条门槛缺一不可：字幕帧够多但文本不变（台标）→ clean；文本多变但只零星
-    出现（外语强制字幕）→ clean；两者都满足 → hardsub。"""
+    """两条门槛缺一不可：文本多变但只零星出现（外语强制字幕）→ clean；
+    两者都满足 → hardsub。"""
     monkeypatch.setattr(d, "HARDSUB_MIN_HIT_RATIO", 0.2)
     monkeypatch.setattr(d, "HARDSUB_MIN_DISTINCT_TEXTS", 5)
 
-    _fake_frames(monkeypatch, ["logo"] * 10 + [""] * 10)
-    assert d.detect_hardsub("x.mp4")[0]["verdict"] == "clean"
+    _fake_scene(monkeypatch, [[_sub_box(f"line{i}abc")] for i in range(3)] + [[]] * 17)
+    assert d.detect_overlays("x.mp4")[0]["verdict"] == "clean"
 
-    _fake_frames(monkeypatch, [f"line{i}" for i in range(3)] + [""] * 17)
-    assert d.detect_hardsub("x.mp4")[0]["verdict"] == "clean"
-
-    _fake_frames(monkeypatch, [f"line{i}" for i in range(6)] + [""] * 14)
-    scan = d.detect_hardsub("x.mp4")[0]
-    assert scan["verdict"] == "hardsub"
+    _fake_scene(monkeypatch, [[_sub_box(t)] for t in
+                              ("alpha", "bravo", "charlie", "delta", "echoes", "foxtrot")]
+                + [[]] * 14)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["reasons"] == ["hardsub"]
     assert scan["hit_ratio"] == 0.3 and scan["distinct_texts"] == 6
 
 
-def test_hardsub_is_unknown_when_duration_or_frames_missing(monkeypatch):
-    """读不到片长、或抽到的帧不足一半 → unknown（调用方按无字幕放行）。"""
+@_needs_cv2
+def test_ocr_variants_of_one_watermark_collapse_into_one(monkeypatch):
+    """🔴 同一串水印字的 OCR 变体必须归为一类：判水印，且不计入硬字幕的不同文本数。"""
+    variants = ["wwwfreemovieshdcom", "wwfreemovieshdcom", "vwwfreemovieshdco",
+                "wfreemovieshdcom", "wwwfreemovieshdcon"]
+    _fake_scene(monkeypatch, [[_sub_box(variants[i % 5])] for i in range(20)])
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["reasons"] == ["watermark"], scan
+    assert len(scan["watermark_texts"]) == 1
+    assert scan["distinct_texts"] == 0 and scan["hits"] == 0
+
+
+@_needs_cv2
+def test_subtitles_under_a_corner_watermark_are_both_reported(monkeypatch):
+    """水印与真字幕同时存在：两项都要判出来（reasons 列全，判死记 hardsub）。"""
+    lines = ["alpha", "bravo", "charlie", "delta", "echoes", "foxtrot", "golfer", "hotels"]
+    boxes = [[_corner_box("piratesite")] + ([_sub_box(lines[i // 2])] if i < 16 else [])
+             for i in range(20)]
+    _fake_scene(monkeypatch, boxes)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["reasons"] == ["hardsub", "watermark"]
+    assert scan["verdict"] == "hardsub+watermark"
+
+
+@_needs_cv2
+def test_short_persistent_text_is_not_a_watermark(monkeypatch):
+    """太短的常驻文字（"ok"）不拿来判水印；但它仍不算字幕。"""
+    _fake_scene(monkeypatch, [[_sub_box("ok")] for _ in range(20)])
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["verdict"] == "clean" and scan["hits"] == 0
+
+
+@_needs_cv2
+def test_watermark_judgement_can_be_switched_off(monkeypatch):
+    _fake_scene(monkeypatch, [[_corner_box("piratesite")] for _ in range(20)])
+    monkeypatch.setattr(d, "WATERMARK_CHECK_ENABLED", False)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["verdict"] == "clean"
+    assert scan["watermark_texts"], "关掉的是判定，检测结果仍记进台账供校准"
+
+
+@_needs_cv2
+def test_overlay_is_unknown_when_duration_or_frames_missing(monkeypatch):
+    """读不到片长、或抽到的帧不足一半 → unknown（调用方按没有放行）。"""
     monkeypatch.setattr(d, "_probe_duration", lambda p: None)
-    assert d.detect_hardsub("x.mp4")[0]["verdict"] == "unknown"
+    assert d.detect_overlays("x.mp4")[0]["verdict"] == "unknown"
 
-    _fake_frames(monkeypatch, [None] * 15 + ["a1", "b2", "c3", "d4", "e5"])
-    assert d.detect_hardsub("x.mp4")[0]["verdict"] == "unknown"
+    _fake_scene(monkeypatch, [None] * 15 + [[]] * 5)
+    assert d.detect_overlays("x.mp4")[0]["verdict"] == "unknown"
 
 
-def _hardsub_job(sandbox, monkeypatch, tmdb_id="66"):
+def _overlay_job(sandbox, monkeypatch, tmdb_id="66"):
     """一个能真正走完 finalize_one_entry 的转封装任务：转封装 mock 成写出一个文件。"""
     temp_mp4 = os.path.join(str(sandbox), "temp", f"temp_{tmdb_id}.mp4")
 
@@ -5795,10 +5916,15 @@ def _hardsub_job(sandbox, monkeypatch, tmdb_id="66"):
     }
 
 
-_HARDSUB_SCAN = {
-    "verdict": "hardsub", "sampled": 60, "hits": 24, "hit_ratio": 0.4,
-    "distinct_texts": 20, "examples": ["weneedtotalk"],
-}
+def _scan(*reasons):
+    return {
+        "verdict": "+".join(reasons) or "clean", "reasons": list(reasons),
+        "sampled": 60, "hits": 24, "hit_ratio": 0.4, "distinct_texts": 20,
+        "examples": ["weneedtotalk"],
+        "watermark_texts": ([{"text": "piratesite", "presence": 1.0, "ring_std": 40.0}]
+                            if "watermark" in reasons else []),
+        "watermark_logo": None, "static_texts": [], "logo_peak_presence": 0.1,
+    }
 
 
 def _read_jsonl(path):
@@ -5808,33 +5934,38 @@ def _read_jsonl(path):
         return [json.loads(line) for line in fh if line.strip()]
 
 
-def test_hardsub_film_is_deleted_and_marked_dead(sandbox, monkeypatch):
-    """🔴 kill：成品就地删除、不进 downloads/、整片判死（reason_class=hardsub），
+@pytest.mark.parametrize("reasons, reason_class", [
+    (("hardsub",), "hardsub"),
+    (("watermark",), "watermark"),
+    (("hardsub", "watermark"), "hardsub"),
+])
+def test_overlay_film_is_deleted_and_marked_dead(sandbox, monkeypatch, reasons, reason_class):
+    """🔴 kill：成品就地删除、不进 downloads/、整片判死（reason_class 区分硬字幕/水印），
     并登记进 processed_ids（本次运行重取回来的链接也不再下）。"""
-    job = _hardsub_job(sandbox, monkeypatch)
+    job = _overlay_job(sandbox, monkeypatch)
     monkeypatch.setattr(d, "HARDSUB_ACTION", "kill")
-    monkeypatch.setattr(d, "detect_hardsub", lambda p: (dict(_HARDSUB_SCAN), []))
+    monkeypatch.setattr(d, "detect_overlays", lambda p: (_scan(*reasons), []))
     processed = set()
 
     tid, ok, info = d.finalize_one_entry(job, processed)
 
-    assert (tid, ok) == ("66", False) and info.get("hardsub") is True
+    assert (tid, ok) == ("66", False)
+    assert info["overlay_reject"] == reason_class
     assert not os.path.exists(job["temp_mp4"]), "成品必须就地删除"
     assert not os.path.exists(d.movie_dir("66", 2010)), "不能进成品目录"
     assert "66" in processed and "66" not in d.processing_ids
     dead = _read_jsonl(d.DOWNLOAD_DEAD_LOG)
-    assert [r["reason_class"] for r in dead] == ["hardsub"]
-    assert dead[0]["evidence"]["hit_ratio"] == 0.4
+    assert [(r["reason_class"], r["reasons"]) for r in dead] == [(reason_class, list(reasons))]
     scan = _read_jsonl(d.HARDSUB_SCAN_LOG)
-    assert scan[0]["verdict"] == "hardsub" and scan[0]["tmdbId"] == "66"
+    assert scan[0]["reasons"] == list(reasons) and scan[0]["tmdbId"] == "66"
     assert d.load_dead_ids() == {"66"}, "下次启动必须跳过"
 
 
-def test_hardsub_record_mode_still_delivers_the_film(sandbox, monkeypatch):
+def test_overlay_record_mode_still_delivers_the_film(sandbox, monkeypatch):
     """record：只记台账与证据，照常交付，不判死。"""
-    job = _hardsub_job(sandbox, monkeypatch)
+    job = _overlay_job(sandbox, monkeypatch)
     monkeypatch.setattr(d, "HARDSUB_ACTION", "record")
-    monkeypatch.setattr(d, "detect_hardsub", lambda p: (dict(_HARDSUB_SCAN), []))
+    monkeypatch.setattr(d, "detect_overlays", lambda p: (_scan("watermark"), []))
 
     _, ok, info = d.finalize_one_entry(job, set())
 
@@ -5843,15 +5974,15 @@ def test_hardsub_record_mode_still_delivers_the_film(sandbox, monkeypatch):
     assert _read_jsonl(d.HARDSUB_SCAN_LOG)[0]["action"] == "record"
 
 
-def test_hardsub_detection_error_lets_the_film_through(sandbox, monkeypatch):
-    """检测本身出错（OCR 崩溃等）→ 按无字幕放行，台账记 unknown。"""
-    job = _hardsub_job(sandbox, monkeypatch)
+def test_overlay_detection_error_lets_the_film_through(sandbox, monkeypatch):
+    """检测本身出错（OCR 崩溃等）→ 按没有放行，台账记 unknown。"""
+    job = _overlay_job(sandbox, monkeypatch)
     monkeypatch.setattr(d, "HARDSUB_ACTION", "kill")
 
     def boom(path):
         raise RuntimeError("onnxruntime exploded")
 
-    monkeypatch.setattr(d, "detect_hardsub", boom)
+    monkeypatch.setattr(d, "detect_overlays", boom)
 
     _, ok, _ = d.finalize_one_entry(job, set())
 
@@ -5861,27 +5992,27 @@ def test_hardsub_detection_error_lets_the_film_through(sandbox, monkeypatch):
     assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == []
 
 
-def test_hardsub_check_disabled_skips_detection(sandbox, monkeypatch):
-    job = _hardsub_job(sandbox, monkeypatch)
+def test_overlay_check_disabled_skips_detection(sandbox, monkeypatch):
+    job = _overlay_job(sandbox, monkeypatch)
     monkeypatch.setattr(d, "HARDSUB_CHECK_ENABLED", False)
 
     def boom(path):
         raise AssertionError("关闭时不该检测")
 
-    monkeypatch.setattr(d, "detect_hardsub", boom)
+    monkeypatch.setattr(d, "detect_overlays", boom)
     _, ok, _ = d.finalize_one_entry(job, set())
     assert ok is True and _read_jsonl(d.HARDSUB_SCAN_LOG) == []
 
 
-@_needs_ocr
-def test_hardsub_evidence_crops_are_saved(sandbox, monkeypatch):
-    """判为硬字幕时保存证据截图：成品删掉后这是人工核对误判的唯一依据。"""
+@_needs_cv2
+def test_overlay_evidence_frames_are_saved(sandbox, monkeypatch):
+    """判死时保存证据截图：成品删掉后这是人工核对误判的唯一依据。"""
     import numpy as np
 
-    job = _hardsub_job(sandbox, monkeypatch)
+    job = _overlay_job(sandbox, monkeypatch)
     monkeypatch.setattr(d, "HARDSUB_ACTION", "kill")
-    crops = [np.full((54, 320, 3), 128, np.uint8) for _ in range(3)]
-    monkeypatch.setattr(d, "detect_hardsub", lambda p: (dict(_HARDSUB_SCAN), crops))
+    frames = [np.full((54, 96, 3), 128, np.uint8) for _ in range(3)]
+    monkeypatch.setattr(d, "detect_overlays", lambda p: (_scan("watermark"), frames))
 
     d.finalize_one_entry(job, set())
 
@@ -5890,24 +6021,26 @@ def test_hardsub_evidence_crops_are_saved(sandbox, monkeypatch):
     assert _read_jsonl(d.HARDSUB_SCAN_LOG)[0]["evidence_dir"] == folder
 
 
-def test_retry_dead_never_revives_hardsub_records(tmp_path, monkeypatch):
-    """🔴 硬字幕记录没有码率依据：不拦的话会落进"无依据 → 放回"，被 --retry-dead 放回重下。"""
+def test_retry_dead_never_revives_overlay_records(tmp_path, monkeypatch):
+    """🔴 硬字幕/水印记录没有码率依据：不拦的话会落进"无依据 → 放回"，被 --retry-dead 放回重下。"""
     dead_log = tmp_path / "dead.jsonl"
     dead_log.write_text(
         json.dumps({"tmdbId": "66", "reason_class": "hardsub", "evidence": {}}) + "\n"
+        + json.dumps({"tmdbId": "67", "reason_class": "watermark", "evidence": {}}) + "\n"
         + json.dumps({"tmdbId": "77", "reason_class": "quality", "evidence": {}}) + "\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(dead_log))
 
     assert d.dead_record_passes_now({"reason_class": "hardsub"}) is False
-    assert d.load_dead_ids(d.dead_record_passes_now) == {"66"}, (
-        "硬字幕片永不放回；无依据的画质记录照旧放回"
+    assert d.dead_record_passes_now({"reason_class": "watermark"}) is False
+    assert d.load_dead_ids(d.dead_record_passes_now) == {"66", "67"}, (
+        "硬字幕/水印片永不放回；无依据的画质记录照旧放回"
     )
 
 
-def test_pipeline_never_uploads_a_hardsub_film(tmp_path, monkeypatch, capsys):
-    """端到端：硬字幕片不进上传阶段，failed.jsonl 记 stage=hardsub，收尾打印比例。"""
+def test_pipeline_never_uploads_overlay_films(tmp_path, monkeypatch, capsys):
+    """端到端：硬字幕片与水印片都不进上传阶段，failed.jsonl 按类别记 stage，收尾打印比例。"""
     _isolate_logs(tmp_path, monkeypatch)
     monkeypatch.setattr(d, "S3_ENABLED", True)
     monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
@@ -5920,8 +6053,8 @@ def test_pipeline_never_uploads_a_hardsub_film(tmp_path, monkeypatch, capsys):
     os.makedirs(d.TEMP_DIR, exist_ok=True)
     inp = tmp_path / "in.jsonl"
     inp.write_text(
-        json.dumps({"tmdbId": "66", "title": "H", "year": 2010, "urls": ["u"]}) + "\n"
-        + json.dumps({"tmdbId": "67", "title": "C", "year": 2011, "urls": ["u"]}) + "\n",
+        "".join(json.dumps({"tmdbId": tid, "title": tid, "year": 2010, "urls": ["u"]}) + "\n"
+                for tid in ("66", "67", "68", "69")),
         encoding="utf-8",
     )
     monkeypatch.setattr(d, "INPUT_JSONL", str(inp))
@@ -5944,13 +6077,12 @@ def test_pipeline_never_uploads_a_hardsub_film(tmp_path, monkeypatch, capsys):
             fh.write(b"m" * 1024)
         return True
 
+    verdicts = {"66": ("hardsub",), "67": ("watermark",), "68": (), "69": ()}
     monkeypatch.setattr(d, "process_one_entry", fake_process)
     monkeypatch.setattr(d, "convert_ts_to_mp4", fake_convert)
     monkeypatch.setattr(
-        d, "detect_hardsub",
-        lambda p: (dict(_HARDSUB_SCAN), []) if "temp_66" in p else
-        ({"verdict": "clean", "sampled": 60, "hits": 0, "hit_ratio": 0.0,
-          "distinct_texts": 0, "examples": []}, []),
+        d, "detect_overlays",
+        lambda p: (_scan(*verdicts[os.path.basename(p)[5:7]]), []),
     )
     uploads = []
     monkeypatch.setattr(d, "upload_one_entry",
@@ -5958,25 +6090,36 @@ def test_pipeline_never_uploads_a_hardsub_film(tmp_path, monkeypatch, capsys):
 
     d._run_pipeline()
 
-    assert uploads == ["67"], "只有干净的片能上传"
+    assert sorted(uploads) == ["68", "69"], "只有干净的片能上传"
     stages = {r["tmdbId"]: r["stage"] for r in _read_jsonl(d.FAILED_LOG)}
-    assert stages == {"66": "hardsub"}
+    assert stages == {"66": "hardsub", "67": "watermark"}
     out = capsys.readouterr().out
-    assert "硬字幕检测：已检测 2 部，判定带硬字幕 1 部（50.0%）" in out
+    assert ("硬字幕/水印检测：已检测 4 部，硬字幕 1 部（25.0%），水印 1 部（25.0%），"
+            "合计判死 2 部（50.0%）") in out
 
 
-def test_preflight_rejects_bad_action_and_missing_ocr(tmp_path, monkeypatch):
-    """启用检测时 action 写错或缺 OCR 依赖必须 fail-fast：否则每部片都"检测失败放行"，
-    硬字幕照样上传，而用户以为过滤在生效。"""
+@_needs_ocr
+def test_ocr_self_test_recognizes_the_probe_text():
+    """预检自检在真 OCR 上必须能认出测试文字，否则预检会把正常机器拦下。"""
+    recognized, texts = d._ocr_self_test()
+    assert recognized, texts
+
+
+def test_preflight_rejects_bad_action_missing_ocr_and_failed_self_test(tmp_path, monkeypatch):
+    """启用检测时 action 写错、缺 OCR 依赖、或 OCR 自检不过都必须 fail-fast：否则每部片
+    都"检测失败放行"，带硬字幕/水印的片照样上传，而用户以为过滤在生效。"""
     _isolate_logs(tmp_path, monkeypatch)
     monkeypatch.setattr(d, "release_main_lock", lambda: None)
     monkeypatch.setattr(d, "HARDSUB_CHECK_ENABLED", True)
+    monkeypatch.setattr(d, "_ocr_self_test", lambda: (True, ["ocrselftest"]))
 
     monkeypatch.setattr(d, "HARDSUB_ACTION", "delete")
     with pytest.raises(SystemExit):
         d.preflight_check_hardsub()
 
     monkeypatch.setattr(d, "HARDSUB_ACTION", "kill")
+    d.preflight_check_hardsub()  # 一切正常：不退出
+
     real_import = d.importlib.import_module
 
     def no_ocr(name, *a, **kw):
@@ -5987,6 +6130,75 @@ def test_preflight_rejects_bad_action_and_missing_ocr(tmp_path, monkeypatch):
     monkeypatch.setattr(d.importlib, "import_module", no_ocr)
     with pytest.raises(SystemExit):
         d.preflight_check_hardsub()
+    monkeypatch.setattr(d.importlib, "import_module", real_import)
+
+    # 能 import 但 OCR 认不出 / 推理时崩溃
+    monkeypatch.setattr(d, "_ocr_self_test", lambda: (False, []))
+    with pytest.raises(SystemExit):
+        d.preflight_check_hardsub()
+
+    def crash():
+        raise RuntimeError("onnxruntime: illegal instruction")
+
+    monkeypatch.setattr(d, "_ocr_self_test", crash)
+    with pytest.raises(SystemExit):
+        d.preflight_check_hardsub()
+    assert "engine" not in d._hardsub_local.__dict__, "自检用过的主线程引擎要释放"
 
     monkeypatch.setattr(d, "HARDSUB_CHECK_ENABLED", False)
     d.preflight_check_hardsub()  # 关闭时不检查、不退出
+
+
+# ---------------------------------------------------------------------------
+# 补传滞留成品后清理旧台账（与 reupload 同口径）
+# ---------------------------------------------------------------------------
+
+def test_stranded_upload_cleans_up_old_failure_ledgers(tmp_path, monkeypatch):
+    """之前上传失败过的片被补传成功后：success.jsonl 收成一条 uploaded:true、
+    failed.jsonl 删掉 stage=upload 的行、pending 删掉该片；别的片的记录不动。"""
+    _setup_stranded(tmp_path, monkeypatch)
+    path = _put_mp4("1", 2001)
+    _put_mp4("2", 2002)
+    with open(d.SUCCESS_LOG, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "1", "uploaded": False, "final_path": path}) + "\n")
+        fh.write(json.dumps({"tmdbId": "9", "uploaded": True}) + "\n")
+    with open(d.FAILED_LOG, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "1", "stage": "upload", "error": "R2 down"}) + "\n")
+        fh.write(json.dumps({"tmdbId": "1", "stage": "download", "error": "502"}) + "\n")
+        fh.write(json.dumps({"tmdbId": "9", "stage": "upload", "error": "x"}) + "\n")
+    with open(d.UPLOAD_PENDING_LOG, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "1", "local_path": path}) + "\n")
+        fh.write(json.dumps({"tmdbId": "9", "local_path": "/x"}) + "\n")
+
+    def fake_upload(info):
+        info = dict(info, uploaded=True, s3_key="k")
+        d.write_log(d.SUCCESS_LOG, info)
+        return info["tmdbId"], True, info
+
+    monkeypatch.setattr(d, "upload_one_entry", fake_upload)
+
+    d._run_pipeline()
+
+    success = _read_jsonl(d.SUCCESS_LOG)
+    assert [(r["tmdbId"], r["uploaded"]) for r in success if r["tmdbId"] == "1"] == [("1", True)]
+    assert [r["tmdbId"] for r in success].count("2") == 1, "从没失败过的片照常一条"
+    failed = {(r["tmdbId"], r["stage"]) for r in _read_jsonl(d.FAILED_LOG)}
+    assert failed == {("1", "download"), ("9", "upload")}
+    assert [r["tmdbId"] for r in _read_jsonl(d.UPLOAD_PENDING_LOG)] == ["9"]
+
+
+def test_stranded_upload_failure_keeps_ledgers(tmp_path, monkeypatch):
+    """补传仍失败：旧台账一条不删（下次还要靠它们补传）。"""
+    _setup_stranded(tmp_path, monkeypatch)
+    _put_mp4("1", 2001)
+    with open(d.SUCCESS_LOG, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "1", "uploaded": False}) + "\n")
+    with open(d.UPLOAD_PENDING_LOG, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "1", "local_path": "/x"}) + "\n")
+    monkeypatch.setattr(d, "upload_one_entry",
+                        lambda info: (info["tmdbId"], False, {"error": "R2 down"}))
+
+    d._run_pipeline()
+
+    assert [r["tmdbId"] for r in _read_jsonl(d.UPLOAD_PENDING_LOG)] == ["1"]
+    assert [r["uploaded"] for r in _read_jsonl(d.SUCCESS_LOG)] == [False]
