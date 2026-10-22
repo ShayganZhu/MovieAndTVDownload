@@ -5453,3 +5453,194 @@ def test_sigint_while_disk_gate_closed_does_not_hang(tmp_path, monkeypatch):
     gate.set()
     t.join(3)
     assert not hung, "中断后 3 秒内必须退出，不能卡在 shutdown(wait=True) 上"
+
+
+# ---------------------------------------------------------------------------
+# 转封装剥除隐藏字幕（CEA-608/708，ATSC A/53）
+#   业务口径：成品不要任何字幕，但只剥不剔——去掉字幕照常交付，绝不因此丢片。
+# ---------------------------------------------------------------------------
+
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+
+
+def _ffmpeg_has_libx264():
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        return False
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return "libx264" in out
+
+
+_needs_ffmpeg = pytest.mark.skipif(
+    not _ffmpeg_has_libx264(), reason="需要本机 ffmpeg/ffprobe 且带 libx264"
+)
+
+
+def _inject_a53_sei(h264_bytes):
+    """在 Annex B H.264 码流的每个 slice 前插一条 A/53 隐藏字幕 SEI（GA94）。"""
+    payload = bytes([0xB5, 0x00, 0x31]) + b"GA94" + bytes(
+        [0x03, 0x42, 0xFF, 0xFC, 0x94, 0x2C, 0xFC, 0x80, 0x80, 0xFF]
+    )
+    sei = b"\x00\x00\x00\x01" + bytes([0x06, 0x04, len(payload)]) + payload + b"\x80"
+    starts = []
+    i = 0
+    while (j := h264_bytes.find(b"\x00\x00\x01", i)) >= 0:
+        starts.append(j)
+        i = j + 3
+    out = bytearray()
+    for k, s in enumerate(starts):
+        begin = s - 1 if s > 0 and h264_bytes[s - 1] == 0 else s
+        end = starts[k + 1] if k + 1 < len(starts) else len(h264_bytes)
+        if k + 1 < len(starts) and h264_bytes[end - 1] == 0:
+            end -= 1
+        if h264_bytes[s + 3] & 0x1F in (1, 5):
+            out += sei
+        out += h264_bytes[begin:end]
+    return bytes(out)
+
+
+def _make_ts(tmp_path, name, with_cc):
+    """造一段 2 秒的 H.264+AAC TS。带字幕时让 libx264 从帧 side data 写回 A/53 SEI，
+    得到与源站同构的"字幕藏在视频码流里"的样本。"""
+    raw = tmp_path / f"{name}.h264"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24", "-t", "2",
+         "-c:v", "libx264", "-bsf:v", "h264_mp4toannexb", "-f", "h264", str(raw)],
+        check=True, capture_output=True, timeout=60,
+    )
+    if with_cc:
+        raw.write_bytes(_inject_a53_sei(raw.read_bytes()))
+    ts = tmp_path / f"{name}.ts"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-framerate", "24", "-f", "h264", "-i", str(raw),
+         "-f", "lavfi", "-i", "sine=frequency=440", "-t", "2",
+         "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-a53cc", "1",
+         "-c:a", "aac", "-f", "mpegts", str(ts)],
+        check=True, capture_output=True, timeout=60,
+    )
+    return str(ts)
+
+
+def _count_cc_frames(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_frames",
+         "-of", "compact", path],
+        capture_output=True, text=True, timeout=60,
+    ).stdout
+    return out.count("Closed Captions")
+
+
+def _count_video_frames(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+         "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", path],
+        capture_output=True, text=True, timeout=60,
+    ).stdout
+    # TS 输入会在节目段里再打印一遍同一条流，取第一行即可。
+    return int(out.split()[0])
+
+
+@_needs_ffmpeg
+def test_closed_captions_are_stripped_during_remux(tmp_path, monkeypatch):
+    """🔴 真 ffmpeg 端到端：带 A/53 字幕的 TS 转封装后，成品里一帧字幕都不剩，
+    且画面一帧不少。"""
+    monkeypatch.setattr(d, "STRIP_CLOSED_CAPTIONS", True)
+    src = _make_ts(tmp_path, "cc", with_cc=True)
+    assert d.has_closed_captions(src), "前提：样本确实带隐藏字幕"
+    assert _count_cc_frames(src) > 0
+
+    dst = str(tmp_path / "out.mp4")
+    assert d.convert_ts_to_mp4(src, dst) is True
+
+    assert _count_cc_frames(dst) == 0
+    assert not d.has_closed_captions(dst)
+    assert _count_video_frames(dst) == _count_video_frames(src) == 48
+
+
+@_needs_ffmpeg
+def test_plain_video_is_remuxed_without_caption_filter(tmp_path, monkeypatch):
+    """没有隐藏字幕的片走原来的纯拷贝路径，不挂任何码流过滤器。"""
+    monkeypatch.setattr(d, "STRIP_CLOSED_CAPTIONS", True)
+    src = _make_ts(tmp_path, "plain", with_cc=False)
+    assert not d.has_closed_captions(src)
+    calls = []
+    real = d._remux_to_mp4
+    monkeypatch.setattr(d, "_remux_to_mp4",
+                        lambda s, t, bsf=None: calls.append(bsf) or real(s, t, bsf))
+    dst = str(tmp_path / "out.mp4")
+    assert d.convert_ts_to_mp4(src, dst) is True
+    assert calls == [None]
+    assert _count_video_frames(dst) == 48
+
+
+def test_strip_failure_falls_back_to_plain_remux(tmp_path, monkeypatch):
+    """剥除失败时退回原样转封装：留着字幕也好过丢片。"""
+    monkeypatch.setattr(d, "STRIP_CLOSED_CAPTIONS", True)
+    monkeypatch.setattr(d, "has_closed_captions", lambda p: True)
+    monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
+    calls = []
+    monkeypatch.setattr(d, "_remux_to_mp4",
+                        lambda s, t, bsf=None: calls.append(bsf) or bsf is None)
+    assert d.convert_ts_to_mp4("in.ts", str(tmp_path / "out.mp4")) is True
+    assert calls == ["filter_units=remove_types=6", None]
+
+
+def test_unsupported_codec_keeps_captions_and_still_converts(tmp_path, monkeypatch, capsys):
+    """HEVC 等暂不支持剥除的编码：原样转封装、记日志，绝不因此放弃该片。"""
+    monkeypatch.setattr(d, "STRIP_CLOSED_CAPTIONS", True)
+    monkeypatch.setattr(d, "has_closed_captions", lambda p: True)
+    monkeypatch.setattr(d, "probe_codec", lambda p: "hevc")
+    calls = []
+    monkeypatch.setattr(d, "_remux_to_mp4",
+                        lambda s, t, bsf=None: calls.append(bsf) or True)
+    assert d.convert_ts_to_mp4("in.ts", str(tmp_path / "out.mp4")) is True
+    assert calls == [None]
+    assert "hevc 编码暂不支持剥除" in capsys.readouterr().out
+
+
+def test_caption_check_is_skipped_when_disabled(tmp_path, monkeypatch):
+    """开关关掉时连探测都不做，行为与改动前完全一致。"""
+    monkeypatch.setattr(d, "STRIP_CLOSED_CAPTIONS", False)
+
+    def boom(p):
+        raise AssertionError("关闭时不该探测")
+
+    monkeypatch.setattr(d, "has_closed_captions", boom)
+    calls = []
+    monkeypatch.setattr(d, "_remux_to_mp4",
+                        lambda s, t, bsf=None: calls.append(bsf) or True)
+    assert d.convert_ts_to_mp4("in.ts", str(tmp_path / "out.mp4")) is True
+    assert calls == [None]
+
+
+def test_caption_probe_failure_is_treated_as_no_captions(monkeypatch):
+    """ffprobe 缺失/超时只当作没有字幕，不能把探测问题变成转封装失败。"""
+    def raise_os_error(*a, **kw):
+        raise OSError("ffprobe not found")
+
+    monkeypatch.setattr(d.subprocess, "run", raise_os_error)
+    assert d.has_closed_captions("whatever.ts") is False
+
+
+@_needs_ffmpeg
+def test_probe_codec_reads_ts_input_as_a_single_codec_name(tmp_path):
+    """TS 输入 ffprobe 会把同一条流打印两遍（"h264\\nh264"）。probe_codec 必须
+    只取一个编码名，否则 normalize_codec 认不出：HLS 采样一律退回 H.264 基准，
+    隐藏字幕剥除也永远不会生效。"""
+    src = _make_ts(tmp_path, "plain", with_cc=False)
+    assert d.probe_codec(src) == "h264"
+    assert d.normalize_codec(d.probe_codec(src)) == "h264"
+
+
+def test_probe_codec_takes_first_line_of_duplicated_output(monkeypatch):
+    monkeypatch.setattr(
+        d.subprocess, "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="HEVC\nhevc\n", stderr=""),
+    )
+    assert d.probe_codec("x.ts") == "hevc"

@@ -523,6 +523,10 @@ download_movies:
   # 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒完成，给足冗余；
   # 防坏 TS/fMP4 让 ffmpeg 无限阻塞占死转封装线程。超时判失败(下次续跑重来)。
   convert_timeout: 1800
+  # 转封装时剥掉视频码流里的隐藏字幕（CEA-608/708，ATSC A/53，藏在 SEI 里）。
+  # 只剥不剔：检测到就去掉字幕、照常交付这部片。目前只支持 H.264；其它编码
+  # 检测到隐藏字幕时原样保留并记日志，绝不因此放弃该片。
+  strip_closed_captions: true
   # ---- playlist(master/media)解析阶段的请求重试 ----
   # 源站临时 5xx 抽风时，这一层若过早放弃会直接判整部影片失败。
   #

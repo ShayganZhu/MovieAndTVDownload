@@ -284,6 +284,10 @@ SAMPLE_SEG_RETRY_MAX = max(1, int(_CFG.get("sample_seg_retry_max", 5)))
 # 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒内完成，给足冗余防坏 TS
 # 让 ffmpeg 无限阻塞占死 convert worker。超时判失败(可重试)，不拖垮转封装池。
 CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
+# 转封装时剥除隐藏字幕（CEA-608/708，ATSC A/53）。业务口径：成品里不要任何
+# 字幕，但**只剥不剔**——这类字幕不在画面里，去掉它对影片零损失，不值得为它
+# 丢片。详见 convert_ts_to_mp4。
+STRIP_CLOSED_CAPTIONS = bool(_CFG.get("strip_closed_captions", True))
 # playlist（master/media）解析阶段的请求重试。
 # 🔴 2026-09-13 由 10 降到 4（§12.37 E-2）：退避指数增长、第 7 次起封顶 60s，
 # 跑满 10 次约 4 分钟，而实跑中这些 400/500/502 全部来自 CDN 回源故障
@@ -2957,8 +2961,11 @@ def probe_codec(sample_path):
     except (subprocess.SubprocessError, OSError):
         return None
 
-    codec = result.stdout.strip().lower()
-    return codec or None
+    # 只取第一行：TS 输入会被 ffprobe 打印两遍（节目段里再列一次同一条流，
+    # 实测输出 "h264\nh264"）。整段当编码名的话 normalize_codec 认不出，
+    # HLS 采样就一律退回 H.264 基准——HEVC 流被按更严的门槛误判。
+    lines = [line.strip().lower() for line in result.stdout.splitlines()]
+    return next((line for line in lines if line), None)
 
 
 def normalize_codec(codec):
@@ -3275,7 +3282,80 @@ def download_segments(
 
 
 # ---------- FFmpeg ----------
+# 隐藏字幕检测的采样窗口（ffprobe -read_intervals 语法）：片头、5/30/60 分钟处
+# 各解码 120 帧。A/53 字幕在带它的码流里通常逐帧都有（无字时发填充数据），
+# 几个窗口足以定论；比整片解码便宜几个数量级（实测 4 个窗口 < 1s）。超出片长
+# 的窗口会读不到帧，不影响结论。
+_CC_PROBE_INTERVALS = "%+#120,300%+#120,1800%+#120,3600%+#120"
+# ffprobe 逐帧 side data 里隐藏字幕的类型名（"ATSC A53 Part 4 Closed Captions"）。
+# 不用流级的 closed_captions 字段：FFmpeg 新版（实测 9.0）已不再输出它，
+# 逐帧 side data 在服务器的 6.1 与本机 9.0 上都可用。
+_CC_SIDE_DATA_MARKER = "Closed Captions"
+# 各编码剥除字幕 SEI 的码流过滤器。H.264 的 A/53 字幕只能随 SEI NAL（类型 6）
+# 整体删掉——h264_metadata 没有专删字幕的选项。删掉的其余 SEI（编码器信息、
+# 缓冲/时序、恢复点）对 MP4 播放无影响：关键帧标记由解复用器在过滤前定好、
+# 原样保留。HEVC 的字幕在前缀 SEI（类型 39）里，与 HDR 母版元数据同类，整删
+# 会丢 HDR 信息，且本地造不出带字幕的 HEVC 样本无法验证，故暂不处理。
+_CC_STRIP_BSF = {"h264": "filter_units=remove_types=6"}
+
+
+def has_closed_captions(path):
+    """视频码流里是否带隐藏字幕（CEA-608/708）。探测失败一律当作没有——
+    宁可漏剥一条字幕，也不能让探测问题把一部片拖成转封装失败。"""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-read_intervals",
+        _CC_PROBE_INTERVALS,
+        "-show_frames",
+        "-of",
+        "compact",
+        path,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return _CC_SIDE_DATA_MARKER in result.stdout
+
+
 def convert_ts_to_mp4(ts_path, mp4_path):
+    """转封装为 mp4（纯拷贝，只保留第一条视频与第一条音轨），并按需剥掉隐藏字幕。
+
+    剥除失败（码流过滤器读不动某些码流）时退回原样转封装：成品留着隐藏字幕，
+    也好过因此判这部片转封装失败。
+    """
+    strip_bsf = None
+    if STRIP_CLOSED_CAPTIONS and has_closed_captions(ts_path):
+        codec = normalize_codec(probe_codec(ts_path))
+        strip_bsf = _CC_STRIP_BSF.get(codec)
+        if strip_bsf:
+            print(f"  检测到隐藏字幕，转封装时剥除: {ts_path}", flush=True)
+        else:
+            print(
+                f"  ⚠️ 检测到隐藏字幕，但 {codec or '未知'} 编码暂不支持剥除，"
+                f"原样保留（不因此放弃该片）: {ts_path}",
+                flush=True,
+            )
+
+    if strip_bsf:
+        if _remux_to_mp4(ts_path, mp4_path, strip_bsf):
+            return True
+        print("  ⚠️ 剥除隐藏字幕失败，改为原样转封装（保片优先）", flush=True)
+        remove_file(mp4_path)
+    return _remux_to_mp4(ts_path, mp4_path)
+
+
+def _remux_to_mp4(ts_path, mp4_path, video_bsf=None):
     command = [
         "ffmpeg",
         "-y",
@@ -3294,6 +3374,10 @@ def convert_ts_to_mp4(ts_path, mp4_path):
         "0:a:0?",
         "-c",
         "copy",
+    ]
+    if video_bsf:
+        command += ["-bsf:v", video_bsf]
+    command += [
         "-movflags",
         "+faststart",
         mp4_path,
