@@ -6586,6 +6586,19 @@ def test_reject_records_where_the_screenshots_actually_are(tmp_path, monkeypatch
     assert _read_jsonl(d.DOWNLOAD_DEAD_LOG)[0]["evidence"]["evidence_dir"] == near_dir
 
 
+def test_dead_breakdown_splits_quality_hardsub_and_watermark():
+    """启动摘要的判死计数按原因拆开：账本里不止画质判死，同一片以最后一条为准。"""
+    with open(d.DOWNLOAD_DEAD_LOG, "w", encoding="utf-8") as fh:
+        for tid, kind in (("1", None), ("2", "quality"), ("3", "hardsub"), ("4", "watermark"),
+                          ("5", "quality"), ("5", "hardsub")):
+            fh.write(json.dumps({"tmdbId": tid, **({"reason_class": kind} if kind else {})}) + "\n")
+
+    assert d.dead_breakdown(d.load_dead_ids()) == "画质 2 / 硬字幕 2 / 水印 1"
+    # --retry-dead 下放回的片不在 dead_ids 里，也就不计入
+    assert d.dead_breakdown({"3", "4"}) == "画质 0 / 硬字幕 1 / 水印 1"
+    assert d.dead_breakdown(set()) == "画质 0 / 硬字幕 0 / 水印 0"
+
+
 def test_reject_skips_unknown_films_and_refuses_while_main_runs(tmp_path, monkeypatch, capsys):
     r2 = _setup_reject(tmp_path, monkeypatch)
     assert d.reject_films(["999"]) == (0, 0)

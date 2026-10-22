@@ -1532,6 +1532,18 @@ def load_dead_ids(threshold_fn=None):
     return dead
 
 
+def dead_breakdown(dead_ids):
+    """启动摘要用：把判死 ID 按原因拆开计数（取判死账本里该片的最后一条记录）。
+
+    判死账本里不止画质：下载后检出硬字幕/水印、临门槛人工 reject 的也在。
+    没有 reason_class 的老记录都是画质判死，归入画质。
+    """
+    latest = _latest_by_id(DOWNLOAD_DEAD_LOG)
+    kinds = [(latest.get(tmdb_id) or {}).get("reason_class") for tmdb_id in dead_ids]
+    hardsub, watermark = kinds.count("hardsub"), kinds.count("watermark")
+    return f"画质 {len(kinds) - hardsub - watermark} / 硬字幕 {hardsub} / 水印 {watermark}"
+
+
 def dead_record_passes_now(record):
     """当前配置门槛下，这条判死记录是否该被放回重试。
 
@@ -5937,7 +5949,8 @@ def _run_pipeline(run_volume=None):
 
     logged_ids = load_success_log_ids()
     disk_ids, duplicate_files = scan_downloaded_mp4_ids()
-    # 画质判死片：默认一律跳过；--retry-dead 下按当前门槛复判，够格的放回。
+    # 判死片（画质 / 硬字幕 / 水印）：默认一律跳过；--retry-dead 下按当前门槛复判，
+    # 画质够格的放回，硬字幕/水印永不放回。
     dead_ids = load_dead_ids(
         dead_record_passes_now if RETRY_DEAD_MODE else None
     )
@@ -5945,7 +5958,7 @@ def _run_pipeline(run_volume=None):
     print(
         f"成功日志中有 {len(logged_ids)} 个 ID，"
         f"目标目录中有 {len(disk_ids)} 个已下载 ID，"
-        f"画质判死 {len(dead_ids)} 个 ID；"
+        f"判死 {len(dead_ids)} 个 ID（{dead_breakdown(dead_ids)}）；"
         f"合并去重后将跳过 {len(processed_ids)} 个 ID"
     )
 
@@ -7384,11 +7397,11 @@ if __name__ == "__main__":
         if RETRY_ONLY_MODE:
             print(
                 "[重试模式] 只重试 results.jsonl 里尚未成功的片"
-                "（跳过 success.jsonl、磁盘已有成品、画质判死）"
+                "（跳过 success.jsonl、磁盘已有成品、已判死的片）"
             )
         if RETRY_DEAD_MODE:
             print(
                 f"[判死复判] 将按当前门槛复判 {DOWNLOAD_DEAD_LOG} 里的片，"
-                f"余量系数 {DEAD_REVIVE_MARGIN:.2f}"
+                f"余量系数 {DEAD_REVIVE_MARGIN:.2f}（只复判画质判死，硬字幕/水印判死的不放回）"
             )
         main()
