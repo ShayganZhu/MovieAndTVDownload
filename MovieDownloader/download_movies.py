@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import os
 import math
+import statistics
 import random
 import re
 import shutil
@@ -307,6 +308,10 @@ HARDSUB_SAMPLE_FRAMES = max(1, int(_HARDSUB_CFG.get("sample_frames", 60)))
 HARDSUB_MIN_HIT_RATIO = float(_HARDSUB_CFG.get("min_hit_ratio", 0.2))
 HARDSUB_MIN_DISTINCT_TEXTS = max(1, int(_HARDSUB_CFG.get("min_distinct_texts", 5)))
 HARDSUB_MIN_TEXT_SCORE = float(_HARDSUB_CFG.get("min_text_score", 0.8))
+# 基线对齐的字幕帧占比门槛（见 _judge_hardsub）：对白断续的片（纪录片访谈）字幕在屏
+# 时间少，总占比够不到 min_hit_ratio，但字幕行严格居中、底边落在同一条基线上，
+# 画面里的场景字做不到这一点，故可以用更低的占比门槛把它们抓出来。
+HARDSUB_MIN_ALIGNED_RATIO = float(_HARDSUB_CFG.get("min_aligned_hit_ratio", 0.08))
 HARDSUB_OCR_THREADS = max(1, int(_HARDSUB_CFG.get("ocr_threads", 2)))
 HARDSUB_SCAN_LOG = resolve_file(_HARDSUB_CFG.get("scan_log"), "hardsub_scan.jsonl")
 HARDSUB_EVIDENCE_DIR = resolve_dir(_HARDSUB_CFG.get("evidence_dir"), "hardsub_evidence")
@@ -4757,6 +4762,12 @@ _HARDSUB_BOTTOM = 0.70             # 硬字幕只看画面底部 30%（含宽银
 _HARDSUB_CENTER_RANGE = (0.30, 0.70)
 _HARDSUB_BOX_HEIGHT_RANGE = (0.02, 0.10)
 _TEXT_SIMILARITY = 0.75            # 两串文字相似度 ≥ 它视为同一句（吸收 OCR 抖动）
+# 字幕基线对齐：命中帧最下面一行字幕框的中心离画面中线不超过 3%，底边离基线（各居中
+# 命中帧底边的中位数）不超过 4%。实测：真字幕片 361227 底边差 0.009、中心偏差 0.011；
+# 字幕纪录片 626979 的居中行底边在 0.919~0.958；而商品/卡片文字片 1054835 底边从
+# 0.757 到 0.996、中心从 0.335 到 0.647。
+_HARDSUB_ALIGN_CX_TOL = 0.03
+_HARDSUB_ALIGN_Y_TOL = 0.04
 _WATERMARK_MIN_TEXT_LEN = 4        # 太短的文字（"ok"、"no"）不拿来判水印
 _WATERMARK_POSITION_TOLERANCE = 0.05   # 框中心偏离常驻位置不超过画面的 5% 才算同一处
 _LOGO_CORNER = (0.25, 0.22)        # 台标搜索区：四角各占宽 25%、高 22%
@@ -4768,8 +4779,7 @@ _RING_DYNAMIC_STD = 10.0           # 周边像素随时间的标准差中位数 
 _RING_DARK = (24.0, 6.0)           # 周边均值 ≤ 24 且标准差 ≤ 6 → 均匀黑边
 _OVERLAY_EVIDENCE_KEEP = 4         # 每部判死 / 临门槛的片保留几张证据截图
 # 临门槛：没判死、但离门槛不远的片也存截图并在台账标 near_miss，供人工核对有没有漏判。
-#   硬字幕：字幕帧占比 ≥ 门槛的一半，且不同文本 ≥ 门槛的一半（漏判的典型形态是对白少
-#           的片，占比略低于门槛、文本却成句地多）
+#   硬字幕：总量规则或基线对齐规则任一达到"占比 ≥ 门槛一半、不同文本 ≥ 门槛一半"
 #   水印：  有常驻文字但因周边不变 / 位置不固定没判；或把台标常驻门槛放宽到 85% 才找得到
 #           形状像台标的图形
 _NEAR_MISS_FRACTION = 0.5
@@ -4985,6 +4995,73 @@ def _is_subtitle_box(box):
     )
 
 
+def _judge_hardsub(frame_boxes, persistent, sampled):
+    """硬字幕判定（纯计算，离线校准直接复用）。两条规则任一满足即判硬字幕：
+
+    ① 总量：像字幕的帧占比 ≥ min_hit_ratio，且不同文本类数 ≥ min_distinct_texts；
+    ② 基线对齐：只数"最下面一行字幕严格居中、底边落在同一条基线上"的命中帧，其占比
+       ≥ min_aligned_hit_ratio 且不同文本类数 ≥ min_distinct_texts。
+
+    为什么要有②：对白断续的片（纪录片访谈，626979）字幕在屏时间少，①的占比够不到，
+    但它的字幕行位置极其一致；画面里的场景字（商品包装、卡片、招牌）位置和大小每帧
+    都不同，对不齐基线——所以②能用低得多的占比门槛抓字幕，又不误伤场景字多的片。
+
+    返回 dict：hit_indexes / hit_clusters / aligned_indexes / aligned_clusters /
+    baseline（居中命中帧底边的中位数，无则 None）/ is_hardsub / near（临门槛）。
+    """
+    hit_indexes = []
+    hit_clusters = set()
+    lowest = {}  # 命中帧序号 -> (最下面一行字幕框, 该帧字幕的文本类)
+    for index, boxes in enumerate(frame_boxes):
+        subtitles = [
+            box for box in boxes
+            if box["cluster"] not in persistent and _is_subtitle_box(box)
+        ]
+        if not subtitles:
+            continue
+        clusters = {box["cluster"] for box in subtitles}
+        hit_indexes.append(index)
+        hit_clusters |= clusters
+        lowest[index] = (max(subtitles, key=lambda box: box["y1"]), clusters)
+
+    centered = {
+        index: item for index, item in lowest.items()
+        if abs((item[0]["x0"] + item[0]["x1"]) / 2 - 0.5) <= _HARDSUB_ALIGN_CX_TOL
+    }
+    aligned_indexes = []
+    aligned_clusters = set()
+    baseline = None
+    if centered:
+        baseline = statistics.median(box["y1"] for box, _ in centered.values())
+        for index, (box, clusters) in sorted(centered.items()):
+            if abs(box["y1"] - baseline) <= _HARDSUB_ALIGN_Y_TOL:
+                aligned_indexes.append(index)
+                aligned_clusters |= clusters
+
+    hit_ratio = len(hit_indexes) / sampled
+    aligned_ratio = len(aligned_indexes) / sampled
+    by_total = (hit_ratio >= HARDSUB_MIN_HIT_RATIO
+                and len(hit_clusters) >= HARDSUB_MIN_DISTINCT_TEXTS)
+    by_aligned = (aligned_ratio >= HARDSUB_MIN_ALIGNED_RATIO
+                  and len(aligned_clusters) >= HARDSUB_MIN_DISTINCT_TEXTS)
+    half_distinct = math.ceil(HARDSUB_MIN_DISTINCT_TEXTS * _NEAR_MISS_FRACTION)
+    near = not (by_total or by_aligned) and (
+        (hit_ratio >= HARDSUB_MIN_HIT_RATIO * _NEAR_MISS_FRACTION
+         and len(hit_clusters) >= half_distinct)
+        or (aligned_ratio >= HARDSUB_MIN_ALIGNED_RATIO * _NEAR_MISS_FRACTION
+            and len(aligned_clusters) >= half_distinct)
+    )
+    return {
+        "hit_indexes": hit_indexes,
+        "hit_clusters": hit_clusters,
+        "aligned_indexes": aligned_indexes,
+        "aligned_clusters": aligned_clusters,
+        "baseline": round(baseline, 3) if baseline is not None else None,
+        "is_hardsub": by_total or by_aligned,
+        "near": near,
+    }
+
+
 def detect_overlays(path):
     """抽帧检测一部片有没有硬字幕 / 水印。
 
@@ -5079,30 +5156,17 @@ def detect_overlays(path):
     logo, logo_peak, logo_near = _find_static_logo(grays, std_map, mean_map)
 
     # ③ 硬字幕：剔除常驻文字后的底部居中文字框
-    hit_indexes = []
-    hit_clusters = set()
-    for index, boxes in enumerate(frame_boxes):
-        subtitle_clusters = {
-            box["cluster"] for box in boxes
-            if box["cluster"] not in persistent and _is_subtitle_box(box)
-        }
-        if subtitle_clusters:
-            hit_indexes.append(index)
-            hit_clusters |= subtitle_clusters
+    hardsub = _judge_hardsub(frame_boxes, persistent, sampled)
+    hit_indexes = hardsub["hit_indexes"]
+    hit_clusters = hardsub["hit_clusters"]
     hit_frames = len(hit_indexes)
     hit_ratio = hit_frames / sampled
-    is_hardsub = (
-        hit_ratio >= HARDSUB_MIN_HIT_RATIO
-        and len(hit_clusters) >= HARDSUB_MIN_DISTINCT_TEXTS
-    )
+    is_hardsub = hardsub["is_hardsub"]
     is_watermark = WATERMARK_CHECK_ENABLED and bool(watermark_texts or logo)
 
     reasons = (["hardsub"] if is_hardsub else []) + (["watermark"] if is_watermark else [])
     near_miss = []
-    if not is_hardsub and (
-        hit_ratio >= HARDSUB_MIN_HIT_RATIO * _NEAR_MISS_FRACTION
-        and len(hit_clusters) >= math.ceil(HARDSUB_MIN_DISTINCT_TEXTS * _NEAR_MISS_FRACTION)
-    ):
+    if not is_hardsub and hardsub["near"]:
         near_miss.append("hardsub")
     if not is_watermark and (static_texts or roaming_texts or logo_near):
         near_miss.append("watermark")
@@ -5117,6 +5181,8 @@ def detect_overlays(path):
         picked = []
         trigger_lists = []
         if "hardsub" in concerned:
+            # 基线对齐的命中帧最像真字幕，先取它们，再从其余命中帧里补。
+            trigger_lists.append(hardsub["aligned_indexes"])
             trigger_lists.append(hit_indexes)
         if "watermark" in concerned:
             trigger_lists.append(sorted(watermark_frames))
@@ -5139,6 +5205,11 @@ def detect_overlays(path):
         "hits": hit_frames,
         "hit_ratio": round(hit_ratio, 3),
         "distinct_texts": len(hit_clusters),
+        # 基线对齐的字幕帧（判据见 _judge_hardsub），门槛校准用。
+        "aligned_hits": len(hardsub["aligned_indexes"]),
+        "aligned_ratio": round(len(hardsub["aligned_indexes"]) / sampled, 3),
+        "aligned_distinct": len(hardsub["aligned_clusters"]),
+        "subtitle_baseline": hardsub["baseline"],
         # 少量样例供人工复核（已归一化，只留字母数字汉字）。
         "examples": [clusters[cid]["text"] for cid in sorted(hit_clusters)][:5],
         "watermark_texts": watermark_texts,

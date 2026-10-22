@@ -6023,6 +6023,86 @@ def test_near_miss_film_is_delivered_with_evidence_in_its_own_folder(sandbox, mo
     assert d.overlay_stats["near_miss"] == 1 and d.overlay_stats["rejected"] == 0
 
 
+def _line(text, cx, y1, h=0.05, w=0.3):
+    """一行文字框：给定水平中心、底边位置与字高（均为相对整帧的比例）。"""
+    return {"text": text, "x0": cx - w / 2, "x1": cx + w / 2, "y0": y1 - h, "y1": y1}
+
+
+_INTERVIEW_LINES = ["alphaline", "bravoline", "charlieline", "deltaline", "echoline",
+                    "foxtrotline", "golfline", "hotelline", "indialine", "julietline"]
+
+
+@_needs_cv2
+def test_aligned_subtitles_with_low_total_ratio_are_hardsub(monkeypatch):
+    """🔴 实测漏判（626979，字幕纪录片）：对白断续，像字幕的帧只占 0.167 < 0.2，总量规则
+    判不出；但居中命中帧的最下行字幕都落在同一条基线上（0.92~0.96）。基线对齐规则
+    （对齐帧占比 ≥ 0.08 且文本 ≥ 5）必须把它判成硬字幕。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_HIT_RATIO", 0.2)
+    monkeypatch.setattr(d, "HARDSUB_MIN_ALIGNED_RATIO", 0.08)
+    monkeypatch.setattr(d, "HARDSUB_MIN_DISTINCT_TEXTS", 5)
+    boxes = [[] for _ in range(60)]
+    aligned = {1: 0.954, 19: 0.956, 26: 0.931, 49: 0.919, 52: 0.958, 59: 0.921}
+    for k, (index, y1) in enumerate(aligned.items()):
+        boxes[index] = [_line(_INTERVIEW_LINES[k], 0.5, y1)]
+    # 跟着偏右的档案画面走的字幕行：不居中，不计入对齐
+    for index, line in zip((17, 28, 36), _INTERVIEW_LINES[6:9]):
+        boxes[index] = [_line(line, 0.66, 0.9)]
+    _fake_scene(monkeypatch, boxes)
+    scan, evidence = d.detect_overlays("x.mp4")
+    assert scan["reasons"] == ["hardsub"], scan
+    assert scan["hit_ratio"] == 0.15 and scan["aligned_hits"] == 6
+    assert abs(scan["subtitle_baseline"] - 0.9425) < 0.001
+    aligned_ts = {_sample_ts(i, 60) for i in aligned}
+    assert {e[1] for e in evidence} <= aligned_ts, "证据优先取基线对齐的字幕帧"
+
+
+@_needs_cv2
+def test_scattered_scene_text_is_not_aligned(monkeypatch):
+    """🔴 防误杀（1054835 / 1380168：商品包装、卡片、日期戳）：底部区域的字位置五花八门，
+    对不齐基线，不能因为基线规则的门槛低就被判死；总量够临门槛则只存截图。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_HIT_RATIO", 0.2)
+    monkeypatch.setattr(d, "HARDSUB_MIN_ALIGNED_RATIO", 0.08)
+    boxes = [[] for _ in range(60)]
+    scattered = [(3, 0.473, 0.794), (17, 0.36, 0.757), (19, 0.335, 0.844),
+                 (28, 0.647, 0.854), (33, 0.499, 0.996), (59, 0.514, 0.95)]
+    for (index, cx, y1), line in zip(scattered, _INTERVIEW_LINES):
+        boxes[index] = [_line(line, cx, y1)]
+    _fake_scene(monkeypatch, boxes)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["verdict"] == "clean", scan
+    assert scan["aligned_hits"] <= 2
+    assert scan["near_miss"] == ["hardsub"], "总量够临门槛：存截图人工核对，不判死"
+
+
+@_needs_cv2
+def test_aligned_rule_still_needs_distinct_texts(monkeypatch):
+    """同一句居中文字反复出现（片中固定标语、重复字卡）对得齐基线，但只有一类文本，
+    不是字幕。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_ALIGNED_RATIO", 0.08)
+    monkeypatch.setattr(d, "HARDSUB_MIN_DISTINCT_TEXTS", 5)
+    boxes = [[] for _ in range(60)]
+    for index in (2, 9, 15, 23, 31, 44):
+        boxes[index] = [_line("samecaption", 0.5, 0.93)]
+    _fake_scene(monkeypatch, boxes)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["verdict"] == "clean" and scan["aligned_hits"] == 6
+    assert scan["aligned_distinct"] == 1
+
+
+def test_judge_hardsub_is_a_pure_function_usable_offline(monkeypatch):
+    """_judge_hardsub 不抽帧、不 OCR，只吃文字框：离线校准与线上判定共用同一份逻辑。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_HIT_RATIO", 0.2)
+    monkeypatch.setattr(d, "HARDSUB_MIN_ALIGNED_RATIO", 0.08)
+    monkeypatch.setattr(d, "HARDSUB_MIN_DISTINCT_TEXTS", 5)
+    frames = [[] for _ in range(20)]
+    for k, index in enumerate((1, 4, 8, 12, 17)):
+        frames[index] = [dict(_line(_INTERVIEW_LINES[k], 0.505, 0.905), cluster=k)]
+    result = d._judge_hardsub(frames, set(), 20)
+    assert result["is_hardsub"] is True
+    assert result["aligned_indexes"] == [1, 4, 8, 12, 17]
+    assert result["baseline"] == 0.905
+
+
 @_needs_cv2
 def test_short_persistent_text_is_not_a_watermark(monkeypatch):
     """太短的常驻文字（"ok"）不拿来判水印；但它仍不算字幕。"""
