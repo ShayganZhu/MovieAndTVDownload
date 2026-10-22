@@ -288,6 +288,21 @@ CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
 # 字幕，但**只剥不剔**——这类字幕不在画面里，去掉它对影片零损失，不值得为它
 # 丢片。详见 convert_ts_to_mp4。
 STRIP_CLOSED_CAPTIONS = bool(_CFG.get("strip_closed_captions", True))
+# 硬字幕（烧在画面里的字幕）检测。业务口径：带硬字幕的片一概不要——检出即
+# 就地删除、不上传、整片判死，不再换节点尝试。检测放在转封装之后、移入成品
+# 目录之前（下载后检测）：先拿到真实比例，再决定要不要挪到下载前。详见
+# check_hardsub。
+_HARDSUB_CFG = _CFG.get("hardsub_check", {}) or {}
+HARDSUB_CHECK_ENABLED = bool(_HARDSUB_CFG.get("enabled", True))
+# kill = 检出即删除并判死；record = 只检测、记台账与证据帧，照常交付（校准门槛用）。
+HARDSUB_ACTION = str(_HARDSUB_CFG.get("action", "kill")).strip().lower()
+HARDSUB_SAMPLE_FRAMES = max(1, int(_HARDSUB_CFG.get("sample_frames", 60)))
+HARDSUB_MIN_HIT_RATIO = float(_HARDSUB_CFG.get("min_hit_ratio", 0.2))
+HARDSUB_MIN_DISTINCT_TEXTS = max(1, int(_HARDSUB_CFG.get("min_distinct_texts", 5)))
+HARDSUB_MIN_TEXT_SCORE = float(_HARDSUB_CFG.get("min_text_score", 0.8))
+HARDSUB_OCR_THREADS = max(1, int(_HARDSUB_CFG.get("ocr_threads", 2)))
+HARDSUB_SCAN_LOG = resolve_file(_HARDSUB_CFG.get("scan_log"), "hardsub_scan.jsonl")
+HARDSUB_EVIDENCE_DIR = resolve_dir(_HARDSUB_CFG.get("evidence_dir"), "hardsub_evidence")
 # playlist（master/media）解析阶段的请求重试。
 # 🔴 2026-09-13 由 10 降到 4（§12.37 E-2）：退避指数增长、第 7 次起封顶 60s，
 # 跑满 10 次约 4 分钟，而实跑中这些 400/500/502 全部来自 CDN 回源故障
@@ -1530,6 +1545,11 @@ def dead_record_passes_now(record):
        这批记录会被无条件放回。而实跑中"未知分辨率"占比高达 44%（§12.18），
        量级不小。故 height 缺失时在模式 A 下**一律不放回**。
     """
+    # 硬字幕判死与画质门槛无关，调门槛救不回来：永不放回。
+    # （它也没有码率依据，不先拦下的话会落进下面"没有依据 → 放回"那条。）
+    if record.get("reason_class") == "hardsub":
+        return False
+
     evidence = record.get("evidence") or {}
     bitrate = evidence.get("bitrate_kbps")
     if bitrate is None:
@@ -4648,6 +4668,235 @@ def _resolve_final_resolution(resolution, final_path, label):
     return probed
 
 
+# ---------- 硬字幕检测（下载后、移入成品目录前） ----------
+# 做法：在片长 10%~90% 区间均匀抽帧（避开片头片尾的演职员表），只截画面底部、
+# 用 OCR 找"像字幕"的文字框；整片满足两条才判有硬字幕：
+#   ① 像字幕的帧占比 ≥ min_hit_ratio —— 正常对白片字幕在屏时间约三到五成；
+#      原片自带的外语强制字幕只零星出现，达不到门槛，不会被误判；
+#   ② 不同文本数 ≥ min_distinct_texts —— 字幕内容一直在变，台标/水印/固定
+#      标语是同一串字，靠这条排除。
+# 检测出错一律按"无硬字幕"放行：检测故障不能变成丢片。
+
+_HARDSUB_SPAN = (0.10, 0.90)          # 抽帧区间（占片长比例）
+_HARDSUB_CROP_RATIO = 0.30            # 只看画面底部 30%（含宽银幕黑边里的字幕）
+_HARDSUB_CROP_WIDTH = 960             # 截图缩放宽度：字幕仍清晰可读，OCR 快一倍以上
+# "像字幕"的文字框几何条件，均相对整帧：框中心横坐标居中、框高在字幕字号范围内。
+_HARDSUB_CENTER_RANGE = (0.30, 0.70)
+_HARDSUB_BOX_HEIGHT_RANGE = (0.02, 0.10)
+_HARDSUB_EVIDENCE_KEEP = 4            # 每部判定为硬字幕的片保留几张证据截图
+_HARDSUB_MARKER = "检测到硬字幕"
+
+# OCR 引擎按线程各建一份：模型加载只要零点几秒，且避免多线程共用一个会话。
+_hardsub_local = threading.local()
+_hardsub_stats_lock = threading.Lock()
+# 本次运行的检测计数（_run_pipeline 开头清零、收尾打印）：比例统计的现场口径，
+# 跨运行的完整口径在 HARDSUB_SCAN_LOG。
+hardsub_stats = {"checked": 0, "hardsub": 0, "unknown": 0}
+
+
+def _reset_hardsub_stats():
+    with _hardsub_stats_lock:
+        for key in hardsub_stats:
+            hardsub_stats[key] = 0
+
+
+def _hardsub_engine():
+    engine = getattr(_hardsub_local, "engine", None)
+    if engine is None:
+        from rapidocr_onnxruntime import RapidOCR
+
+        # 线程数要限：转封装池有多个线程同时检测，onnxruntime 默认会吃满全部核。
+        # 检测模型按"长边不超过截图宽度"缩放：默认的"短边至少 736"会把 960×162
+        # 的底部截图放大到四千多像素宽，实测每帧 0.77s；改后 0.045s，结论不变。
+        engine = RapidOCR(
+            intra_op_num_threads=HARDSUB_OCR_THREADS, inter_op_num_threads=1,
+            det_limit_type="max", det_limit_side_len=_HARDSUB_CROP_WIDTH,
+        )
+        _hardsub_local.engine = engine
+    return engine
+
+
+def _grab_bottom_crop(path, timestamp):
+    """抽 timestamp 秒处一帧的底部区域并缩放，返回 BGR 图像；失败返回 None。"""
+    import cv2
+    import numpy as np
+
+    vf = (
+        f"crop=iw:ih*{_HARDSUB_CROP_RATIO}:0:ih*{1 - _HARDSUB_CROP_RATIO},"
+        f"scale={_HARDSUB_CROP_WIDTH}:-2"
+    )
+    command = [
+        "ffmpeg", "-v", "error", "-ss", f"{timestamp:.3f}", "-i", path,
+        "-frames:v", "1", "-vf", vf, "-f", "image2pipe", "-c:v", "png", "-",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=60)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    return cv2.imdecode(np.frombuffer(result.stdout, np.uint8), cv2.IMREAD_COLOR)
+
+
+def _normalize_sub_text(text):
+    """只留字母、数字、汉字并转小写：比对"是不是同一句"时不受标点空格干扰。"""
+    return re.sub(r"[\W_]+", "", str(text or "")).lower()
+
+
+def _subtitle_text_in(crop):
+    """截图里像字幕的文字（多个框拼成一句）；没有返回空串。"""
+    result, _ = _hardsub_engine()(crop, use_cls=False)
+    height, width = crop.shape[:2]
+    texts = []
+    for box, text, score in result or []:
+        if score < HARDSUB_MIN_TEXT_SCORE:
+            continue
+        xs = [point[0] for point in box]
+        ys = [point[1] for point in box]
+        center_x = (min(xs) + max(xs)) / 2 / width
+        # 截图只是整帧底部的一段，框高要换算回整帧比例。
+        box_height = (max(ys) - min(ys)) / height * _HARDSUB_CROP_RATIO
+        if not (_HARDSUB_CENTER_RANGE[0] <= center_x <= _HARDSUB_CENTER_RANGE[1]):
+            continue
+        if not (_HARDSUB_BOX_HEIGHT_RANGE[0] <= box_height <= _HARDSUB_BOX_HEIGHT_RANGE[1]):
+            continue
+        normalized = _normalize_sub_text(text)
+        if len(normalized) >= 2:
+            texts.append(normalized)
+    return "".join(texts)
+
+
+def detect_hardsub(path):
+    """抽帧检测一部片有没有硬字幕。
+
+    返回 (结论字典, 证据截图列表)。结论 verdict 为 hardsub / clean / unknown
+    （探测不到时长、抽到的帧不足一半时为 unknown，调用方按无字幕放行）。
+    """
+    duration = _probe_duration(path)
+    if not duration or duration <= 0:
+        return {"verdict": "unknown", "error": "无法读取片长"}, []
+
+    start, end = _HARDSUB_SPAN
+    sampled = 0
+    hit_texts = []
+    evidence = []
+    for index in range(HARDSUB_SAMPLE_FRAMES):
+        timestamp = duration * (start + (end - start) * (index + 0.5) / HARDSUB_SAMPLE_FRAMES)
+        crop = _grab_bottom_crop(path, timestamp)
+        if crop is None:
+            continue
+        sampled += 1
+        text = _subtitle_text_in(crop)
+        if text:
+            hit_texts.append(text)
+            if len(evidence) < _HARDSUB_EVIDENCE_KEEP:
+                evidence.append(crop)
+
+    if sampled < max(1, HARDSUB_SAMPLE_FRAMES // 2):
+        return {
+            "verdict": "unknown", "sampled": sampled,
+            "error": f"只抽到 {sampled}/{HARDSUB_SAMPLE_FRAMES} 帧",
+        }, []
+
+    hit_ratio = len(hit_texts) / sampled
+    distinct = len(set(hit_texts))
+    is_hardsub = (
+        hit_ratio >= HARDSUB_MIN_HIT_RATIO and distinct >= HARDSUB_MIN_DISTINCT_TEXTS
+    )
+    return {
+        "verdict": "hardsub" if is_hardsub else "clean",
+        "sampled": sampled,
+        "hits": len(hit_texts),
+        "hit_ratio": round(hit_ratio, 3),
+        "distinct_texts": distinct,
+        # 少量样例供人工复核（已归一化，只留字母数字汉字）。
+        "examples": list(dict.fromkeys(hit_texts))[:5],
+    }, evidence
+
+
+def _save_hardsub_evidence(tmdb_id, crops):
+    """保存证据截图到 {evidence_dir}/{tmdbId}/。成品会被删掉，这是事后人工
+    核对有没有误判的唯一依据。失败只告警。"""
+    try:
+        import cv2
+
+        folder = os.path.join(HARDSUB_EVIDENCE_DIR, safe_file_token(tmdb_id))
+        os.makedirs(folder, exist_ok=True)
+        for index, crop in enumerate(crops, 1):
+            cv2.imwrite(os.path.join(folder, f"{index}.jpg"), crop)
+        return folder
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [{tmdb_id}] ⚠️ 硬字幕证据截图保存失败: {exc}", flush=True)
+        return None
+
+
+def record_hardsub_dead(tmdb_id, title, scan):
+    """把硬字幕片记进 DOWNLOAD_DEAD_LOG（纯追加，读取端按 id 聚合）。
+
+    reason_class="hardsub" 是关键：`--retry-dead` 复判只针对画质门槛，
+    硬字幕片永不放回（见 dead_record_passes_now）。
+    """
+    write_log(DOWNLOAD_DEAD_LOG, {
+        "tmdbId": tmdb_id,
+        "title": title or "",
+        "dead_at": int(time.time()),
+        "reason_class": "hardsub",
+        "error": f"{_HARDSUB_MARKER}（字幕帧占比 {scan.get('hit_ratio')}，"
+                 f"不同文本 {scan.get('distinct_texts')} 条）",
+        "evidence": {
+            key: scan.get(key)
+            for key in ("sampled", "hits", "hit_ratio", "distinct_texts", "examples")
+        },
+    })
+
+
+def check_hardsub(tmdb_id, title, path):
+    """检测并按配置处置。返回 True 表示该片判为硬字幕且应删除判死（action=kill）。
+
+    每部片的结论都写进 HARDSUB_SCAN_LOG（比例统计与门槛校准用）；判为硬字幕的
+    片另存证据截图。检测本身任何异常都按"无硬字幕"放行。
+    """
+    if not HARDSUB_CHECK_ENABLED:
+        return False
+    try:
+        scan, evidence = detect_hardsub(path)
+    except Exception as exc:  # noqa: BLE001 - 检测故障不能变成丢片
+        scan, evidence = {"verdict": "unknown", "error": str(exc)}, []
+
+    verdict = scan.get("verdict")
+    with _hardsub_stats_lock:
+        hardsub_stats["checked"] += 1
+        if verdict in ("hardsub", "unknown"):
+            hardsub_stats[verdict] += 1
+
+    record = {
+        "tmdbId": tmdb_id,
+        "title": title or "",
+        "checked_at": int(time.time()),
+        "action": HARDSUB_ACTION,
+        **scan,
+    }
+    if verdict == "hardsub":
+        record["evidence_dir"] = _save_hardsub_evidence(tmdb_id, evidence)
+    write_log(HARDSUB_SCAN_LOG, record)
+
+    if verdict == "unknown":
+        print(f"  [{tmdb_id}] ⚠️ 硬字幕检测失败，按无字幕放行: "
+              f"{scan.get('error')}", flush=True)
+        return False
+    if verdict != "hardsub":
+        return False
+    if HARDSUB_ACTION != "kill":
+        print(f"  [{tmdb_id}] {_HARDSUB_MARKER}（记录模式，照常交付）："
+              f"字幕帧占比 {scan['hit_ratio']}，不同文本 {scan['distinct_texts']} 条",
+              flush=True)
+        return False
+    record_hardsub_dead(tmdb_id, title, scan)
+    print(f"  [{tmdb_id}] {_HARDSUB_MARKER}：字幕帧占比 {scan['hit_ratio']}，"
+          f"不同文本 {scan['distinct_texts']} 条 → 删除成品并判死", flush=True)
+    return True
+
+
 def finalize_one_entry(conversion_job, processed_ids):
     """转封装 + 移动到目标目录。成功后登记去重，把成品交给上传阶段。
 
@@ -4660,12 +4909,24 @@ def finalize_one_entry(conversion_job, processed_ids):
     temp_mp4 = conversion_job["temp_mp4"]
     cleanup_paths = conversion_job["cleanup_paths"]
     completed = False
+    hardsub_dead = False
 
     try:
         print(f"  [{tmdb_id}] 开始转封装为 MP4...", flush=True)
         remove_file(temp_mp4)
         if not convert_ts_to_mp4(final_ts, temp_mp4):
             raise RuntimeError("FFmpeg 转换失败")
+
+        # 硬字幕：在移入成品目录之前查。判死的片就地删掉，不进 downloads/、
+        # 不存字幕与 meta、不上传；整片判死，不再换节点尝试（业务口径）。
+        if check_hardsub(tmdb_id, conversion_job["title"], temp_mp4):
+            remove_file(temp_mp4)
+            hardsub_dead = True
+            return tmdb_id, False, {
+                "error": f"{_HARDSUB_MARKER}，已删除成品并判死"
+                         f"（不上传、不再尝试其它节点）",
+                "hardsub": True,
+            }
 
         print(f"  [{tmdb_id}] 转封装完成，准备移动文件", flush=True)
         final_path = move_to_target_folder(
@@ -4729,9 +4990,10 @@ def finalize_one_entry(conversion_job, processed_ids):
         for path in cleanup_paths:
             remove_file(path)
         # 成品已落地即登记去重（成败上传都不再重下）；失败则释放 ID 锁允许重试。
+        # 硬字幕判死同样登记：本次运行里重取回来的新链接也不该再下它。
         with processing_lock:
             processing_ids.discard(normalized_id)
-            if completed:
+            if completed or hardsub_dead:
                 processed_ids.add(normalized_id)
 
 
@@ -5001,6 +5263,39 @@ def preflight_check_ffmpeg():
     print("[ffmpeg 预检通过] ffmpeg 与 ffprobe 均已就绪", flush=True)
 
 
+def preflight_check_hardsub():
+    """启用硬字幕检测时预检 action 取值与 OCR 依赖：不满足就 fail-fast 退出。
+
+    不能在运行中才发现：缺依赖时每部片都会"检测失败按无字幕放行"，带硬字幕的
+    片照样被上传，而用户以为过滤在生效。
+    """
+    if not HARDSUB_CHECK_ENABLED:
+        return
+    reason = None
+    if HARDSUB_ACTION not in ("kill", "record"):
+        reason = (f"hardsub_check.action 只能是 kill 或 record，"
+                  f"当前为 {HARDSUB_ACTION!r}")
+    else:
+        try:
+            importlib.import_module("rapidocr_onnxruntime")
+            importlib.import_module("cv2")
+        except Exception as exc:  # noqa: BLE001
+            reason = (f"硬字幕检测依赖缺失（{exc}）。请先 "
+                      f"`pip install -r requirements.txt`，"
+                      f"或在 config.yaml 里关闭 hardsub_check.enabled")
+    if reason:
+        print(f"[硬字幕检测预检失败] {reason}", flush=True)
+        write_log(FAILED_LOG, {
+            "stage": "preflight",
+            "error": reason,
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        release_main_lock()
+        sys.exit(1)
+    print(f"[硬字幕检测预检通过] 动作 {HARDSUB_ACTION}，每部抽 "
+          f"{HARDSUB_SAMPLE_FRAMES} 帧", flush=True)
+
+
 def install_interrupt_handler():
     """让 Ctrl+C / SIGTERM 置位全局 `interrupted`，把中断意图传达给工作线程。
 
@@ -5037,6 +5332,7 @@ def main():
     acquire_main_lock()
     install_interrupt_handler()
     preflight_check_ffmpeg()
+    preflight_check_hardsub()
     if S3_ENABLED:
         preflight_check_s3()
     monitor_thread = None
@@ -5135,6 +5431,7 @@ def _run_pipeline(run_volume=None):
     """
     clean_temp_directory()
     print("已清理 temp 目录中的旧临时文件")
+    _reset_hardsub_stats()
 
     logged_ids = load_success_log_ids()
     disk_ids, duplicate_files = scan_downloaded_mp4_ids()
@@ -5464,14 +5761,17 @@ def _run_pipeline(run_volume=None):
                 info = {"error": str(exc)}
 
             if not conversion_success:
+                # 硬字幕判死单独标 stage：它不是转封装故障，统计与排查时要分开看。
+                hardsub = bool(info.get("hardsub"))
                 write_log(FAILED_LOG, {
                     "tmdbId": tmdb_id,
                     "title": entry.get("title") or "",
                     "urls": entry.get("urls", []),
                     "error": info.get("error", "未知错误"),
-                    "stage": "conversion",
+                    "stage": "hardsub" if hardsub else "conversion",
                 })
-                print(f"转封装失败: {tmdb_id}: {info.get('error', '未知错误')}")
+                print(f"{'硬字幕判死' if hardsub else '转封装失败'}: "
+                      f"{tmdb_id}: {info.get('error', '未知错误')}")
                 return
 
             # 转封装成功 -> 立即提交上传。反压：先 acquire 信号量（限制
@@ -5983,6 +6283,17 @@ def _run_pipeline(run_volume=None):
             f"上传 {stats['uploads']} 部。"
         )
         print_upload_volume("本次上传成功", volume)
+
+        # 硬字幕比例：决定日后要不要把检测挪到下载前的依据（完整台账见 scan_log）。
+        if hardsub_stats["checked"]:
+            checked = hardsub_stats["checked"]
+            print(
+                f"\n硬字幕检测：已检测 {checked} 部，判定带硬字幕 "
+                f"{hardsub_stats['hardsub']} 部（{hardsub_stats['hardsub'] / checked:.1%}）"
+                + (f"，检测失败按无字幕放行 {hardsub_stats['unknown']} 部"
+                   if hardsub_stats["unknown"] else "")
+                + ("" if HARDSUB_ACTION == "kill" else "（记录模式，未删除）")
+            )
 
         # 被拒原因聚合统计（观测性）：量化各类失败占比，指导码率门槛校准。
         def _print_reject_stats(title, counter, note):

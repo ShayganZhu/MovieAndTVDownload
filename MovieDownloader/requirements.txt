@@ -17,3 +17,7 @@ botocore
 # 元数据抓取阶段（fetch_movie_metadata.py）
 pandas
 tmdbsimple
+
+# 硬字幕检测（download_movies.py hardsub_check）：CPU 版 OCR，wheel 自带中英文
+# 检测/识别模型，无需另行下载；会连带装上 onnxruntime 与 opencv-python
+rapidocr_onnxruntime

@@ -5644,3 +5644,349 @@ def test_probe_codec_takes_first_line_of_duplicated_output(monkeypatch):
         lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="HEVC\nhevc\n", stderr=""),
     )
     assert d.probe_codec("x.ts") == "hevc"
+
+
+# ---------------------------------------------------------------------------
+# 硬字幕检测（下载后、移入成品目录前）
+#   业务口径：带硬字幕的片就地删除、不上传、整片判死，不再换节点尝试；
+#   检测出错按无字幕放行；--retry-dead 永不放回。
+# ---------------------------------------------------------------------------
+
+def _ocr_available():
+    try:
+        import cv2  # noqa: F401
+        import rapidocr_onnxruntime  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return _ffmpeg_has_libx264()
+
+
+_needs_ocr = pytest.mark.skipif(
+    not _ocr_available(), reason="需要 rapidocr_onnxruntime、opencv 与带 libx264 的 ffmpeg"
+)
+
+_SUB_LINES = [
+    "Where are you going tonight?", "I told you to stay here.", "We need to talk.",
+    "Nobody knows the truth.", "Get in the car, now!", "It was never about money.",
+    "Do you remember that day?", "Let's go home.", "He is not coming back.",
+]
+
+
+def _make_overlay_video(tmp_path, kind, seconds=60, w=640, h=360):
+    """合成测试片：sub=底部居中、每 2 秒换一句的字幕（一半时间在屏）；
+    logo=一直不变的居中标语 + 角落台标；clean=无字。1 帧/秒编码，够抽帧用。"""
+    import cv2
+    import numpy as np
+
+    frames = tmp_path / f"{kind}_frames"
+    frames.mkdir()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    for s in range(seconds):
+        img = np.zeros((h, w, 3), np.uint8)
+        img[:] = (40 + s % 60, 70, 100 + (s * 3) % 100)
+        cv2.circle(img, (w // 2 + int(80 * np.sin(s / 7)), h // 2 - 40), 45, (200, 180, 60), -1)
+        if kind == "sub" and (s // 2) % 2 == 0:
+            text = _SUB_LINES[(s // 4) % len(_SUB_LINES)]
+            (tw, _), _ = cv2.getTextSize(text, font, 0.8, 2)
+            org = ((w - tw) // 2, int(h * 0.92))
+            cv2.putText(img, text, org, font, 0.8, (0, 0, 0), 6, cv2.LINE_AA)
+            cv2.putText(img, text, org, font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        if kind == "logo":
+            text = "WATCH FREE ON STREAMHUB"
+            (tw, _), _ = cv2.getTextSize(text, font, 0.7, 2)
+            cv2.putText(img, text, ((w - tw) // 2, int(h * 0.93)), font, 0.7,
+                        (230, 230, 230), 2, cv2.LINE_AA)
+            cv2.putText(img, "HBO", (int(w * 0.88), int(h * 0.95)), font, 0.6, (255, 255, 255), 2)
+        cv2.imwrite(str(frames / f"{s:04d}.png"), img)
+    out = tmp_path / f"{kind}.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-framerate", "1",
+         "-i", str(frames / "%04d.png"), "-c:v", "libx264", "-r", "24",
+         "-pix_fmt", "yuv420p", str(out)],
+        check=True, capture_output=True, timeout=120,
+    )
+    return str(out)
+
+
+@_needs_ocr
+def test_hardsub_detector_flags_changing_bottom_subtitles(tmp_path, monkeypatch):
+    """🔴 真 OCR 端到端：底部居中、内容不断变化的字幕 → 判为硬字幕，并带回证据截图。"""
+    monkeypatch.setattr(d, "HARDSUB_SAMPLE_FRAMES", 20)
+    scan, evidence = d.detect_hardsub(_make_overlay_video(tmp_path, "sub"))
+    assert scan["verdict"] == "hardsub", scan
+    assert scan["hit_ratio"] >= d.HARDSUB_MIN_HIT_RATIO
+    assert scan["distinct_texts"] >= d.HARDSUB_MIN_DISTINCT_TEXTS
+    assert 0 < len(evidence) <= 4
+
+
+@_needs_ocr
+def test_hardsub_detector_ignores_static_overlay_and_clean_video(tmp_path, monkeypatch):
+    """一直不变的标语/台标（同一串字）与干净画面都不能判成硬字幕——误判就是永久丢片。"""
+    monkeypatch.setattr(d, "HARDSUB_SAMPLE_FRAMES", 20)
+    logo, _ = d.detect_hardsub(_make_overlay_video(tmp_path, "logo"))
+    assert logo["verdict"] == "clean", logo
+    assert logo["distinct_texts"] <= 1, "固定文字只能算一条文本"
+    clean, _ = d.detect_hardsub(_make_overlay_video(tmp_path, "clean"))
+    assert clean["verdict"] == "clean" and clean["hits"] == 0, clean
+
+
+def _fake_frames(monkeypatch, texts, duration=1000.0):
+    """让检测器"看到"给定的逐帧字幕文本（None 表示抽帧失败）。"""
+    monkeypatch.setattr(d, "_probe_duration", lambda p: duration)
+    frames = iter(texts)
+    current = {}
+
+    def grab(path, ts):
+        current["text"] = next(frames)
+        return None if current["text"] is None else object()
+
+    monkeypatch.setattr(d, "_grab_bottom_crop", grab)
+    monkeypatch.setattr(d, "_subtitle_text_in", lambda crop: current["text"])
+    monkeypatch.setattr(d, "HARDSUB_SAMPLE_FRAMES", len(texts))
+
+
+def test_hardsub_needs_both_hit_ratio_and_distinct_texts(monkeypatch):
+    """两条门槛缺一不可：字幕帧够多但文本不变（台标）→ clean；文本多变但只零星
+    出现（外语强制字幕）→ clean；两者都满足 → hardsub。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_HIT_RATIO", 0.2)
+    monkeypatch.setattr(d, "HARDSUB_MIN_DISTINCT_TEXTS", 5)
+
+    _fake_frames(monkeypatch, ["logo"] * 10 + [""] * 10)
+    assert d.detect_hardsub("x.mp4")[0]["verdict"] == "clean"
+
+    _fake_frames(monkeypatch, [f"line{i}" for i in range(3)] + [""] * 17)
+    assert d.detect_hardsub("x.mp4")[0]["verdict"] == "clean"
+
+    _fake_frames(monkeypatch, [f"line{i}" for i in range(6)] + [""] * 14)
+    scan = d.detect_hardsub("x.mp4")[0]
+    assert scan["verdict"] == "hardsub"
+    assert scan["hit_ratio"] == 0.3 and scan["distinct_texts"] == 6
+
+
+def test_hardsub_is_unknown_when_duration_or_frames_missing(monkeypatch):
+    """读不到片长、或抽到的帧不足一半 → unknown（调用方按无字幕放行）。"""
+    monkeypatch.setattr(d, "_probe_duration", lambda p: None)
+    assert d.detect_hardsub("x.mp4")[0]["verdict"] == "unknown"
+
+    _fake_frames(monkeypatch, [None] * 15 + ["a1", "b2", "c3", "d4", "e5"])
+    assert d.detect_hardsub("x.mp4")[0]["verdict"] == "unknown"
+
+
+def _hardsub_job(sandbox, monkeypatch, tmdb_id="66"):
+    """一个能真正走完 finalize_one_entry 的转封装任务：转封装 mock 成写出一个文件。"""
+    temp_mp4 = os.path.join(str(sandbox), "temp", f"temp_{tmdb_id}.mp4")
+
+    def fake_convert(src, dst):
+        with open(dst, "wb") as fh:
+            fh.write(b"m" * 4096)
+        return True
+
+    monkeypatch.setattr(d, "convert_ts_to_mp4", fake_convert)
+    monkeypatch.setattr(d, "probe_resolution", lambda p: (1920, 1080))
+    monkeypatch.setattr(d, "HARDSUB_CHECK_ENABLED", True)
+    return {
+        "tmdbId": tmdb_id, "normalized_id": tmdb_id, "title": "Hard Sub", "year": 2010,
+        "url": "https://a/1.m3u8",
+        "final_ts": os.path.join(str(sandbox), "temp", f"temp_{tmdb_id}.ts"),
+        "temp_mp4": temp_mp4,
+        "cleanup_paths": [],
+        "bitrate_kbps": 3000, "resolution": "1920x1080",
+        "missing_segment_count": 0, "missing_segment_indices": [],
+    }
+
+
+_HARDSUB_SCAN = {
+    "verdict": "hardsub", "sampled": 60, "hits": 24, "hit_ratio": 0.4,
+    "distinct_texts": 20, "examples": ["weneedtotalk"],
+}
+
+
+def _read_jsonl(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+def test_hardsub_film_is_deleted_and_marked_dead(sandbox, monkeypatch):
+    """🔴 kill：成品就地删除、不进 downloads/、整片判死（reason_class=hardsub），
+    并登记进 processed_ids（本次运行重取回来的链接也不再下）。"""
+    job = _hardsub_job(sandbox, monkeypatch)
+    monkeypatch.setattr(d, "HARDSUB_ACTION", "kill")
+    monkeypatch.setattr(d, "detect_hardsub", lambda p: (dict(_HARDSUB_SCAN), []))
+    processed = set()
+
+    tid, ok, info = d.finalize_one_entry(job, processed)
+
+    assert (tid, ok) == ("66", False) and info.get("hardsub") is True
+    assert not os.path.exists(job["temp_mp4"]), "成品必须就地删除"
+    assert not os.path.exists(d.movie_dir("66", 2010)), "不能进成品目录"
+    assert "66" in processed and "66" not in d.processing_ids
+    dead = _read_jsonl(d.DOWNLOAD_DEAD_LOG)
+    assert [r["reason_class"] for r in dead] == ["hardsub"]
+    assert dead[0]["evidence"]["hit_ratio"] == 0.4
+    scan = _read_jsonl(d.HARDSUB_SCAN_LOG)
+    assert scan[0]["verdict"] == "hardsub" and scan[0]["tmdbId"] == "66"
+    assert d.load_dead_ids() == {"66"}, "下次启动必须跳过"
+
+
+def test_hardsub_record_mode_still_delivers_the_film(sandbox, monkeypatch):
+    """record：只记台账与证据，照常交付，不判死。"""
+    job = _hardsub_job(sandbox, monkeypatch)
+    monkeypatch.setattr(d, "HARDSUB_ACTION", "record")
+    monkeypatch.setattr(d, "detect_hardsub", lambda p: (dict(_HARDSUB_SCAN), []))
+
+    _, ok, info = d.finalize_one_entry(job, set())
+
+    assert ok is True and os.path.exists(info["final_path"])
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == []
+    assert _read_jsonl(d.HARDSUB_SCAN_LOG)[0]["action"] == "record"
+
+
+def test_hardsub_detection_error_lets_the_film_through(sandbox, monkeypatch):
+    """检测本身出错（OCR 崩溃等）→ 按无字幕放行，台账记 unknown。"""
+    job = _hardsub_job(sandbox, monkeypatch)
+    monkeypatch.setattr(d, "HARDSUB_ACTION", "kill")
+
+    def boom(path):
+        raise RuntimeError("onnxruntime exploded")
+
+    monkeypatch.setattr(d, "detect_hardsub", boom)
+
+    _, ok, _ = d.finalize_one_entry(job, set())
+
+    assert ok is True
+    scan = _read_jsonl(d.HARDSUB_SCAN_LOG)[0]
+    assert scan["verdict"] == "unknown" and "exploded" in scan["error"]
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == []
+
+
+def test_hardsub_check_disabled_skips_detection(sandbox, monkeypatch):
+    job = _hardsub_job(sandbox, monkeypatch)
+    monkeypatch.setattr(d, "HARDSUB_CHECK_ENABLED", False)
+
+    def boom(path):
+        raise AssertionError("关闭时不该检测")
+
+    monkeypatch.setattr(d, "detect_hardsub", boom)
+    _, ok, _ = d.finalize_one_entry(job, set())
+    assert ok is True and _read_jsonl(d.HARDSUB_SCAN_LOG) == []
+
+
+@_needs_ocr
+def test_hardsub_evidence_crops_are_saved(sandbox, monkeypatch):
+    """判为硬字幕时保存证据截图：成品删掉后这是人工核对误判的唯一依据。"""
+    import numpy as np
+
+    job = _hardsub_job(sandbox, monkeypatch)
+    monkeypatch.setattr(d, "HARDSUB_ACTION", "kill")
+    crops = [np.full((54, 320, 3), 128, np.uint8) for _ in range(3)]
+    monkeypatch.setattr(d, "detect_hardsub", lambda p: (dict(_HARDSUB_SCAN), crops))
+
+    d.finalize_one_entry(job, set())
+
+    folder = os.path.join(d.HARDSUB_EVIDENCE_DIR, "66")
+    assert sorted(os.listdir(folder)) == ["1.jpg", "2.jpg", "3.jpg"]
+    assert _read_jsonl(d.HARDSUB_SCAN_LOG)[0]["evidence_dir"] == folder
+
+
+def test_retry_dead_never_revives_hardsub_records(tmp_path, monkeypatch):
+    """🔴 硬字幕记录没有码率依据：不拦的话会落进"无依据 → 放回"，被 --retry-dead 放回重下。"""
+    dead_log = tmp_path / "dead.jsonl"
+    dead_log.write_text(
+        json.dumps({"tmdbId": "66", "reason_class": "hardsub", "evidence": {}}) + "\n"
+        + json.dumps({"tmdbId": "77", "reason_class": "quality", "evidence": {}}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(dead_log))
+
+    assert d.dead_record_passes_now({"reason_class": "hardsub"}) is False
+    assert d.load_dead_ids(d.dead_record_passes_now) == {"66"}, (
+        "硬字幕片永不放回；无依据的画质记录照旧放回"
+    )
+
+
+def test_pipeline_never_uploads_a_hardsub_film(tmp_path, monkeypatch, capsys):
+    """端到端：硬字幕片不进上传阶段，failed.jsonl 记 stage=hardsub，收尾打印比例。"""
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "async_refetch_hook", None)
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    monkeypatch.setattr(d, "HARDSUB_CHECK_ENABLED", True)
+    monkeypatch.setattr(d, "HARDSUB_ACTION", "kill")
+    monkeypatch.setattr(d, "processing_ids", set())
+    os.makedirs(d.TEMP_DIR, exist_ok=True)
+    inp = tmp_path / "in.jsonl"
+    inp.write_text(
+        json.dumps({"tmdbId": "66", "title": "H", "year": 2010, "urls": ["u"]}) + "\n"
+        + json.dumps({"tmdbId": "67", "title": "C", "year": 2011, "urls": ["u"]}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(inp))
+
+    def fake_process(entry, ids):
+        tid = str(entry["tmdbId"])
+        with d.processing_lock:
+            d.processing_ids.add(tid)
+        return tid, True, {
+            "tmdbId": tid, "normalized_id": tid, "title": entry["title"],
+            "year": entry["year"], "url": "u",
+            "final_ts": os.path.join(d.TEMP_DIR, f"temp_{tid}.ts"),
+            "temp_mp4": os.path.join(d.TEMP_DIR, f"temp_{tid}.mp4"),
+            "cleanup_paths": [], "bitrate_kbps": 3000, "resolution": "1920x1080",
+            "missing_segment_count": 0, "missing_segment_indices": [],
+        }
+
+    def fake_convert(src, dst):
+        with open(dst, "wb") as fh:
+            fh.write(b"m" * 1024)
+        return True
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+    monkeypatch.setattr(d, "convert_ts_to_mp4", fake_convert)
+    monkeypatch.setattr(
+        d, "detect_hardsub",
+        lambda p: (dict(_HARDSUB_SCAN), []) if "temp_66" in p else
+        ({"verdict": "clean", "sampled": 60, "hits": 0, "hit_ratio": 0.0,
+          "distinct_texts": 0, "examples": []}, []),
+    )
+    uploads = []
+    monkeypatch.setattr(d, "upload_one_entry",
+                        lambda info: uploads.append(info["tmdbId"]) or (info["tmdbId"], True, info))
+
+    d._run_pipeline()
+
+    assert uploads == ["67"], "只有干净的片能上传"
+    stages = {r["tmdbId"]: r["stage"] for r in _read_jsonl(d.FAILED_LOG)}
+    assert stages == {"66": "hardsub"}
+    out = capsys.readouterr().out
+    assert "硬字幕检测：已检测 2 部，判定带硬字幕 1 部（50.0%）" in out
+
+
+def test_preflight_rejects_bad_action_and_missing_ocr(tmp_path, monkeypatch):
+    """启用检测时 action 写错或缺 OCR 依赖必须 fail-fast：否则每部片都"检测失败放行"，
+    硬字幕照样上传，而用户以为过滤在生效。"""
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "release_main_lock", lambda: None)
+    monkeypatch.setattr(d, "HARDSUB_CHECK_ENABLED", True)
+
+    monkeypatch.setattr(d, "HARDSUB_ACTION", "delete")
+    with pytest.raises(SystemExit):
+        d.preflight_check_hardsub()
+
+    monkeypatch.setattr(d, "HARDSUB_ACTION", "kill")
+    real_import = d.importlib.import_module
+
+    def no_ocr(name, *a, **kw):
+        if name == "rapidocr_onnxruntime":
+            raise ImportError("No module named 'rapidocr_onnxruntime'")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(d.importlib, "import_module", no_ocr)
+    with pytest.raises(SystemExit):
+        d.preflight_check_hardsub()
+
+    monkeypatch.setattr(d, "HARDSUB_CHECK_ENABLED", False)
+    d.preflight_check_hardsub()  # 关闭时不检查、不退出
