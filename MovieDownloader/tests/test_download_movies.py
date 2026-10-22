@@ -5275,6 +5275,16 @@ def test_stranded_covers_upload_failed_but_not_uploaded(tmp_path, monkeypatch):
     assert d.build_s3_key("3", None).endswith("movies/unknown_year/3/3.mp4")
 
 
+def test_dead_film_on_disk_is_never_uploaded(tmp_path, monkeypatch):
+    """磁盘上有成品、但该片已判死（如 record 模式中断后改 kill 才判死）→ 绝不补传。"""
+    uploads = _setup_stranded(tmp_path, monkeypatch)
+    _put_mp4("55", 2001)
+    _put_mp4("56", 2001)
+    monkeypatch.setattr(d, "load_dead_ids", lambda *a, **kw: {"55"})
+    d._run_pipeline()
+    assert [u["tmdbId"] for u in uploads] == ["56"]
+
+
 def test_stranded_scan_is_skipped_when_upload_disabled(tmp_path, monkeypatch):
     """不开上传时成品本就留本地，不该被当成滞留去"补传"。"""
     uploads = _setup_stranded(tmp_path, monkeypatch)
@@ -5864,6 +5874,45 @@ def test_subtitles_under_a_corner_watermark_are_both_reported(monkeypatch):
     scan = d.detect_overlays("x.mp4")[0]
     assert scan["reasons"] == ["hardsub", "watermark"]
     assert scan["verdict"] == "hardsub+watermark"
+
+
+@_needs_cv2
+def test_recurring_scene_sign_at_varying_positions_is_not_a_watermark(monkeypatch):
+    """🔴 防误杀：剧情里反复出现的招牌（四成镜头都拍得到，但每个镜头位置不同）不是
+    水印——水印钉在固定位置。复审实测：不看位置时它会被判成水印、整片删除。"""
+    import random
+
+    random.seed(1)
+    boxes = []
+    for i in range(20):
+        if i % 5 in (0, 2):
+            x, y = random.uniform(0.05, 0.7), random.uniform(0.1, 0.6)
+            boxes.append([{"text": "joesdiner", "x0": x, "x1": x + 0.2,
+                           "y0": y, "y1": y + 0.05}])
+        else:
+            boxes.append([])
+    _fake_scene(monkeypatch, boxes)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["verdict"] == "clean", scan
+    assert scan["roaming_texts"][0]["text"] == "joesdiner", "记进台账供校准"
+
+
+@_needs_cv2
+def test_fixed_watermark_with_occasional_ocr_misses_is_still_caught(monkeypatch):
+    """固定位置的水印，即便部分帧 OCR 没认出（或框略有抖动），只要在同一处的帧
+    仍够门槛就判水印。"""
+    boxes = []
+    for i in range(20):
+        if i % 4 == 3:
+            boxes.append([])  # OCR 漏认
+        else:
+            jitter = 0.01 * (i % 3)
+            boxes.append([{"text": "piratesite", "x0": 0.80 + jitter, "x1": 0.95 + jitter,
+                           "y0": 0.03, "y1": 0.07}])
+    _fake_scene(monkeypatch, boxes)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["reasons"] == ["watermark"], scan
+    assert scan["watermark_texts"][0]["presence"] == 0.75
 
 
 @_needs_cv2

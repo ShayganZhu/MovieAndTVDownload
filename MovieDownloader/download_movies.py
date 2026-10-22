@@ -4735,8 +4735,10 @@ def _resolve_final_resolution(resolution, final_path, label):
 # 同一套抽帧（片长 10%~90% 均匀抽 N 帧，避开片头片尾的演职员表），三路判定：
 #   ① 文字水印：整帧 OCR，相似文本归为一类。同一串字压在不同背景上会被识别成
 #      好几个变体（实测半透明网址水印 60 帧认出 8 种写法），不按相似度合并的话
-#      会被当成"内容一直在变"的字幕。某一类出现在 ≥ watermark_text_presence 的
-#      抽样帧里、且周边画面在变 → 文字水印。
+#      会被当成"内容一直在变"的字幕。某一类**在同一位置**出现在
+#      ≥ watermark_text_presence 的抽样帧里、且周边画面在变 → 文字水印。
+#      "同一位置"挡的是剧情里反复出现的招牌/店名：它们可能在三成镜头里都拍得到，
+#      但每个镜头位置都不同；水印则钉在固定位置。
 #   ② 图形水印（台标）：四角区域里逐帧边缘位置几乎不变（≥ watermark_logo_presence
 #      的帧都在）的紧凑图形、且周边画面在变 → 图形水印。纯图形 OCR 认不出，靠这一路。
 #   ③ 硬字幕：画面底部 30%、水平居中、字号合理的文字框，先剔除①里的常驻文字，
@@ -4756,6 +4758,7 @@ _HARDSUB_CENTER_RANGE = (0.30, 0.70)
 _HARDSUB_BOX_HEIGHT_RANGE = (0.02, 0.10)
 _TEXT_SIMILARITY = 0.75            # 两串文字相似度 ≥ 它视为同一句（吸收 OCR 抖动）
 _WATERMARK_MIN_TEXT_LEN = 4        # 太短的文字（"ok"、"no"）不拿来判水印
+_WATERMARK_POSITION_TOLERANCE = 0.05   # 框中心偏离常驻位置不超过画面的 5% 才算同一处
 _LOGO_CORNER = (0.25, 0.22)        # 台标搜索区：四角各占宽 25%、高 22%
 # 整行/整列的静止边缘占比超过它 = 宽银幕/画中框的黑边分界线，不是台标，先剔除。
 _LOGO_LINE_FRACTION = 0.4
@@ -4858,6 +4861,7 @@ def _cluster_texts(frame_boxes):
                 cluster_id = len(clusters)
                 clusters.append({"text": box["text"], "frames": set(), "boxes": []})
             box["cluster"] = cluster_id
+            box["frame"] = index
             clusters[cluster_id]["frames"].add(index)
             clusters[cluster_id]["boxes"].append(box)
     return clusters
@@ -4999,8 +5003,10 @@ def detect_overlays(path):
     #   几秒），无论是不是水印都从硬字幕统计里剔除；周边画面在变的才算文字水印。
     persistent = set()
     watermark_texts = []
-    # 常驻但周边画面不变的文字（固定机位的招牌等）：不判水印，记下来供门槛校准。
+    # 常驻但不判水印的文字，记下来供门槛校准：周边画面不变（固定机位的招牌等）、
+    # 位置不固定（不同镜头里反复拍到的招牌/店名）。
     static_texts = []
+    roaming_texts = []
     for cluster_id, cluster in enumerate(clusters):
         presence = len(cluster["frames"]) / sampled
         if presence < WATERMARK_TEXT_PRESENCE:
@@ -5008,14 +5014,30 @@ def detect_overlays(path):
         persistent.add(cluster_id)
         if len(cluster["text"]) < _WATERMARK_MIN_TEXT_LEN:
             continue
-        # 位置取各帧框的中位数：水印偶尔挪位，中位数仍落在它常驻的地方。
+        # 常驻位置取各帧框中心的中位数，只数落在它附近的那些帧。
+        centers = [((box["x0"] + box["x1"]) / 2, (box["y0"] + box["y1"]) / 2)
+                   for box in cluster["boxes"]]
+        anchor_x = float(np.median([cx for cx, _ in centers]))
+        anchor_y = float(np.median([cy for _, cy in centers]))
+        anchored = [
+            box for box, (cx, cy) in zip(cluster["boxes"], centers)
+            if abs(cx - anchor_x) <= _WATERMARK_POSITION_TOLERANCE
+            and abs(cy - anchor_y) <= _WATERMARK_POSITION_TOLERANCE
+        ]
+        anchored_presence = len({box["frame"] for box in anchored}) / sampled
+        if anchored_presence < WATERMARK_TEXT_PRESENCE:
+            roaming_texts.append({
+                "text": cluster["text"], "presence": round(presence, 3),
+                "anchored_presence": round(anchored_presence, 3),
+            })
+            continue
         dynamic, ring_std = _background_is_dynamic(
             std_map, mean_map,
-            *(float(np.median([box[key] for box in cluster["boxes"]]))
+            *(float(np.median([box[key] for box in anchored]))
               for key in ("x0", "y0", "x1", "y1")),
         )
         item = {
-            "text": cluster["text"], "presence": round(presence, 3),
+            "text": cluster["text"], "presence": round(anchored_presence, 3),
             "ring_std": round(ring_std, 1),
         }
         (watermark_texts if dynamic else static_texts).append(item)
@@ -5054,6 +5076,7 @@ def detect_overlays(path):
         "watermark_texts": watermark_texts,
         "watermark_logo": logo,
         "static_texts": static_texts,
+        "roaming_texts": roaming_texts,
         # 角落里最高的边缘常驻比例：没判出台标时也记下，门槛校准用。
         "logo_peak_presence": round(logo_peak, 3),
     }, (text_frames or plain_frames)
@@ -5860,8 +5883,10 @@ def _run_pipeline(run_volume=None):
     # 不开上传时成品本就留本地，无需处理。
     stranded_uploads = []
     if S3_ENABLED:
+        # 已判死的片（画质 / 硬字幕 / 水印）即使磁盘上有成品也绝不补传——例如
+        # record 模式下中断留下、之后改成 kill 才判死的片。
         stranded_uploads = find_stranded_uploads(
-            disk_ids - load_uploaded_ids(),
+            disk_ids - load_uploaded_ids() - dead_ids,
             {tid: entry.get("title") or "" for tid, entry in entry_by_id.items()},
         )
         # 之前留过上传失败台账的（success.jsonl 有 uploaded:false 或 pending 有记录），
