@@ -6439,3 +6439,136 @@ def test_stranded_upload_failure_keeps_ledgers(tmp_path, monkeypatch):
 
     assert [r["tmdbId"] for r in _read_jsonl(d.UPLOAD_PENDING_LOG)] == ["1"]
     assert [r["uploaded"] for r in _read_jsonl(d.SUCCESS_LOG)] == [False]
+
+
+# ---------------------------------------------------------------------------
+# 临门槛核对与处置（near-miss / reject，每台机器只管自己的那份）
+# ---------------------------------------------------------------------------
+
+class _FakeR2:
+    """最小化的 R2 客户端：按前缀列举、逐个删除，可模拟删除失败。"""
+
+    def __init__(self, objects, fail_delete=False):
+        self.objects = dict(objects)
+        self.fail_delete = fail_delete
+        self.deleted = []
+
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
+        hits = [{"Key": k, "Size": v} for k, v in sorted(self.objects.items()) if k.startswith(Prefix)]
+        return {"Contents": hits, "IsTruncated": False}
+
+    def delete_object(self, Bucket, Key):
+        if self.fail_delete:
+            raise RuntimeError("R2 503")
+        self.deleted.append(Key)
+        self.objects.pop(Key, None)
+
+
+def _setup_reject(tmp_path, monkeypatch, fail_delete=False):
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "S3_PREFIX", "test")
+    monkeypatch.setattr(d, "FOLDER_PREFIX", "movies")
+    monkeypatch.setattr(d, "is_main_running", lambda: False)
+    r2 = _FakeR2({
+        "test/movies/2010/66/66.mp4": 3_000_000_000,
+        "test/movies/2010/66/meta.json": 1_000,
+        "test/movies/2010/66/subs/en.vtt": 2_000,
+        "test/movies/2010/666/666.mp4": 2_000_000_000,   # 前缀相邻的另一部片，绝不能误删
+        "test/movies/2011/77/77.mp4": 4_000_000_000,
+    }, fail_delete=fail_delete)
+    monkeypatch.setattr(d, "get_s3_client", lambda: r2)
+    with open(d.SUCCESS_LOG, "w", encoding="utf-8") as fh:
+        for tid, year, size in (("66", 2010, 3_000_000_000), ("666", 2010, 2_000_000_000),
+                                ("77", 2011, 4_000_000_000)):
+            fh.write(json.dumps({"tmdbId": tid, "title": f"T{tid}", "year": year, "uploaded": True,
+                                 "s3_key": f"test/movies/{year}/{tid}/{tid}.mp4",
+                                 "file_size_bytes": size, "logged_at": int(time.time())}) + "\n")
+    near_dir = os.path.join(d.HARDSUB_EVIDENCE_DIR, "near_miss", "66")
+    os.makedirs(near_dir)
+    open(os.path.join(near_dir, "1.jpg"), "wb").close()
+    with open(d.HARDSUB_SCAN_LOG, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "66", "title": "T66", "verdict": "clean", "near_miss": ["hardsub"],
+                             "hit_ratio": 0.15, "aligned_ratio": 0.05, "distinct_texts": 9,
+                             "evidence_dir": near_dir}) + "\n")
+        fh.write(json.dumps({"tmdbId": "77", "title": "T77", "verdict": "clean", "near_miss": ["watermark"],
+                             "hit_ratio": 0.0, "evidence_dir": None,
+                             "static_texts": [{"text": "sometext"}]}) + "\n")
+        fh.write(json.dumps({"tmdbId": "666", "title": "T666", "verdict": "clean", "near_miss": []}) + "\n")
+    return r2
+
+
+def test_near_miss_report_lists_this_machines_pending_films(tmp_path, monkeypatch, capsys):
+    _setup_reject(tmp_path, monkeypatch)
+    d.report_near_miss()
+    out = capsys.readouterr().out
+    assert "66\tT66\t临门槛:hardsub\t已上传 3.00 GB" in out
+    assert "77\tT77\t临门槛:watermark" in out and "常驻文字 ['sometext']" in out
+    assert "666\t" not in out, "不临门槛的片不列"
+    assert "待核对 2 部，其中已上传 R2 的合计 7.00 GB" in out
+
+
+def test_reject_removes_film_from_r2_and_from_upload_totals(tmp_path, monkeypatch, capsys):
+    """🔴 处置 = kill 模式同口径：R2 上该片目录全删（相邻的 666 不动）、移出 success.jsonl
+    （storage 的已上传容量随之扣减）、记人工判死、截图挪到判死目录。"""
+    r2 = _setup_reject(tmp_path, monkeypatch)
+
+    done, freed = d.reject_films(["66"])
+
+    assert (done, freed) == (1, 3_000_003_000)
+    assert sorted(r2.deleted) == ["test/movies/2010/66/66.mp4", "test/movies/2010/66/meta.json",
+                                  "test/movies/2010/66/subs/en.vtt"]
+    assert "test/movies/2010/666/666.mp4" in r2.objects
+    assert sorted(r["tmdbId"] for r in _read_jsonl(d.SUCCESS_LOG)) == ["666", "77"]
+    dead = _read_jsonl(d.DOWNLOAD_DEAD_LOG)
+    assert [(r["tmdbId"], r["reason_class"], r["manual"]) for r in dead] == [("66", "hardsub", True)]
+    assert d.load_dead_ids() == {"66"}, "下次运行跳过"
+    assert d.dead_record_passes_now(dead[0]) is False, "--retry-dead 永不放回"
+    assert [(r["tmdbId"], r["stage"]) for r in _read_jsonl(d.FAILED_LOG)] == [("66", "hardsub")]
+    assert os.listdir(os.path.join(d.HARDSUB_EVIDENCE_DIR, "66")) == ["1.jpg"]
+    assert not os.path.exists(os.path.join(d.HARDSUB_EVIDENCE_DIR, "near_miss", "66"))
+
+    capsys.readouterr()
+    d.report_storage()
+    storage = capsys.readouterr().out
+    assert "已上传 R2: 2 部，6.00 GB" in storage, "容量统计必须扣掉处置的片"
+    assert "另有 1 部经临门槛核对确认带硬字幕/水印，已从 R2 移除，未计入" in storage
+    d.report_near_miss()
+    near = capsys.readouterr().out
+    assert "待核对 1 部" in near and "另有 1 部已处置" in near
+
+
+def test_reject_dry_run_changes_nothing(tmp_path, monkeypatch, capsys):
+    r2 = _setup_reject(tmp_path, monkeypatch)
+    before = open(d.SUCCESS_LOG, encoding="utf-8").read()
+    d.reject_films(["66"], dry_run=True)
+    assert r2.deleted == [] and open(d.SUCCESS_LOG, encoding="utf-8").read() == before
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == []
+    assert "将删除 test/movies/2010/66/66.mp4" in capsys.readouterr().out
+
+
+def test_reject_keeps_ledgers_when_r2_delete_fails(tmp_path, monkeypatch, capsys):
+    """R2 没删成就不能动台账：否则台账说已处置、R2 里还在，容量统计也对不上。"""
+    _setup_reject(tmp_path, monkeypatch, fail_delete=True)
+    before = open(d.SUCCESS_LOG, encoding="utf-8").read()
+    assert d.reject_films(["66"]) == (0, 0)
+    assert open(d.SUCCESS_LOG, encoding="utf-8").read() == before
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == []
+    assert "R2 删除失败，台账未改动" in capsys.readouterr().out
+
+
+def test_reject_needs_reason_for_films_outside_the_near_miss_list(tmp_path, monkeypatch, capsys):
+    r2 = _setup_reject(tmp_path, monkeypatch)
+    assert d.reject_films(["666"]) == (0, 0)
+    assert "需用 --reason" in capsys.readouterr().out and r2.deleted == []
+    assert d.reject_films(["666"], reason="watermark")[0] == 1
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG)[0]["reason_class"] == "watermark"
+
+
+def test_reject_skips_unknown_films_and_refuses_while_main_runs(tmp_path, monkeypatch, capsys):
+    r2 = _setup_reject(tmp_path, monkeypatch)
+    assert d.reject_films(["999"]) == (0, 0)
+    assert "success.jsonl 里没有这部片" in capsys.readouterr().out
+    monkeypatch.setattr(d, "is_main_running", lambda: True)
+    assert d.reject_films(["66"]) == (0, 0)
+    assert r2.deleted == [] and "主流程正在运行" in capsys.readouterr().out

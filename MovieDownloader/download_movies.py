@@ -7002,6 +7002,225 @@ def reupload_pending():
     return volume
 
 
+def _latest_by_id(path):
+    """读 jsonl，按 tmdbId 取最后一条（台账都是追加写，后写的为准）。"""
+    latest = {}
+    if not os.path.exists(path):
+        return latest
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tmdb_id = normalize_tmdb_id(record.get("tmdbId"))
+            if tmdb_id:
+                latest[tmdb_id] = record
+    return latest
+
+
+def _manually_rejected_ids():
+    """人工确认后由 reject 处置掉的片（判死账本里 manual=True 的记录）。"""
+    return {
+        tmdb_id for tmdb_id, record in _latest_by_id(DOWNLOAD_DEAD_LOG).items()
+        if record.get("manual")
+    }
+
+
+def report_near_miss():
+    """列出本机待人工核对的临门槛片（只读）。
+
+    临门槛 = 硬字幕/水印检测没判死、但离门槛不远的片：照常上传了，截图存在
+    {evidence_dir}/near_miss/{tmdbId}/。分机器跑时各机 ID 互不相交，每台机器只核对
+    自己的这份清单即可。人工看过截图、确认确实带硬字幕/水印的，用 reject 处置。
+    """
+    scans = {
+        tmdb_id: record for tmdb_id, record in _latest_by_id(HARDSUB_SCAN_LOG).items()
+        if record.get("near_miss")
+    }
+    if not scans:
+        print(f"{HARDSUB_SCAN_LOG} 里没有临门槛的片，无需核对。")
+        return
+    success = _latest_by_id(SUCCESS_LOG)
+    rejected = _manually_rejected_ids()
+
+    pending = []
+    done = 0
+    for tmdb_id, scan in scans.items():
+        if tmdb_id in rejected:
+            done += 1
+            continue
+        record = success.get(tmdb_id) or {}
+        pending.append((tmdb_id, scan, record))
+
+    print(f"===== 临门槛待核对（{HARDSUB_SCAN_LOG}）=====")
+    total_bytes = 0
+    for tmdb_id, scan, record in pending:
+        size = int(record.get("file_size_bytes") or 0)
+        total_bytes += size if record.get("uploaded") else 0
+        status = "已上传" if record.get("uploaded") else ("仅本地" if record else "无成品记录")
+        texts = [w["text"] for w in scan.get("watermark_texts") or []] + [
+            w["text"] for w in (scan.get("static_texts") or []) + (scan.get("roaming_texts") or [])
+        ]
+        print(
+            f"{tmdb_id}\t{(scan.get('title') or record.get('title') or '')[:30]}\t"
+            f"临门槛:{'/'.join(scan['near_miss'])}\t{status} {bytes_to_gb(size):.2f} GB\t"
+            f"字幕帧 {scan.get('hit_ratio')} 对齐 {scan.get('aligned_ratio')} "
+            f"文本 {scan.get('distinct_texts')}"
+            + (f"\t常驻文字 {texts[:3]}" if texts else "")
+            + f"\t截图 {scan.get('evidence_dir') or '（无）'}"
+        )
+    print(
+        f"待核对 {len(pending)} 部，其中已上传 R2 的合计 {bytes_to_gb(total_bytes):.2f} GB"
+        + (f"；另有 {done} 部已处置" if done else "")
+    )
+    if pending:
+        print("看过截图、确认带硬字幕/水印的，执行：")
+        print("  python download_movies.py reject <tmdbId> [<tmdbId> ...] [--dry-run]")
+
+
+def _list_r2_keys(client, prefix):
+    keys = []
+    token = None
+    while True:
+        kwargs = {"Bucket": S3_BUCKET, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        response = client.list_objects_v2(**kwargs)
+        keys += [(o["Key"], int(o.get("Size") or 0)) for o in response.get("Contents", [])]
+        if not response.get("IsTruncated"):
+            return keys
+        token = response.get("NextContinuationToken")
+
+
+def _remove_success_records(tmdb_id):
+    """从 SUCCESS_LOG 删掉该片的全部记录（log_lock 保护，原子替换）。
+
+    处置后它不再是"成品"：storage 统计的已上传容量随之扣掉，与 R2 实际一致。
+    """
+    tmdb_id = str(tmdb_id)
+    with log_lock:
+        if not os.path.exists(SUCCESS_LOG):
+            return
+        kept = []
+        with open(SUCCESS_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    if normalize_tmdb_id(json.loads(stripped).get("tmdbId")) == tmdb_id:
+                        continue
+                except json.JSONDecodeError:
+                    pass  # 无法解析的行原样保留
+                kept.append(stripped)
+        tmp_path = SUCCESS_LOG + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            for line in kept:
+                fh.write(line + "\n")
+        os.replace(tmp_path, SUCCESS_LOG)
+
+
+def reject_films(tmdb_ids, reason=None, dry_run=False):
+    """人工确认临门槛片确实带硬字幕/水印后，按 kill 模式的口径处置。
+
+    逐片：删 R2 上该片目录下全部对象（视频、meta.json、字幕）→ 确认删干净 →
+    从 SUCCESS_LOG 移除（storage 容量统计随之扣减）→ 记判死（manual=True，下次运行
+    跳过、--retry-dead 永不放回）→ 失败台账记一笔 → 清本地残留 → 截图从 near_miss/
+    挪到判死目录。R2 删除没确认成功之前**不动任何台账**：宁可留着重试，也不能台账说
+    删了而 R2 里还在。
+
+    reason 不给时取该片临门槛记录里的理由（两者都有时记 hardsub）；不在临门槛清单里
+    的片必须显式给 reason。返回 (处置部数, 释放的 R2 字节数)。
+    """
+    if reason is not None and reason not in ("hardsub", "watermark"):
+        raise SystemExit(f"--reason 只能是 hardsub 或 watermark，收到 {reason!r}")
+    if is_main_running():
+        print("检测到主流程正在运行；处置会改写 success.jsonl，请在主流程结束后再执行。")
+        return 0, 0
+    scans = _latest_by_id(HARDSUB_SCAN_LOG)
+    success = _latest_by_id(SUCCESS_LOG)
+    client = get_s3_client() if S3_ENABLED else None
+    done = 0
+    freed = 0
+    for raw_id in tmdb_ids:
+        tmdb_id = normalize_tmdb_id(raw_id)
+        record = success.get(tmdb_id)
+        scan = scans.get(tmdb_id) or {}
+        if not record:
+            print(f"[{tmdb_id}] success.jsonl 里没有这部片（未下载或已处置），跳过")
+            continue
+        near = scan.get("near_miss") or []
+        film_reason = reason or ("hardsub" if "hardsub" in near else (near[0] if near else None))
+        if film_reason is None:
+            print(f"[{tmdb_id}] 不在临门槛清单里，需用 --reason hardsub|watermark 指明理由，跳过")
+            continue
+        year = record.get("year")
+        prefix = asset_rel_path(tmdb_id, year) + "/"
+        if S3_PREFIX:
+            prefix = f"{S3_PREFIX}/{prefix}"
+        keys = _list_r2_keys(client, prefix) if client else []
+        size = sum(k[1] for k in keys)
+        print(f"[{tmdb_id}] {record.get('title') or ''}：理由 {film_reason}，"
+              f"R2 上 {len(keys)} 个对象 {bytes_to_gb(size):.2f} GB（{prefix}）")
+        if dry_run:
+            for key, _ in keys:
+                print(f"    将删除 {key}")
+            continue
+
+        try:
+            for key, _ in keys:
+                client.delete_object(Bucket=S3_BUCKET, Key=key)
+            leftover = _list_r2_keys(client, prefix) if client else []
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{tmdb_id}] ⚠️ R2 删除失败，台账未改动，可重新执行: {exc}")
+            continue
+        if leftover:
+            print(f"[{tmdb_id}] ⚠️ R2 上仍有 {len(leftover)} 个对象未删掉，台账未改动，可重新执行")
+            continue
+
+        _remove_success_records(tmdb_id)
+        remove_pending_record(tmdb_id)
+        write_log(DOWNLOAD_DEAD_LOG, {
+            "tmdbId": tmdb_id,
+            "title": record.get("title") or "",
+            "dead_at": int(time.time()),
+            "reason_class": film_reason,
+            "reasons": [film_reason],
+            "manual": True,
+            "error": f"临门槛人工确认{'硬字幕' if film_reason == 'hardsub' else '水印'}，已从 R2 移除",
+            "removed_bytes": size,
+            "evidence": {
+                key: scan.get(key)
+                for key in ("hit_ratio", "aligned_ratio", "distinct_texts", "examples",
+                            "watermark_texts", "evidence_dir")
+            },
+        })
+        write_log(FAILED_LOG, {
+            "tmdbId": tmdb_id,
+            "title": record.get("title") or "",
+            "error": f"临门槛人工确认{'硬字幕' if film_reason == 'hardsub' else '水印'}，已从 R2 移除并判死",
+            "stage": film_reason,
+        })
+        folder = movie_dir(tmdb_id, year)
+        if os.path.isdir(folder):
+            shutil.rmtree(folder, ignore_errors=True)
+        near_dir = os.path.join(HARDSUB_EVIDENCE_DIR, "near_miss", safe_file_token(tmdb_id))
+        dead_dir = os.path.join(HARDSUB_EVIDENCE_DIR, safe_file_token(tmdb_id))
+        if os.path.isdir(near_dir) and not os.path.exists(dead_dir):
+            os.replace(near_dir, dead_dir)
+        done += 1
+        freed += size
+        print(f"[{tmdb_id}] 已处置：R2 删除 {len(keys)} 个对象，已判死并移出成品统计")
+    if not dry_run:
+        print(f"处置完成 {done}/{len(tmdb_ids)} 部，释放 R2 {bytes_to_gb(freed):.2f} GB。"
+              f"`python download_movies.py storage` 的容量统计已同步扣减。")
+    return done, freed
+
+
 def report_storage(since_days=None):
     """汇总 success.jsonl，打印已上传成品的累计容量（十进制 GB）。
 
@@ -7083,6 +7302,9 @@ def report_storage(since_days=None):
         # 分母只用"有大小记录的已上传片"，否则平均值会被无大小的片拉低。
         print(f"平均每部: {bytes_to_gb(uploaded_bytes / uploaded_sized):.2f} GB")
     print("注: 采用十进制单位，1 GB = 1000³ 字节（与云存储计费口径一致）")
+    rejected = _manually_rejected_ids()
+    if rejected:
+        print(f"注: 另有 {len(rejected)} 部经临门槛核对确认带硬字幕/水印，已从 R2 移除，未计入")
     if unsized:
         print(
             f"⚠️ {unsized} 部没有 file_size_bytes 字段（本功能上线前下载的），"
@@ -7100,6 +7322,28 @@ def report_storage(since_days=None):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "reupload":
         reupload_pending()
+    elif len(sys.argv) > 1 and sys.argv[1] == "near-miss":
+        report_near_miss()
+    elif len(sys.argv) > 1 and sys.argv[1] == "reject":
+        # reject <tmdbId> [<tmdbId> ...] [--reason hardsub|watermark] [--dry-run]
+        _rest = sys.argv[2:]
+        _dry = "--dry-run" in _rest
+        _reason = None
+        if "--reason" in _rest:
+            _i = _rest.index("--reason")
+            if _i + 1 >= len(_rest):
+                print("错误: --reason 后面要跟 hardsub 或 watermark")
+                raise SystemExit(2)
+            _reason = _rest[_i + 1]
+            _rest = _rest[:_i] + _rest[_i + 2:]
+        _ids = [a for a in _rest if a != "--dry-run"]
+        _bad = [a for a in _ids if not a.isdigit()]
+        if not _ids or _bad:
+            print(f"错误: 需要给出 tmdbId（纯数字）{'，无法识别 ' + ' '.join(_bad) if _bad else ''}")
+            print("用法: python download_movies.py reject <tmdbId> [<tmdbId> ...] "
+                  "[--reason hardsub|watermark] [--dry-run]")
+            raise SystemExit(2)
+        reject_films(_ids, reason=_reason, dry_run=_dry)
     elif len(sys.argv) > 1 and sys.argv[1] == "storage":
         # 可选的天数过滤：`storage 1` = 只看最近 1 天落库的片。
         # 参数非法就直接拒绝，不静默退回全量——那会让人把全量数字当成单次运行量。
@@ -7127,6 +7371,8 @@ if __name__ == "__main__":
             print("用法: python download_movies.py [--retry-only] [--retry-dead]")
             print("      python download_movies.py reupload")
             print("      python download_movies.py storage [天数]")
+            print("      python download_movies.py near-miss")
+            print("      python download_movies.py reject <tmdbId> ... [--reason hardsub|watermark] [--dry-run]")
             raise SystemExit(2)
         if RETRY_ONLY_MODE:
             print(
