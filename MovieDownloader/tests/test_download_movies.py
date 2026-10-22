@@ -6527,8 +6527,11 @@ def test_reject_removes_film_from_r2_and_from_upload_totals(tmp_path, monkeypatc
     assert [(r["tmdbId"], r["stage"]) for r in _read_jsonl(d.FAILED_LOG)] == [("66", "hardsub")]
     assert os.listdir(os.path.join(d.HARDSUB_EVIDENCE_DIR, "66")) == ["1.jpg"]
     assert not os.path.exists(os.path.join(d.HARDSUB_EVIDENCE_DIR, "near_miss", "66"))
+    assert dead[0]["evidence"]["evidence_dir"] == os.path.join(d.HARDSUB_EVIDENCE_DIR, "66"), \
+        "判死记录要指向挪动后的截图目录，不能照抄扫描记录里 near_miss/ 的旧路径"
+    assert dead[0]["evidence"]["hit_ratio"] == 0.15
 
-    capsys.readouterr()
+    assert "容量统计已同步扣减" in capsys.readouterr().out
     d.report_storage()
     storage = capsys.readouterr().out
     assert "已上传 R2: 2 部，6.00 GB" in storage, "容量统计必须扣掉处置的片"
@@ -6554,21 +6557,41 @@ def test_reject_keeps_ledgers_when_r2_delete_fails(tmp_path, monkeypatch, capsys
     assert d.reject_films(["66"]) == (0, 0)
     assert open(d.SUCCESS_LOG, encoding="utf-8").read() == before
     assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == []
-    assert "R2 删除失败，台账未改动" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "R2 删除失败，台账未改动" in out
+    assert "未处置任何影片，容量统计不变" in out and "已同步扣减" not in out
 
 
 def test_reject_needs_reason_for_films_outside_the_near_miss_list(tmp_path, monkeypatch, capsys):
     r2 = _setup_reject(tmp_path, monkeypatch)
     assert d.reject_films(["666"]) == (0, 0)
-    assert "需用 --reason" in capsys.readouterr().out and r2.deleted == []
+    out = capsys.readouterr().out
+    assert "需用 --reason" in out and r2.deleted == []
+    assert "已同步扣减" not in out, "一部都没处置时不能说容量已扣减"
     assert d.reject_films(["666"], reason="watermark")[0] == 1
-    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG)[0]["reason_class"] == "watermark"
+    dead = _read_jsonl(d.DOWNLOAD_DEAD_LOG)[0]
+    assert dead["reason_class"] == "watermark"
+    assert dead["evidence"]["evidence_dir"] is None, "没有截图就不记目录"
+
+
+def test_reject_records_where_the_screenshots_actually_are(tmp_path, monkeypatch):
+    """判死目录已被占用时截图留在 near_miss/ 不挪，记录就指向 near_miss/。"""
+    _setup_reject(tmp_path, monkeypatch)
+    os.makedirs(os.path.join(d.HARDSUB_EVIDENCE_DIR, "66"))
+    near_dir = os.path.join(d.HARDSUB_EVIDENCE_DIR, "near_miss", "66")
+
+    assert d.reject_films(["66"])[0] == 1
+
+    assert os.listdir(near_dir) == ["1.jpg"]
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG)[0]["evidence"]["evidence_dir"] == near_dir
 
 
 def test_reject_skips_unknown_films_and_refuses_while_main_runs(tmp_path, monkeypatch, capsys):
     r2 = _setup_reject(tmp_path, monkeypatch)
     assert d.reject_films(["999"]) == (0, 0)
-    assert "success.jsonl 里没有这部片" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "success.jsonl 里没有这部片" in out
+    assert "处置完成 0/1 部：未处置任何影片，容量统计不变" in out
     monkeypatch.setattr(d, "is_main_running", lambda: True)
     assert d.reject_films(["66"]) == (0, 0)
     assert r2.deleted == [] and "主流程正在运行" in capsys.readouterr().out

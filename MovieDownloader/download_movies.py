@@ -7182,6 +7182,14 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
             print(f"[{tmdb_id}] ⚠️ R2 上仍有 {len(leftover)} 个对象未删掉，台账未改动，可重新执行")
             continue
 
+        # 截图先挪到判死目录，判死记录里记挪动后的实际位置——扫描记录里的
+        # evidence_dir 还是 near_miss/ 下的旧路径，照抄会指向一个已不存在的目录。
+        near_dir = os.path.join(HARDSUB_EVIDENCE_DIR, "near_miss", safe_file_token(tmdb_id))
+        dead_dir = os.path.join(HARDSUB_EVIDENCE_DIR, safe_file_token(tmdb_id))
+        if os.path.isdir(near_dir) and not os.path.exists(dead_dir):
+            os.replace(near_dir, dead_dir)
+        evidence_dir = next((p for p in (near_dir, dead_dir) if os.path.isdir(p)), None)
+
         _remove_success_records(tmdb_id)
         remove_pending_record(tmdb_id)
         write_log(DOWNLOAD_DEAD_LOG, {
@@ -7194,9 +7202,10 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
             "error": f"临门槛人工确认{'硬字幕' if film_reason == 'hardsub' else '水印'}，已从 R2 移除",
             "removed_bytes": size,
             "evidence": {
-                key: scan.get(key)
-                for key in ("hit_ratio", "aligned_ratio", "distinct_texts", "examples",
-                            "watermark_texts", "evidence_dir")
+                **{key: scan.get(key)
+                   for key in ("hit_ratio", "aligned_ratio", "distinct_texts", "examples",
+                               "watermark_texts")},
+                "evidence_dir": evidence_dir,
             },
         })
         write_log(FAILED_LOG, {
@@ -7208,16 +7217,14 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
         folder = movie_dir(tmdb_id, year)
         if os.path.isdir(folder):
             shutil.rmtree(folder, ignore_errors=True)
-        near_dir = os.path.join(HARDSUB_EVIDENCE_DIR, "near_miss", safe_file_token(tmdb_id))
-        dead_dir = os.path.join(HARDSUB_EVIDENCE_DIR, safe_file_token(tmdb_id))
-        if os.path.isdir(near_dir) and not os.path.exists(dead_dir):
-            os.replace(near_dir, dead_dir)
         done += 1
         freed += size
         print(f"[{tmdb_id}] 已处置：R2 删除 {len(keys)} 个对象，已判死并移出成品统计")
-    if not dry_run:
+    if not dry_run and done:
         print(f"处置完成 {done}/{len(tmdb_ids)} 部，释放 R2 {bytes_to_gb(freed):.2f} GB。"
               f"`python download_movies.py storage` 的容量统计已同步扣减。")
+    elif not dry_run:
+        print(f"处置完成 0/{len(tmdb_ids)} 部：未处置任何影片，容量统计不变。")
     return done, freed
 
 
