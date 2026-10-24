@@ -721,18 +721,22 @@ def test_is_stale_entry_uses_stricter_host_threshold(monkeypatch):
     assert not d.is_stale_entry(backup, now)
 
 
-def test_startup_precheck_leaves_capped_host_entries_to_the_gate(monkeypatch):
-    """pipeline 模式的启动预检不投 paleoak 片：它们由闸门在派发时重取。"""
+@pytest.mark.parametrize("general_refetch,expected", [(False, ["f1"]), (True, [])])
+def test_startup_precheck_leaves_entries_the_gate_will_judge(monkeypatch, general_refetch, expected):
+    """pipeline 模式的启动预检不投 paleoak 片；general_lane 管得到的普通片也不投——
+    它们都由闸门在派发那一刻按实际年龄重取。"""
     r = Refetcher()
     monkeypatch.setattr(d, "async_refetch_hook", r)
     monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
     monkeypatch.setattr(d, "STALE_LINK_SECONDS", 43200)
+    monkeypatch.setattr(d, "GENERAL_LANE_CFG", d._parse_general_lane(
+        {"refetch_after_minutes": {"vidlink": 720}} if general_refetch else None))
     old_fast = fast("f1")
     old_fast["fetched_at"] = int(time.time()) - 13 * 3600
     old_pal = pal("p1")
     old_pal["fetched_at"] = int(time.time()) - 13 * 3600
-    assert d.dispatch_stale_entries_async([old_pal, old_fast], {}) == 1
-    assert r.dispatched == ["f1"]
+    assert d.dispatch_stale_entries_async([old_pal, old_fast], {}) == len(expected)
+    assert r.dispatched == expected
 
 
 def test_parse_host_limits_zero_cap_disables_whole_host():
@@ -759,10 +763,15 @@ def test_shipped_config_values():
     assert shipped["playlist_500_expired_after_seconds"] == 9000
     assert d._CFG["max_workers"] == 50
     assert d._CFG["download_queue_depth"] == 51
-    assert d._parse_general_slots(d._CFG.get("general_slots")) == 10
+    general = d._parse_general_lane(d._CFG.get("general_lane"))
+    assert general["slots"] == 10 and general["max_deferred"] == 1000
+    assert general["refetch_after_seconds"] == {"vidup": 7200, "videasy": 10800, "vidlink": 43200}
+    assert general["signed_link_max_age_seconds"] == {"bcdn4.hakunaymatata.com": 86400}
+    assert general["signed_link_margin_seconds"] == 3600 and general["jit_refetch_max"] == 2
     assert d._parse_demote_patterns(d._CFG.get("demote_nodes")) == ["moon.zenoak.top/r2/"]
     # 槽位合计不超过线程数：两条通道才真正互不占用。
-    assert shipped["max_concurrent"] + 10 <= d._CFG["max_workers"] < d._CFG["download_queue_depth"]
+    assert (shipped["max_concurrent"] + general["slots"]
+            <= d._CFG["max_workers"] < d._CFG["download_queue_depth"])
 
 
 # ------------------------------------------------------------ 播放列表 500
@@ -938,7 +947,7 @@ def _streaming_env(tmp_path, monkeypatch, items, workers=8, depth=16):
     monkeypatch.setattr(d, "DOWNLOAD_QUEUE_DEPTH", depth)
     monkeypatch.setattr(d, "HOST_LIMITS", _limits(max_concurrent=3, max_deferred=1000))
     # 本组用例只验 paleoak 上限；普通槽位不限（分通道的端到端见 test_download_lanes.py）。
-    monkeypatch.setattr(d, "GENERAL_SLOTS", None)
+    monkeypatch.setattr(d, "GENERAL_LANE_CFG", d._parse_general_lane(None))
 
     source = Src(items, closed=False)
     # 模拟取流线程：开头先给全部片，随后收工。
@@ -1098,6 +1107,7 @@ def test_waiting_film_with_lower_verdict_does_not_burn_refetch_budget():
     drain(gate)
     assert r.dispatched == ["p3"]           # 为评估换一次新链接（额度还能留一次给派发）
     fresh = pal("p3", provider="vidup", mp4=True)
+    fresh["urls"][0]["url"] += "?token=new"  # 真的换了新链接（换回原样的不再为它重取）
     fresh["fetched_at"] = clock.t
     src.items.append(fresh)
     drain(gate)                             # 回到原位，投评估

@@ -347,7 +347,7 @@ download_movies:
   #
   # 机制（按「第一个节点」分通道；第一个节点按 demote_nodes 降级后的顺序算）：
   #   - 第一个节点在该主机的片走它的**专用槽位**（max_concurrent 部），其余片走
-  #     普通槽位（general_slots 部）。两条通道各自排队、互不外借、互不堵塞。
+  #     普通槽位（general_lane.slots 部）。两条通道各自排队、互不外借、互不堵塞。
   #   - 节点循环中途切到该主机的普通片占的是普通槽位，不占这里的名额。
   #   - 排队的片在本轮内一定会被下完：来源取空后，只要还有排队就继续等。
   #   - 中断时排队不落盘也不丢片：它们本就在 results.jsonl 里，下次是存量。
@@ -542,20 +542,39 @@ download_movies:
   #   多出的 4 个槽也缓解了固定上限压着它们排队的问题。
   #   代价：带宽真跑满时单部耗时约 +25%（P90 大文件 ~28 → ~35 分钟）。
   #
-  # 🔴 2026-10-24 再由 20 调到 50 = sun.paleoak.top 专用 40 + 普通 10（general_slots）：
+  # 🔴 2026-10-24 再由 20 调到 50 = sun.paleoak.top 专用 40 + 普通 10（general_lane.slots）：
   #   paleoak 单连接只有 ~1.1 Mbps，且与我们开多少连接无关（空闲的 23 和 190 连接
   #   的 06 实测同速）——是源站整体过载，多开连接 paleoak 总量就成比例上去。
   #   上限 6 时 paleoak 片每小时只能下完 30~40 部、需求却有 ~137 部，排队越积越长。
   #   专用槽位互不外借：paleoak 没片也不给普通片用，反之亦然（见 host_limits）。
-  #   ⚠️ 必须 ≥ 专用合计 + general_slots，否则多出的片会在线程池里排队，两条通道
+  #   ⚠️ 必须 ≥ 专用合计 + general_lane.slots，否则多出的片会在线程池里排队，两条通道
   #   不再互不占用（启动时会告警并压低专用槽位）。
   max_workers: 50          # 下载线程数 = 各专用槽位之和 + 普通槽位
-  # 普通片（第一个节点不在 host_limits 主机上）的专用槽位，满了就在闸门里排队，
-  # 不占 paleoak 的槽位。只在 host_limits 生效时起作用；0 / 不配 = 不限。
-  # ⚠️ 1 Gbps 的机器上 paleoak 放到 40 部会占掉 ~700 Mbps，普通片只剩 ~280 Mbps：
-  # 普通通道可能成为瓶颈，盯状态行里「普通槽位 … 最久 N 分钟」，排到小时级就该
-  # 调整分配（如 32/18）。
-  general_slots: 10
+  # 普通片（第一个节点不在 host_limits 主机上）的通道。只在 host_limits 生效时起作用；
+  # 整段不配 = 槽位不限、不做派发前重取（分通道之前的行为）。
+  general_lane:
+    # 专用槽位：满了就在闸门里排队，不占 paleoak 的槽位。0 / 不配 = 不限。
+    # ⚠️ 1 Gbps 的机器上 paleoak 放到 40 部会占掉 ~700 Mbps，普通片只剩 ~280 Mbps：
+    # 普通通道可能成为瓶颈，盯状态行里「普通槽位 … 最久 N 分钟」。
+    slots: 10
+    # 排队告警线（只告警、不阻塞，与 host_limits 的 max_deferred 同义）。
+    max_deferred: 1000
+    # 派发前重取（2026-10-24）：普通通道排队的片，派发那一刻第一个节点太旧就先换新
+    # 链接（新链接回来排回原位）。只管下面明确列出的：
+    #   refetch_after_minutes：按 fetched_at 算链接年龄的阈值（按 provider）。
+    #     vidup / videasy 沿用它们在 paleoak 上的实测（~175 / ~240 分钟过期，阈值
+    #     留 ~60 分钟余量）——zenoak /vd/ 的有效期没单独测过，按同一家 token 的保守值；
+    #     vidlink 沿用 stale_after_seconds 的 12 小时。
+    #   signed_link_max_age_hours：url 里 t= 是签名时刻、到点必过期的主机。
+    #     bcdn4.hakunaymatata.com 10-24 23 号机实测：签名 < 24 小时 24/24 成功、
+    #     ≥ 24 小时 394/394 返回 403；bcdn 不卡有效期（48 小时的也能下），不列。
+    #     提前 signed_link_margin_minutes 就换，给下载本身留时间。
+    # ⚠️ vidlink 按片缓存：同一部片重取多半换回原样的旧链接（实测 371/394）。换回
+    # 同一条链接时本次运行不再为它重取，照常派出去试——不会反复空烧取流。
+    refetch_after_minutes: {vidup: 120, videasy: 180, vidlink: 720}
+    signed_link_max_age_hours: {bcdn4.hakunaymatata.com: 24}
+    signed_link_margin_minutes: 60
+    jit_refetch_max_per_movie: 2
   # 长期不可用的节点路径（「主机/路径」前缀）：派发和下载时排到节点列表最后，
   # 不删除（万一恢复，仍可作最后一试）。
   # zenoak /r2/：19 号机 1528 次、23 号机 349 次请求全部 502，从未成功；它常排在

@@ -44,4 +44,9 @@ def _isolate_hardsub_check(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "OVERLAY_NODE_REJECT_LOG",
                         str(tmp_path / "overlay_node_rejects.jsonl"))
     monkeypatch.setattr(d, "_overlay_node_rejects", None)
+    # 普通通道的派发前重取默认关掉（槽位数照 config）：它会让启动预检让出普通片、
+    # 让闸门在派发时去重取，改变大量与它无关的用例的前提。需要它的用例自行配置。
+    monkeypatch.setattr(d, "GENERAL_LANE_CFG", dict(
+        d.GENERAL_LANE_CFG, refetch_after_seconds={}, signed_link_max_age_seconds={},
+    ))
     yield

@@ -321,12 +321,46 @@ def _parse_ramp(raw, cap):
 
 
 def _parse_general_slots(raw):
-    """general_slots：普通片专用槽位数。≤ 0 或没配 = 不限（与分通道之前一致）。"""
+    """普通片专用槽位数。≤ 0 或没配 = 不限（与分通道之前一致）。"""
     try:
         slots = int(raw or 0)
     except (TypeError, ValueError):
         return None
     return slots if slots > 0 else None
+
+
+def _parse_general_lane(raw):
+    """general_lane：普通片（第一个节点不在 host_limits 主机上）通道的设置。
+
+    没配 = 槽位不限、不做派发前重取（分通道之前的行为）。派发前重取只看明确配了的：
+    refetch_after_minutes 里列出的 provider（按 fetched_at 算链接年龄），和
+    signed_link_max_age_hours 里列出的主机（按 url 里的签名时刻 t= 算）。
+    """
+    raw = raw or {}
+    ages = {}
+    for provider, minutes in (raw.get("refetch_after_minutes") or {}).items():
+        try:
+            if float(minutes) > 0:
+                ages[str(provider)] = float(minutes) * 60
+        except (TypeError, ValueError):
+            continue
+    signed = {}
+    for host, hours in (raw.get("signed_link_max_age_hours") or {}).items():
+        try:
+            if float(hours) > 0:
+                signed[str(host).strip().lower()] = float(hours) * 3600
+        except (TypeError, ValueError):
+            continue
+    return {
+        "slots": _parse_general_slots(raw.get("slots")),
+        "max_deferred": max(1, int(raw.get("max_deferred") or 1000)),
+        "refetch_after_seconds": ages,
+        "signed_link_max_age_seconds": signed,
+        "signed_link_margin_seconds": max(
+            0.0, float(raw.get("signed_link_margin_minutes", 60) or 0)
+        ) * 60,
+        "jit_refetch_max": max(0, int(raw.get("jit_refetch_max_per_movie", 2) or 0)),
+    }
 
 
 def _parse_demote_patterns(raw):
@@ -343,9 +377,10 @@ def _parse_demote_patterns(raw):
 # 按 CDN 主机的并发上限 + 让行队列（2026-10-24，见 config.yaml host_limits 与
 # HostCapGate）。空字典 = 功能整体关闭。
 HOST_LIMITS = _parse_host_limits(_CFG.get("host_limits"))
-# 普通片（第一个节点不在 host_limits 主机上）的专用槽位，与受限主机的专用槽位
-# 互不外借（2026-10-24）。只在 HOST_LIMITS 非空、闸门存在时生效。
-GENERAL_SLOTS = _parse_general_slots(_CFG.get("general_slots"))
+# 普通片（第一个节点不在 host_limits 主机上）的通道：专用槽位（与受限主机的专用
+# 槽位互不外借）、排队告警线、派发前重取（2026-10-24）。只在 HOST_LIMITS 非空、
+# 闸门存在时生效。
+GENERAL_LANE_CFG = _parse_general_lane(_CFG.get("general_lane"))
 # 长期不可用的节点路径：派发和下载时挪到节点列表最后（不删，仍作最后一试）。
 DEMOTE_NODE_PATTERNS = _parse_demote_patterns(_CFG.get("demote_nodes"))
 
@@ -2257,6 +2292,51 @@ def capped_refetch_policy(entry):
     return ages.get(nodes[0]["provider"], min(ages.values())), cfg["jit_refetch_max"]
 
 
+def _signed_at(url):
+    """直链 url 里的签名时刻（查询参数 t=，秒）；没有或解析不了返回 None。"""
+    match = re.search(r"[?&]t=(\d{9,11})(?:&|$)", str(url or ""))
+    return int(match.group(1)) if match else None
+
+
+def general_refetch_applies(entry, cfg):
+    """普通通道的派发前重取管不管这部片（第一个节点的 provider 或签名主机配了）。"""
+    nodes = _entry_nodes(entry)
+    if not nodes or cfg["jit_refetch_max"] <= 0:
+        return False
+    first = nodes[0]
+    return (
+        first["provider"] in cfg["refetch_after_seconds"]
+        or _host_of(first["url"]) in cfg["signed_link_max_age_seconds"]
+    )
+
+
+def general_stale_reason(entry, cfg, now):
+    """普通通道的片派发这一刻该不该先换新链接：该换返回说明文字，否则 None。
+
+    只看第一个节点（与受限主机一致：备用节点多半用不上，为它重取不值）：
+      - 签名主机（如 bcdn4.hakunaymatata.com）：url 里 t= 是签名时刻，过了
+        max_age 必 403（10-24 23 号机实测 24 小时，24/24 内成功、394/394 外 403）；
+        提前 margin 就换，给下载本身留时间。
+      - 其余按 refetch_after_minutes 里该 provider 的阈值看 fetched_at 年龄。
+    """
+    nodes = _entry_nodes(entry)
+    if not nodes:
+        return None
+    first = nodes[0]
+    max_age = cfg["signed_link_max_age_seconds"].get(_host_of(first["url"]))
+    signed_at = _signed_at(first["url"]) if max_age else None
+    if signed_at and now - signed_at >= max_age - cfg["signed_link_margin_seconds"]:
+        return (
+            f"签名已 {(now - signed_at) / 3600:.1f} 小时"
+            f"（该主机 {max_age / 3600:.0f} 小时过期）"
+        )
+    limit = cfg["refetch_after_seconds"].get(first["provider"])
+    age = node_link_age(entry, first, now) if limit else None
+    if age is not None and age > limit:
+        return f"链接已 {age / 60:.0f} 分钟（阈值 {limit / 60:.0f}）"
+    return None
+
+
 def is_stale_entry(entry, now=None):
     """该条目的直链是否已躺过 STALE_LINK_SECONDS（host_limits 主机按其更严的阈值）。
 
@@ -2342,9 +2422,10 @@ def dispatch_stale_entries_async(entries, refetch_counts):
 
     投递计入 refetch_counts（每片重取上限跨预检与轮次共用）。返回投递数。
 
-    带 host_limits 派发前重取策略的条目（sun.paleoak.top）**不在这里投**：
-    它们由 HostCapGate 在派发那一刻按实测有效期就地重取。启动时整批重取几千条
-    存量，大部分要排队几个小时才轮到下载，到时新链接又过期了。
+    带 host_limits 派发前重取策略的条目（sun.paleoak.top），以及普通通道
+    general_lane 管得到的条目，**不在这里投**：它们由 HostCapGate 在派发那一刻
+    按实际年龄就地重取。启动时整批重取几千条存量，大部分要排队几个小时才轮到
+    下载，到时新链接又过期了。
     """
     hook = async_refetch_hook
     if (
@@ -2358,6 +2439,9 @@ def dispatch_stale_entries_async(entries, refetch_counts):
     for entry in entries:
         policy = capped_refetch_policy(entry)
         if policy is not None and policy[1] > 0:
+            continue
+        if HOST_LIMITS and general_refetch_applies(entry, GENERAL_LANE_CFG):
+            # 普通通道的派发前重取会在派发那一刻按实际年龄判（2026-10-24）。
             continue
         if not is_stale_entry(entry, now):
             continue
@@ -2387,6 +2471,11 @@ def dispatch_stale_entries_async(entries, refetch_counts):
         flush=True,
     )
     return len(to_dispatch)
+
+
+def _first_node_url(entry):
+    nodes = _entry_nodes(entry)
+    return nodes[0]["url"] if nodes else None
 
 
 def _mp4_first(entry):
@@ -2500,8 +2589,6 @@ def compare_fallback_quality(entry):
 
 # 普通片通道在闸门里的名字（与受限主机名并列作为通道键）。
 GENERAL_LANE = "_general"
-# 普通通道排队超过这个数就告警（只告警、不阻塞；与 host_limits 的 max_deferred 同义）。
-GENERAL_QUEUE_WARN = 1000
 
 
 class LaneRamp:
@@ -2660,7 +2747,7 @@ def fit_lane_caps(limits, general_slots, workers):
 
 
 class HostCapGate:
-    """分通道的派发闸门（config.yaml host_limits + general_slots，2026-10-24）。
+    """分通道的派发闸门（config.yaml host_limits + general_lane，2026-10-24）。
 
     包在每轮的来源外面，对主循环呈现同样的来源接口（poll → item / wait / done），
     主循环在下载 future 结束时调 release() 归还名额。
@@ -2668,18 +2755,21 @@ class HostCapGate:
     1. **专用通道**：第一个节点（按 demote_nodes 降级后的顺序）落在受限主机的片
        走该主机的通道，其余走普通通道。每条通道有自己的在途上限和排队，互不外借：
        受限主机通道空着，普通片也不多占；普通通道满了，后面的受限主机片照样派。
-       受限主机的上限按 ramp 分档放量（LaneRamp）；general_slots 不配 = 普通
+       受限主机的上限按 ramp 分档放量（LaneRamp）；general_lane.slots 不配 = 普通
        通道不限（即分通道之前的行为）。排队按**第一次进闸门的时刻**先来先走：
        下载失败、重取回来的片排回原位。节点循环切到受限主机的普通片
        （_host_extra_active）只在状态行里显示，不占受限主机通道的名额——它占的是
        普通槽位，受限主机的总片数因此有上界（专用 + 普通槽位数）。
     2. **反压**：两条通道都满时不从来源取片。只要有一条通道有空位就继续取，
        取到另一条通道的片就放进它的排队——不会因为队首在等而堵住另一条通道。
-       排队没有硬上限（max_deferred / GENERAL_QUEUE_WARN 只是告警线）：片始终
+       排队没有硬上限（两条通道的 max_deferred 都只是告警线）：片始终
        留在本轮内，不阻塞、不丢。
-    3. **派发前重取**：受限主机的片在真正派发那一刻（不是进排队时）链接年龄超过
-       refetch_after_minutes，就先交给取流线程换新链接，新链接经首轮来源的重取
-       结果通道回到本闸门再派发。新结果缺了某家 provider 时把旧节点补回原位
+    3. **派发前重取**（两条通道都做）：在真正派发那一刻（不是进排队时）第一个
+       节点的链接太旧——受限主机按 host_limits.refetch_after_minutes，普通片按
+       general_lane（provider 阈值或签名主机的 t= 签名年龄，见 general_stale_reason）
+       ——就先交给取流线程换新链接，新链接经首轮来源的重取结果通道回到本闸门、
+       排回原位再派发。换回的还是同一条链接（vidlink 按片缓存）时本次运行不再为
+       它重取，照常派出去试。新结果缺了某家 provider 时把旧节点补回原位
        （_merge_missing_providers），并记一次「下次派发跳过年龄检查」——补回的
        旧节点年龄就是旧链接的年龄，再查只会立刻又重取、换回同样残缺的结果
        （2026-10-24 线上：499580 在 120/122/124 分钟连重 3 次把额度烧光）。
@@ -2700,7 +2790,7 @@ class HostCapGate:
     STATUS_INTERVAL_SECONDS = 600
 
     def __init__(self, limits, refetcher=None, extra_active=None, clock=None,
-                 probe_submit=None, general_slots=None, segment_stats=None):
+                 probe_submit=None, general=None, segment_stats=None):
         self._limits = limits
         # 判断「重取是否还有下文」要靠 is_pending；没有它就无法安全地等结果。
         self._refetcher = refetcher if hasattr(refetcher, "is_pending") else None
@@ -2711,7 +2801,8 @@ class HostCapGate:
         self._probe_executor = None
         self._source = None
         self._jit_enabled = False
-        self._general_slots = general_slots
+        # 普通通道设置（_parse_general_lane 的结果）；None = 不限槽位、不做派发前重取。
+        self._general = general or _parse_general_lane(None)
         self._ramps = {
             host: LaneRamp(host, cfg["ramp"], self._clock, segment_stats)
             for host, cfg in limits.items() if cfg.get("ramp")
@@ -2729,6 +2820,8 @@ class HostCapGate:
         self._jit_counts = {}         # tmdbId -> 本次运行已派发前重取次数
         # 下次派发不再查年龄、沿用手上链接的 tmdbId（重取无果 / 补回过旧节点）。只生效一次。
         self._skip_jit = set()
+        # 重取换回的还是同一条链接的 tmdbId：本次运行不再为它派发前重取。
+        self._no_jit = set()
         self._budget_out = set()      # 派发前重取额度已用尽的 tmdbId（只为按片计数）
         self._demoted = set()         # 节点被 demote_nodes 降级过的 tmdbId（只为按片计数）
         self._fallback_probes = {}    # tmdbId -> 进行中的画质评估 Future
@@ -2738,7 +2831,7 @@ class HostCapGate:
         self.stats = {
             "deferred": 0, "general_deferred": 0, "mp4_fallback": 0, "fallback_lower": 0,
             "jit_refetch": 0, "jit_partial": 0, "jit_no_result": 0, "jit_budget_out": 0,
-            "demoted": 0,
+            "general_jit_refetch": 0, "jit_same_link": 0, "demoted": 0,
         }
 
     # ---- 主循环接口 ----
@@ -2751,9 +2844,9 @@ class HostCapGate:
         )
 
     def cap(self, lane):
-        """通道此刻的在途上限；None 表示不限（普通通道没配 general_slots）。"""
+        """通道此刻的在途上限；None 表示不限（普通通道没配 slots）。"""
         if lane == GENERAL_LANE:
-            return self._general_slots
+            return self._general["slots"]
         ramp = self._ramps.get(lane)
         return ramp.cap if ramp is not None else self._limits[lane]["max_concurrent"]
 
@@ -2831,7 +2924,8 @@ class HostCapGate:
             f"[让行] 普通槽位：在途 {self.in_flight(GENERAL_LANE)}/{cap or '不限'}，"
             f"排队 {len(self._general_queue)} 部"
             f"（最久 {self._oldest_wait([self._general_queue], now):.0f} 分钟）；"
-            f"累计排队 {s['general_deferred']}，节点降级的片 {s['demoted']} 部",
+            f"累计排队 {s['general_deferred']}，派发前重取 {s['general_jit_refetch']}，"
+            f"节点降级的片 {s['demoted']} 部；重取换回同一条链接 {s['jit_same_link']} 部",
             flush=True,
         )
 
@@ -2965,12 +3059,7 @@ class HostCapGate:
 
     def _link_stale(self, entry, now):
         """第一个节点的链接是否已过派发前重取的年龄阈值。"""
-        policy = capped_refetch_policy(entry)
-        if policy is None:
-            return False
-        nodes = _entry_nodes(entry)
-        age = node_link_age(entry, nodes[0] if nodes else None, now)
-        return age is not None and age > policy[0]
+        return self._stale_reason(entry, now) is not None
 
     def _default_probe_submit(self, entry):
         if self._probe_executor is None:
@@ -2999,6 +3088,12 @@ class HostCapGate:
                 # 补回的旧节点年龄就是旧链接的年龄：下次派发（哪怕先排一阵队）不再
                 # 查年龄，免得立刻又重取、换回同样残缺的结果，几分钟内把额度烧光。
                 self._skip_jit.add(key)
+            elif _first_node_url(entry) == _first_node_url(old):
+                # 换回的还是同一条链接（vidlink 按片缓存：10-24 23 号机 394 条过期链接
+                # 重取 371 条原样返回、0 次换到新签名）：本次运行不再为它派发前重取，
+                # 照常派出去试。
+                self._no_jit.add(key)
+                self.stats["jit_same_link"] += 1
         host = capped_host_of(entry)
         lane = host or GENERAL_LANE
         self._queued_since.setdefault(key, now)
@@ -3017,7 +3112,7 @@ class HostCapGate:
     def _defer(self, entry, lane, key, now):
         if lane == GENERAL_LANE:
             queue = self._general_queue
-            size, warn_at = len(queue), GENERAL_QUEUE_WARN
+            size, warn_at = len(queue), self._general["max_deferred"]
         else:
             queues = self._queues[lane]
             has_mp4 = any(node["type"] == "mp4" for node in _entry_nodes(entry))
@@ -3041,8 +3136,8 @@ class HostCapGate:
                   flush=True)
 
     def _deliver(self, entry, host, key, now):
-        """派发前的最后一关：受限主机的片链接太旧就先送去重取（返回 None），否则占名额放行。"""
-        if host is not None and self._send_to_refetch(entry, key, now):
+        """派发前的最后一关：链接太旧就先送去重取（返回 None），否则占名额放行。"""
+        if self._send_to_refetch(entry, key, now):
             return None
         self._reserve(entry, host or GENERAL_LANE)
         self._first_deferred_at.pop(key, None)
@@ -3054,21 +3149,17 @@ class HostCapGate:
         reserve：至少还要给之后真正派发留几次额度（为 mp4 兜底评估重取时传 1）。
         年龄看第一个节点自己的（node_link_age）：补回的旧节点比条目时刻旧。
         """
-        if not self._jit_enabled:
+        if not self._jit_enabled or key in self._no_jit:
             return False
         if key in self._skip_jit:
             if reserve:
                 return False
             self._skip_jit.discard(key)
             return False
-        policy = capped_refetch_policy(entry)
-        if policy is None:
+        stale = self._stale_reason(entry, now)
+        if stale is None:
             return False
-        limit, jit_max = policy
-        nodes = _entry_nodes(entry)
-        age = node_link_age(entry, nodes[0] if nodes else None, now)
-        if age is None or age <= limit:
-            return False
+        reason, jit_max, lane = stale
         used = self._jit_counts.get(key, 0)
         if used >= jit_max - reserve:
             if not reserve and key not in self._budget_out:
@@ -3083,13 +3174,35 @@ class HostCapGate:
             return False
         self._jit_counts[key] = used + 1
         self._refetching[key] = entry
-        self.stats["jit_refetch"] += 1
+        self.stats["general_jit_refetch" if lane == GENERAL_LANE else "jit_refetch"] += 1
         print(
-            f"  [派发前重取] {key}: 链接已 {age / 60:.0f} 分钟"
-            f"（阈值 {limit / 60:.0f}），先换新链接（第 {used + 1}/{jit_max} 次）",
+            f"  [派发前重取] {key}: {reason}，先换新链接（第 {used + 1}/{jit_max} 次）",
             flush=True,
         )
         return True
+
+    def _stale_reason(self, entry, now):
+        """派发这一刻该不该先换新链接：(说明, 单片重取上限, 通道) 或 None。
+
+        受限主机的片按 host_limits.refetch_after_minutes 看第一个节点的年龄
+        （node_link_age：补回的旧节点按它自己的时刻）；普通片按 general_lane
+        （general_stale_reason）。
+        """
+        host = capped_host_of(entry)
+        if host is None:
+            reason = general_stale_reason(entry, self._general, now)
+            if reason is None or self._general["jit_refetch_max"] <= 0:
+                return None
+            return reason, self._general["jit_refetch_max"], GENERAL_LANE
+        policy = capped_refetch_policy(entry)
+        if policy is None:
+            return None
+        limit, jit_max = policy
+        nodes = _entry_nodes(entry)
+        age = node_link_age(entry, nodes[0] if nodes else None, now)
+        if age is None or age <= limit:
+            return None
+        return f"链接已 {age / 60:.0f} 分钟（阈值 {limit / 60:.0f}）", jit_max, host
 
     def _reclaim_unanswered_refetches(self):
         """重取已有结论却没有新链接回来的片：取回原条目，沿用原链接。
@@ -7885,10 +7998,11 @@ def _run_pipeline(run_volume=None):
         # 派发前重取次数与 mp4 兜底计时在轮与轮之间连续。
         gate = None
         if HOST_LIMITS:
-            lane_limits = fit_lane_caps(HOST_LIMITS, GENERAL_SLOTS, MAX_WORKERS)
+            general_slots = GENERAL_LANE_CFG["slots"]
+            lane_limits = fit_lane_caps(HOST_LIMITS, general_slots, MAX_WORKERS)
             gate = HostCapGate(
                 lane_limits, refetcher=async_refetch_hook,
-                extra_active=host_extra_active, general_slots=GENERAL_SLOTS,
+                extra_active=host_extra_active, general=GENERAL_LANE_CFG,
             )
             for host, cfg in lane_limits.items():
                 ages = "、".join(
@@ -7915,16 +8029,27 @@ def _run_pipeline(run_volume=None):
                     flush=True,
                 )
             lane_total = sum(cfg["max_concurrent"] for cfg in lane_limits.values())
+            general_ages = "、".join(
+                f"{p} {sec / 60:.0f}" for p, sec in GENERAL_LANE_CFG["refetch_after_seconds"].items()
+            )
+            general_signed = "、".join(
+                f"{h} {sec / 3600:.0f} 小时" for h, sec in GENERAL_LANE_CFG["signed_link_max_age_seconds"].items()
+            )
             print(
-                f"[让行] 普通槽位 {GENERAL_SLOTS or '不限'} 部"
-                + (f"（与专用槽位互不外借，合计 {lane_total + GENERAL_SLOTS}"
-                   f" / 下载线程 {MAX_WORKERS}）" if GENERAL_SLOTS else ""),
+                f"[让行] 普通槽位 {general_slots or '不限'} 部"
+                + (f"（与专用槽位互不外借，合计 {lane_total + general_slots}"
+                   f" / 下载线程 {MAX_WORKERS}）" if general_slots else "")
+                + f"，派发前重取阈值（分钟）{general_ages or '未配置'}，签名过期 "
+                f"{general_signed or '未配置'}（提前 "
+                f"{GENERAL_LANE_CFG['signed_link_margin_seconds'] / 60:.0f} 分钟换），"
+                f"每片最多 {GENERAL_LANE_CFG['jit_refetch_max']} 次，"
+                f"排队告警线 {GENERAL_LANE_CFG['max_deferred']}",
                 flush=True,
             )
-            if GENERAL_SLOTS and DOWNLOAD_QUEUE_DEPTH < lane_total + GENERAL_SLOTS:
+            if general_slots and DOWNLOAD_QUEUE_DEPTH < lane_total + general_slots:
                 print(
                     f"⚠️ [槽位] download_queue_depth {DOWNLOAD_QUEUE_DEPTH} 小于槽位合计 "
-                    f"{lane_total + GENERAL_SLOTS}，槽位填不满（请调大）",
+                    f"{lane_total + general_slots}，槽位填不满（请调大）",
                     flush=True,
                 )
         if DEMOTE_NODE_PATTERNS:

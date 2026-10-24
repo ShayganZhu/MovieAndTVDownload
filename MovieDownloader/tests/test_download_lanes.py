@@ -22,7 +22,7 @@ import requests
 
 import download_movies as d
 from test_host_cap_gate import (
-    HAKUNA, PALEO, Clock, Probe, Src, _limits, _run_pipeline_bounded,
+    HAKUNA, NOW, PALEO, Clock, Probe, Refetcher, Src, _limits, _run_pipeline_bounded,
     _streaming_env, drain, fast, ids, pal,
 )
 
@@ -49,13 +49,15 @@ def _env(monkeypatch):
     monkeypatch.setattr(d, "DEMOTE_NODE_PATTERNS", [f"{R2}/r2/"])
 
 
-def lane_gate(src, general=2, cap=2, clock=None, probe=None, ramp=None, stats=None, extra=None):
+def lane_gate(src, general=2, cap=2, clock=None, probe=None, ramp=None, stats=None, extra=None,
+              refetcher=None, general_cfg=None):
     limits = _limits(max_concurrent=cap, max_deferred=100)
     if ramp is not None:
         limits[PALEO]["ramp"] = ramp
     gate = d.HostCapGate(
         limits, clock=clock or Clock(), probe_submit=probe or Probe(),
-        general_slots=general, segment_stats=stats,
+        general=d._parse_general_lane(dict({"slots": general}, **(general_cfg or {}))),
+        segment_stats=stats, refetcher=refetcher,
         extra_active=(lambda host: extra.get(host, 0)) if extra is not None else None,
     )
     gate.set_source(src)
@@ -170,7 +172,7 @@ def test_extra_occupancy_is_shown_but_does_not_block(capsys):
 
 
 def test_without_general_slots_general_lane_is_unlimited():
-    """general_slots 不配：普通片不限（分通道之前的行为）。"""
+    """general_lane.slots 不配：普通片不限（分通道之前的行为）。"""
     gate = lane_gate(Src([fast(f"f{i}") for i in range(30)]), general=None)
     assert len(drain(gate)[0]) == 30
 
@@ -575,7 +577,7 @@ def test_pipeline_lanes_never_exceed_caps_and_finish_every_film(tmp_path, monkey
     random.Random(3).shuffle(items)
     _streaming_env(tmp_path, monkeypatch, items, workers=6, depth=7)
     monkeypatch.setattr(d, "HOST_LIMITS", _limits(max_concurrent=4, max_deferred=1000))
-    monkeypatch.setattr(d, "GENERAL_SLOTS", 2)
+    monkeypatch.setattr(d, "GENERAL_LANE_CFG", d._parse_general_lane({"slots": 2}))
     lock = threading.Lock()
     active = {"pal": 0, "gen": 0}
     peak = {"pal": 0, "gen": 0, "total": 0}
@@ -599,3 +601,132 @@ def test_pipeline_lanes_never_exceed_caps_and_finish_every_film(tmp_path, monkey
 
     assert sorted(started) == sorted(ids(items))
     assert peak["pal"] == 4 and peak["gen"] == 2 and peak["total"] <= 6
+
+
+# ------------------------------------------------------------ 普通通道的派发前重取与告警线
+
+BCDN4 = "bcdn4.hakunaymatata.com"
+
+
+def vl(tid, host=BCDN4, signed_hours=None, fetched_min=0):
+    """vidlink mp4 片：signed_hours = 签名（url 里 t=）距今几小时，fetched_min = 取到距今几分钟。"""
+    query = f"?sign=s&t={NOW - int(signed_hours * 3600)}" if signed_hours is not None else ""
+    return {"tmdbId": tid, "fetched_at": NOW - fetched_min * 60,
+            "urls": [{"url": f"https://{host}/resource/{tid}.mp4{query}",
+                      "provider": "vidlink", "type": "mp4"}]}
+
+
+SHIPPED_GENERAL = {"refetch_after_minutes": {"vidup": 120, "videasy": 180, "vidlink": 720},
+                   "signed_link_max_age_hours": {BCDN4: 24}}
+
+
+def general_gate(src, r, general=2, **override):
+    return lane_gate(src, general=general, refetcher=r,
+                     general_cfg=dict(SHIPPED_GENERAL, **override))
+
+
+def test_general_film_with_old_link_is_refetched_before_dispatch():
+    """🔴 普通片派发那一刻链接太旧（vidlink 按取到时刻 12 小时）：先换新，新链接回来再派。"""
+    r = Refetcher()
+    src = Src([vl("f1", signed_hours=1, fetched_min=13 * 60), vl("f2", signed_hours=1)],
+              closed=False, refetcher=r)
+    gate = general_gate(src, r)
+    got, _ = drain(gate)
+    assert ids(got) == ["f2"] and r.dispatched == ["f1"]
+    assert gate.stats["general_jit_refetch"] == 1 and gate.stats["jit_refetch"] == 0
+    fresh = vl("f1", signed_hours=0)
+    fresh["urls"][0]["url"] += "&new=1"
+    src.items.append(fresh)
+    got, _ = drain(gate)
+    assert ids(got) == ["f1"] and got[0]["urls"][0]["url"].endswith("&new=1")
+
+
+def test_general_age_is_checked_when_dispatched_not_when_queued():
+    """在普通通道里排队排旧了的片，轮到派发时才查年龄、才去换。"""
+    r = Refetcher()
+    clock = Clock()
+    src = Src([vl("f1", signed_hours=1), vl("f2", signed_hours=1, fetched_min=11 * 60)],
+              closed=False, refetcher=r)
+    gate = lane_gate(src, general=1, clock=clock, refetcher=r, general_cfg=SHIPPED_GENERAL)
+    got, _ = drain(gate)
+    assert ids(got) == ["f1"] and r.dispatched == []          # f2 排队时只有 11 小时
+    clock.advance(120)
+    gate.release(got[0])
+    assert drain(gate) == ([], "wait")
+    assert r.dispatched == ["f2"]                             # 轮到它时 13 小时
+
+
+@pytest.mark.parametrize("host,signed_hours,refetched", [
+    (BCDN4, 23.5, True),      # 24 小时过期、提前 1 小时换
+    (BCDN4, 22.5, False),
+    (HAKUNA, 30, False),      # bcdn 不卡有效期，不在名单里
+])
+def test_signed_link_age_triggers_refetch(host, signed_hours, refetched):
+    r = Refetcher()
+    src = Src([vl("f1", host=host, signed_hours=signed_hours)], closed=False, refetcher=r)
+    got, _ = drain(general_gate(src, r))
+    assert (r.dispatched == ["f1"]) is refetched
+    assert (ids(got) == ["f1"]) is not refetched
+
+
+def test_same_link_coming_back_is_not_refetched_again():
+    """🔴 vidlink 换回原样的过期链接（实测 371/394）：本次运行不再为它重取，照常派出去试。"""
+    r = Refetcher()
+    stale = vl("f1", signed_hours=30)
+    src = Src([stale], closed=False, refetcher=r)
+    gate = general_gate(src, r)
+    assert drain(gate) == ([], "wait")
+    src.items.append(vl("f1", signed_hours=30))               # 重取结果：同一条链接
+    got, _ = drain(gate)
+    assert ids(got) == ["f1"]
+    assert gate.stats["jit_same_link"] == 1
+    gate.release(got[0])
+    src.items.append(vl("f1", signed_hours=30))               # 下载失败后又回来
+    assert ids(drain(gate)[0]) == ["f1"]
+    assert r.dispatched == ["f1"], "换回同一条链接后不能再空烧取流"
+
+
+def test_general_refetch_respects_its_budget():
+    r = Refetcher()
+    src = Src([vl("f1", signed_hours=30)], closed=False, refetcher=r)
+    gate = general_gate(src, r, jit_refetch_max_per_movie=1)
+    gate._jit_counts["f1"] = 1
+    got, _ = drain(gate)
+    assert ids(got) == ["f1"] and r.dispatched == []
+    assert gate.stats["jit_budget_out"] == 1
+
+
+def test_general_refetch_off_without_config():
+    """general_lane 没配重取阈值：普通片一律不做派发前重取（分通道之前的行为）。"""
+    r = Refetcher()
+    src = Src([vl("f1", signed_hours=30, fetched_min=24 * 60)], closed=False, refetcher=r)
+    got, _ = drain(lane_gate(src, refetcher=r))
+    assert ids(got) == ["f1"] and r.dispatched == []
+    assert not d.general_refetch_applies(vl("f1"), d._parse_general_lane(None))
+    assert d.general_refetch_applies(vl("f1"), d._parse_general_lane(SHIPPED_GENERAL))
+
+
+def test_general_lane_warn_line_is_configurable(capsys):
+    src = Src([fast(f"f{i}") for i in range(4)])
+    gate = lane_gate(src, general=1, general_cfg={"max_deferred": 2})
+    drain(gate)
+    assert "普通槽位排队已 3 部（告警线 2）" in capsys.readouterr().out
+
+
+def test_parse_general_lane_defaults_and_values():
+    default = d._parse_general_lane(None)
+    assert default == {
+        "slots": None, "max_deferred": 1000, "refetch_after_seconds": {},
+        "signed_link_max_age_seconds": {}, "signed_link_margin_seconds": 3600.0,
+        "jit_refetch_max": 2,
+    }
+    parsed = d._parse_general_lane({"slots": 12, "max_deferred": 500,
+                                     "refetch_after_minutes": {"vidup": 120, "bad": "x"},
+                                     "signed_link_max_age_hours": {"BCDN4.hakunaymatata.com": 24},
+                                     "signed_link_margin_minutes": 30})
+    assert parsed["slots"] == 12 and parsed["max_deferred"] == 500
+    assert parsed["refetch_after_seconds"] == {"vidup": 7200.0}
+    assert parsed["signed_link_max_age_seconds"] == {BCDN4: 86400.0}
+    assert parsed["signed_link_margin_seconds"] == 1800.0
+    assert d._signed_at(f"https://{BCDN4}/r/x.mp4?sign=a&t=1792698594") == 1792698594
+    assert d._signed_at(f"https://{BCDN4}/r/x.mp4?sign=a") is None
