@@ -56,12 +56,21 @@ def _scan(*reasons):
 
 # ------------------------------------------------------------ 版本标识
 
-def test_mp4_version_ignores_cdn_host_and_signature():
+def test_mp4_versions_of_one_provider_are_one_version():
+    """vidlink 的 1920 / 1280 / 640 几个 mp4 是同一片源：一个检出，其余不再下。"""
     a = node_of(mp4("1", host="bcdn4.hakunaymatata.com", sign="x"))
     b = node_of(mp4("1", host="bcdnxw.hakunaymatata.com", sign="y"))
-    other = node_of(mp4("1", name="b"))
-    assert d.overlay_node_key(a) == d.overlay_node_key(b)
-    assert d.overlay_node_key(a) != d.overlay_node_key(other)
+    other_file = node_of(mp4("1", name="b"))
+    other_provider = node_of({**mp4("1"), "provider": "othermp4"})
+    assert d.overlay_node_key(a) == d.overlay_node_key(b) == d.overlay_node_key(other_file)
+    assert d.overlay_node_key(a) != d.overlay_node_key(other_provider)
+
+
+def test_lower_resolution_variants_are_not_retried():
+    entry = {"tmdbId": "2", "urls": [mp4("2", "1080"), mp4("2", "720"), hls("2")]}
+    job = {"tmdbId": "2", "title": "T", "node": node_of(mp4("2", "1080")), "entry": entry}
+    remaining = d.plan_overlay_retry(job, _scan("hardsub"))
+    assert remaining["urls"] == [hls("2")]
 
 
 def test_hls_version_is_provider_plus_host():
@@ -392,3 +401,90 @@ def test_film_whose_every_version_was_rejected_earlier_is_killed_without_downloa
 
     assert downloaded == [] and uploads == []
     assert d.load_dead_ids() == {"71"}
+
+
+def test_retry_source_keeps_asking_inner_source_after_done():
+    """收尾那段时间里，下载失败投出的重取结果还会从原来源回来：不能记住 done 不再问。"""
+    src = Src(closed=True)
+    rs = d.NodeRetrySource(work_in_flight=lambda: True)
+    rs.set_source(src)
+    assert rs.poll() == ("wait", None)
+    src.items.append({"tmdbId": "8", "urls": [hls("8")]})
+    assert rs.poll()[1]["tmdbId"] == "8"
+
+
+def test_success_record_carries_the_delivered_version(sandbox, monkeypatch):
+    entry = {"tmdbId": "69", "urls": [mp4("69"), hls("69")]}
+    job = _job(sandbox, monkeypatch, "69", hls("69"), entry)
+    monkeypatch.setattr(d, "detect_overlays", lambda p: (_scan(), []))
+    _, ok, info = d.finalize_one_entry(job, set())
+    assert ok is True
+    assert (info["provider"], info["node_type"]) == ("videasy", "m3u8")
+    assert info["node_key"] == d.overlay_node_key(node_of(hls("69")))
+
+
+# ------------------------------------------------------------ 临门槛人工 reject：只判这个版本
+
+from test_download_movies import _setup_reject  # noqa: E402
+
+
+def _reject_env(tmp_path, monkeypatch, success_extra, results_rows):
+    r2 = _setup_reject(tmp_path, monkeypatch)
+    rows = _read_jsonl(d.SUCCESS_LOG)
+    with open(d.SUCCESS_LOG, "w", encoding="utf-8") as fh:
+        for row in rows:
+            if row["tmdbId"] == "66":
+                row.update(success_extra)
+            fh.write(json.dumps(row) + "\n")
+    results = tmp_path / "results.jsonl"
+    results.write_text("".join(json.dumps(r) + "\n" for r in results_rows), encoding="utf-8")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(results))
+    return r2
+
+
+def test_manual_reject_rejects_only_the_uploaded_version(tmp_path, monkeypatch, capsys):
+    """🔴 人工确认临门槛片带硬字幕：只判上传的那个版本，其它版本下次运行照常重下。"""
+    _reject_env(tmp_path, monkeypatch, {"url": mp4("66")["url"]}, [
+        {"tmdbId": "66", "urls": [mp4("66"), hls("66")]},
+    ])
+    done, freed = d.reject_films(["66"])
+
+    assert done == 1 and freed > 0
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == [], "不能整片判死"
+    assert "66" not in d.load_dead_ids()
+    rejects = _read_jsonl(d.OVERLAY_NODE_REJECT_LOG)
+    assert [(r["tmdbId"], r["node_key"], r["manual"], r["reason"]) for r in rejects] == [
+        ("66", "vidlink|mp4", True, "hardsub")]
+    assert [(r["tmdbId"], r["stage"]) for r in _read_jsonl(d.FAILED_LOG)] == [("66", "hardsub_retry")]
+    version_dir = os.path.join(d.HARDSUB_EVIDENCE_DIR, "66",
+                               d._overlay_version_label(node_of(mp4("66"))))
+    assert os.listdir(version_dir) == ["1.jpg"]
+    assert rejects[0]["evidence_dir"] == version_dir
+    entry = {"tmdbId": "66", "urls": [mp4("66"), hls("66")]}
+    assert d.strip_rejected_nodes(entry)[0]["urls"] == [hls("66")]
+    capsys.readouterr()
+    d.report_near_miss()
+    assert "另有 1 部已处置" in capsys.readouterr().out
+
+
+def test_manual_reject_uses_version_recorded_in_success_log(tmp_path, monkeypatch):
+    _reject_env(tmp_path, monkeypatch,
+                {"url": hls("66")["url"], "provider": "videasy", "node_type": "m3u8"}, [])
+    d.reject_films(["66"])
+    assert [r["node_key"] for r in _read_jsonl(d.OVERLAY_NODE_REJECT_LOG)] == [
+        d.overlay_node_key(node_of(hls("66")))]
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == []
+
+
+def test_film_rescanned_after_manual_reject_is_listed_again(tmp_path, monkeypatch, capsys):
+    """处置后换别的版本重下、新版本又临门槛：扫描记录比处置新，要重新列出来核对。"""
+    _reject_env(tmp_path, monkeypatch, {"url": mp4("66")["url"]}, [
+        {"tmdbId": "66", "urls": [mp4("66"), hls("66")]},
+    ])
+    d.reject_films(["66"])
+    with open(d.HARDSUB_SCAN_LOG, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "66", "title": "T66", "verdict": "clean",
+                             "near_miss": ["hardsub"], "checked_at": 4_000_000_000}) + "\n")
+    capsys.readouterr()
+    d.report_near_miss()
+    assert "66\tT66\t临门槛:hardsub" in capsys.readouterr().out

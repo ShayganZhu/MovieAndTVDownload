@@ -138,7 +138,7 @@ def test_dry_run_classifies_and_changes_nothing(prod, tmp_path):
     assert "107" not in rows
     assert rows["101"]["killed"] == [key(hls("101"))]          # 日志：第 2 个
     assert rows["101"]["remaining"] == [f"vidlink/mp4/{HAKUNA}"]
-    assert rows["102"]["killed"] == sorted([key(mp4("102", "a")), key(mp4("102", "b"))])
+    assert rows["102"]["killed"] == [key(mp4("102", "a"))] == [key(mp4("102", "b"))]
     assert rows["102"]["remaining"] == [f"videasy/m3u8/{PALEO}"]
     assert rows["108"]["remaining"] == ["vidup/m3u8/moon.zenoak.top"]
 
@@ -156,7 +156,7 @@ def test_apply_moves_dead_records_and_writes_node_rejects(prod):
     rejects = _read_jsonl(d.OVERLAY_NODE_REJECT_LOG)
     assert all(r["migrated"] for r in rejects)
     assert sorted((r["tmdbId"], r["inferred_from"]) for r in rejects) == [
-        ("101", "log"), ("102", "first_node"), ("102", "first_node"), ("108", "first_node")]
+        ("101", "log"), ("102", "first_node"), ("108", "first_node")]
     # 放回后的派发：已检出版本被滤掉，只下剩下的。
     entry = {"tmdbId": "102", "urls": [mp4("102", "a"), mp4("102", "b"), hls("102")]}
     assert d.strip_rejected_nodes(entry)[0]["urls"] == [hls("102")]
@@ -212,3 +212,20 @@ def test_log_index_tracks_each_film_separately(tmp_path):
     ]) + "\n", encoding="utf-8")
     assert d._overlay_kill_node_index_from_log(str(log)) == {"1": 3, "2": 1}
     assert d._overlay_kill_node_index_from_log(str(tmp_path / "missing.log")) == {}
+
+
+def test_data_dir_keeps_config_paths_that_live_outside_the_script_dir(tmp_path, monkeypatch):
+    """config 里写了脚本目录之外的绝对路径：它本来就指向真实文件，原样读。"""
+    base = str(tmp_path / "a" / "b" / "prod")
+    _build(base)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    os.replace(os.path.join(base, "results.jsonl"), str(elsewhere / "results.jsonl"))
+    monkeypatch.setattr(d, "_SCRIPT_DIR", tmp_path / "scratch")
+    for name in ("DOWNLOAD_DEAD_LOG", "FAILED_LOG", "OVERLAY_NODE_REJECT_LOG"):
+        monkeypatch.setattr(d, name, str(tmp_path / "scratch" / os.path.basename(getattr(d, name))))
+    monkeypatch.setattr(d, "INPUT_JSONL", str(elsewhere / "results.jsonl"))
+    report = str(tmp_path / "report.jsonl")
+    d.migrate_overlay_dead(data_dir=base, report_path=report)
+    rows = {r["tmdbId"]: r for r in _read_jsonl(report)}
+    assert rows["108"]["remaining"] == ["vidup/m3u8/moon.zenoak.top"], "读到了真实的 results.jsonl"

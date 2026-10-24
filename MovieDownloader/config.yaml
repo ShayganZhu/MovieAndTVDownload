@@ -621,8 +621,9 @@ download_movies:
     scan_log: "hardsub_scan.jsonl"     # 每部片的检测结论（比例统计与门槛校准用）
     evidence_dir: "hardsub_evidence"   # 判死片的证据截图（成品删除后人工复核用）
     # 检出后先换这部片还没试过的节点重下，所有节点都检出才整片判死（2026-10-24）。
-    # 「同一个版本」的认法：mp4 = provider + 文件路径（不含主机与签名，换 CDN 主机
-    # 仍算同一个文件）；HLS = provider + 主机。设 false 回到检出即整片判死。
+    # 「同一个版本」的认法：mp4 = 一家 provider 算一个版本（vidlink 给的 1920 / 1280 /
+    # 640 几个 mp4 是同一片源的不同分辨率，一个烧了字幕其余也烧着）；HLS = provider +
+    # 主机。设 false 回到检出即整片判死。
     retry_other_nodes: true
     node_reject_log: "overlay_node_rejects.jsonl"   # 节点级台账：已检出的版本，跨运行不再下
   # ---- playlist(master/media)解析阶段的请求重试 ----

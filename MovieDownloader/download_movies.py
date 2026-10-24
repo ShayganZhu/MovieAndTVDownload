@@ -2026,6 +2026,19 @@ def link_age_seconds(entry, now=None):
     return (now or time.time()) - fetched_at
 
 
+def node_link_age(entry, node=None, now=None):
+    """某个节点链接的年龄（秒）。
+
+    节点自带 fetched_at（派发前重取补回的旧节点）时以它为准，否则按条目的
+    fetched_at。条目里新旧节点混在一起时，只看条目时刻会把旧节点算年轻、
+    或把新节点算老。
+    """
+    fetched_at = (node or {}).get("fetched_at")
+    if fetched_at:
+        return (now or time.time()) - fetched_at
+    return link_age_seconds(entry, now)
+
+
 def _entry_nodes(entry):
     return [
         node for node in (
@@ -2230,7 +2243,8 @@ def _merge_missing_providers(new, old):
     合并按旧条目的 provider 次序（即 config providers 的次序）：每家有新节点用
     新的，没有就用旧的，新结果多出来的 provider 接在最后。这样节点尝试顺序与
     原来一致，不会因为缺了一家就让低画质节点排到最前。
-    补过旧节点时 fetched_at 取旧值：条目里有旧链接，年龄按最旧的算。
+    补回的旧节点各自带上原来的 fetched_at，条目的 fetched_at 仍是新结果的：
+    年龄按节点各算各的（node_link_age），旧节点不被算年轻，新节点也不被算老。
     """
     new_nodes = [(item, _normalize_url_entry(item)) for item in (new.get("urls") or [])]
     old_nodes = [(item, _normalize_url_entry(item)) for item in (old.get("urls") or [])]
@@ -2241,13 +2255,20 @@ def _merge_missing_providers(new, old):
     for _item, node in old_nodes + new_nodes:
         if node and node["provider"] not in order:
             order.append(node["provider"])
+    old_fetched_at = parse_int(old.get("fetched_at"))
     urls = []
     for provider in order:
-        source = new_nodes if provider in new_providers else old_nodes
-        urls += [item for item, node in source if node and node["provider"] == provider]
+        if provider in new_providers:
+            urls += [item for item, node in new_nodes if node and node["provider"] == provider]
+            continue
+        for _item, node in old_nodes:
+            if node and node["provider"] == provider:
+                stamped = dict(node)
+                if "fetched_at" not in stamped and old_fetched_at:
+                    stamped["fetched_at"] = old_fetched_at
+                urls.append(stamped)
     merged = dict(new)
     merged["urls"] = urls
-    merged["fetched_at"] = old.get("fetched_at")
     return merged, True
 
 
@@ -2350,7 +2371,6 @@ class HostCapGate:
         self._probe_submit = probe_submit or self._default_probe_submit
         self._probe_executor = None
         self._source = None
-        self._source_done = False
         self._jit_enabled = False
         # 让行队列放不下而暂扣的条目；非空时不再从来源取片（把反压还给取流侧）。
         self._held = deque()
@@ -2376,7 +2396,6 @@ class HostCapGate:
     def set_source(self, source):
         """换上本轮的来源（每轮开头调一次）。"""
         self._source = source
-        self._source_done = False
         self._jit_enabled = (
             self._refetcher is not None
             and bool(getattr(source, "delivers_refetch_results", False))
@@ -2402,13 +2421,13 @@ class HostCapGate:
             if self._held:
                 entry = self._held.popleft()
             else:
-                if self._source_done:
-                    break
+                # 来源报过 done 也照样再问：它下面的 NodeRetrySource 之后还可能收到
+                # 换节点重下的片（比如重取无果、本闸门刚派出去的那部检出了硬字幕）。
+                # 记住 done 不再问的话，那部片会滞留到下次运行。各来源的 done 都可重复问。
                 state, entry = self._source.poll()
                 if state == "wait":
                     return "wait", None
                 if state == "done":
-                    self._source_done = True
                     break
             result = self._admit(entry, now)
             if result is _GATE_BLOCKED:
@@ -2485,8 +2504,11 @@ class HostCapGate:
     def _pop_mp4_fallback(self, host, queues, now):
         """让行够久、且画质评估通过的带 mp4 片：挪 mp4 到最前派发。
 
-        要逐个看整条道而不只看队首：排在前面的可能是刚回来、计时才开始的老片，
-        也可能是评估结论为 mp4 更低、只能继续等的片。
+        逐个看整条道而不只看队首：排在前面的可能是刚回来、计时才开始的老片，
+        也可能是评估结论为 mp4 更低、只能继续等的片。每条先看已有结论，结论为
+        「更低」或「测不出、还没到重测时间」、或评估还在跑的，直接跳过——只是几次
+        字典查询，也**不为它们重取链接**：派发前重取的额度要留给真正派发的那一刻，
+        在等待中为评估反复重取会把额度耗光，轮到派发时只能带着过期链接出去。
         """
         after = self._limits[host]["mp4_fallback_after_seconds"]
         lane = queues["mp4"]
@@ -2496,25 +2518,39 @@ class HostCapGate:
             key = self._key(entry)
             if now - self._first_deferred_at.get(key, now) < after:
                 continue
-            # 先查链接年龄：链接过期了，评估读 HLS 播放列表也只会 401/500。
-            # 换回的新链接回到原排队位置，计时不变，下一次照样评估、兜底。
-            if self._send_to_refetch(entry, key, now):
+            verdict = self._settle_fallback_probe(key, now)
+            if verdict in ("lower", "wait") or key in self._fallback_probes:
+                continue
+            if verdict == "ok":
+                # 马上要派发：链接旧了照常换新（派发前重取本来的用途），新链接回到
+                # 原排队位置、计时不变，下一次直接兜底。
+                if self._send_to_refetch(entry, key, now):
+                    lane.remove(entry)
+                    continue
                 lane.remove(entry)
+                self._first_deferred_at.pop(key, None)
+                self.stats["mp4_fallback"] += 1
+                return _mp4_first(entry)
+            # 还没有结论：评估要读 HLS 播放列表，链接过期了只会 401/500。为评估重取
+            # 只在额度还能留一次给真正派发时才做；留不出就先不评估，照常等 HLS 名额。
+            if self._link_stale(entry, now):
+                if self._send_to_refetch(entry, key, now, reserve=1):
+                    lane.remove(entry)
                 continue
-            if self._fallback_verdict(entry, key, now) != "ok":
-                continue
-            lane.remove(entry)
-            self._first_deferred_at.pop(key, None)
-            self.stats["mp4_fallback"] += 1
-            return _mp4_first(entry)
+            if len(self._fallback_probes) < FALLBACK_PROBE_MAX_INFLIGHT:
+                try:
+                    self._fallback_probes[key] = self._probe_submit(entry)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"⚠️ mp4 兜底评估投递失败 {key}: {exc}", flush=True)
         return None
 
-    def _fallback_verdict(self, entry, key, now):
-        """取这部片的 mp4 兜底画质结论；还没有就在后台发起评估、本次返回 None。"""
+    def _settle_fallback_probe(self, key, now):
+        """收下已跑完的评估，返回这部片的兜底结论。
+
+        ok / lower：结论；wait：测不出、还没到重测时间；None：还没评估过或该重测了。
+        """
         probe = self._fallback_probes.get(key)
-        if probe is not None:
-            if not probe.done():
-                return None
+        if probe is not None and probe.done():
             del self._fallback_probes[key]
             try:
                 verdict, detail = probe.result()
@@ -2529,16 +2565,21 @@ class HostCapGate:
             }.get(verdict, f"测不出，{FALLBACK_PROBE_RETRY_SECONDS // 60} 分钟后再评估")
             print(f"  [mp4 兜底评估] {key}: {detail} → {outcome}", flush=True)
         record = self._fallback_verdicts.get(key)
-        if record is not None:
-            verdict, retry_at = record
-            if verdict != "unknown" or now < retry_at:
-                return verdict
-        if len(self._fallback_probes) < FALLBACK_PROBE_MAX_INFLIGHT:
-            try:
-                self._fallback_probes[key] = self._probe_submit(entry)
-            except Exception as exc:  # noqa: BLE001
-                print(f"⚠️ mp4 兜底评估投递失败 {key}: {exc}", flush=True)
-        return None
+        if record is None:
+            return None
+        verdict, retry_at = record
+        if verdict != "unknown":
+            return verdict
+        return "wait" if now < retry_at else None
+
+    def _link_stale(self, entry, now):
+        """第一个节点的链接是否已过派发前重取的年龄阈值。"""
+        policy = capped_refetch_policy(entry)
+        if policy is None:
+            return False
+        nodes = _entry_nodes(entry)
+        age = node_link_age(entry, nodes[0] if nodes else None, now)
+        return age is not None and age > policy[0]
 
     def _default_probe_submit(self, entry):
         if self._probe_executor is None:
@@ -2599,22 +2640,30 @@ class HostCapGate:
         self._first_deferred_at.pop(key, None)
         return entry
 
-    def _send_to_refetch(self, entry, key, now):
+    def _send_to_refetch(self, entry, key, now, reserve=0):
+        """链接太旧就送去重取，返回是否送了。
+
+        reserve：至少还要给之后真正派发留几次额度（为 mp4 兜底评估重取时传 1）。
+        年龄看第一个节点自己的（node_link_age）：补回的旧节点比条目时刻旧。
+        """
         if not self._jit_enabled:
             return False
         if key in self._skip_jit:
+            if reserve:
+                return False
             self._skip_jit.discard(key)
             return False
         policy = capped_refetch_policy(entry)
         if policy is None:
             return False
         limit, jit_max = policy
-        age = link_age_seconds(entry, now)
+        nodes = _entry_nodes(entry)
+        age = node_link_age(entry, nodes[0] if nodes else None, now)
         if age is None or age <= limit:
             return False
         used = self._jit_counts.get(key, 0)
-        if used >= jit_max:
-            if key not in self._budget_out:
+        if used >= jit_max - reserve:
+            if not reserve and key not in self._budget_out:
                 self._budget_out.add(key)
                 self.stats["jit_budget_out"] += 1
             return False
@@ -2681,7 +2730,6 @@ class NodeRetrySource:
         self._busy = work_in_flight or (lambda: False)
         self._on_all_rejected = on_all_rejected or (lambda entry: None)
         self._source = None
-        self._source_done = False
         self._requeue = deque()
         self.requeued = 0
         self.stripped = 0
@@ -2689,7 +2737,6 @@ class NodeRetrySource:
 
     def set_source(self, source):
         self._source = source
-        self._source_done = False
 
     @property
     def delivers_refetch_results(self):
@@ -2708,14 +2755,13 @@ class NodeRetrySource:
         while True:
             if self._requeue:
                 entry = self._requeue.popleft()
-            elif self._source_done:
-                # 还有下载 / 转封装在跑：其中检出的片可能马上要换节点重下，本轮先别收尾。
-                return ("wait", None) if self._busy() else ("done", None)
             else:
+                # 原来源报过 done 也每次再问（不记住）：收尾的这段时间里，下载失败投出
+                # 的重取结果还会从它那里回来（pipeline 首轮的 QueueEntrySource）。
                 state, entry = self._source.poll()
                 if state == "done":
-                    self._source_done = True
-                    continue
+                    # 还有下载 / 转封装在跑：其中检出的片可能马上要换节点重下，本轮先别收尾。
+                    return ("wait", None) if self._busy() else ("done", None)
                 if state != "item":
                     return state, entry
             entry, removed = strip_rejected_nodes(entry)
@@ -4242,7 +4288,7 @@ def _normalize_url_entry(item):
     headers = item.get("headers")
     if not isinstance(headers, dict):
         headers = {}
-    return {
+    node = {
         "url": url.strip(),
         "provider": str(item.get("provider") or "unknown"),
         "type": type_,
@@ -4250,6 +4296,12 @@ def _normalize_url_entry(item):
         "quality": _positive_or_none(item.get("quality")),
         "size": _positive_or_none(item.get("size")),
     }
+    # 节点自带的取流时刻：只有派发前重取补回的旧节点才有（见 _merge_missing_providers），
+    # 它比条目的 fetched_at 旧，判链接年龄时以它为准（见 node_link_age）。
+    fetched_at = parse_int(item.get("fetched_at"))
+    if fetched_at and fetched_at > 0:
+        node["fetched_at"] = fetched_at
+    return node
 
 
 def _mp4_request_headers(node_headers):
@@ -4927,7 +4979,7 @@ def process_one_entry(entry, processed_ids):
                 headers=node_headers,
             )
         except RuntimeError as exc:
-            expired = _playlist_500_as_expired(exc, url, link_age_seconds(entry))
+            expired = _playlist_500_as_expired(exc, url, node_link_age(entry, node))
             if expired is None:
                 raise
             raise expired from exc
@@ -5031,7 +5083,7 @@ def process_one_entry(entry, processed_ids):
                     )
                 except RuntimeError as exc:
                     expired = _playlist_500_as_expired(
-                        exc, playlist_url, link_age_seconds(entry)
+                        exc, playlist_url, node_link_age(entry, node)
                     )
                     if expired is None:
                         raise
@@ -6049,16 +6101,15 @@ def overlay_node_key(node):
     """硬字幕/水印按「版本」记账的节点标识。
 
     签名链接的令牌每次重取都会变，不能用整条链接认节点：
-      - mp4：provider + 文件路径（去掉查询串、不含主机）——hakuna 的
-        /resource/<hash>.mp4 稳定指向同一个文件，换 CDN 主机也一样；
+      - mp4：provider 一家算一个版本。vidlink 常给同一部片 3 个 mp4
+        （如 1920 / 1280 / 640 宽），是同一片源转出的不同分辨率——1080p 那个
+        烧了字幕，720p、360p 也烧着。按文件分开记的话，检出后会接着去下更低
+        分辨率的同一版本：要么白下，要么传上去一个更低清的。
       - HLS：provider + 主机——同一家同一主机视为同一个版本。
     """
-    url = node["url"]
     if node["type"] == "mp4":
-        rest = url.split("://", 1)[-1]
-        path = rest.split("/", 1)[1] if "/" in rest else ""
-        return f"{node['provider']}|mp4|/{path.split('?', 1)[0]}"
-    return f"{node['provider']}|m3u8|{_host_of(url)}"
+        return f"{node['provider']}|mp4"
+    return f"{node['provider']}|m3u8|{_host_of(node['url'])}"
 
 
 def _overlay_version_label(node):
@@ -6100,8 +6151,8 @@ def overlay_node_rejects(tmdb_id):
         return dict(_overlay_node_table().get(normalize_tmdb_id(tmdb_id), {}))
 
 
-def record_overlay_node_reject(tmdb_id, title, node, scan):
-    """记一个检出硬字幕/水印的版本（追加台账 + 更新内存）。"""
+def record_overlay_node_reject(tmdb_id, title, node, scan, **extra):
+    """记一个检出硬字幕/水印的版本（追加台账 + 更新内存）。extra 原样并入记录。"""
     reasons = scan.get("reasons") or []
     reason = "hardsub" if "hardsub" in reasons else "watermark"
     key = overlay_node_key(node)
@@ -6116,6 +6167,7 @@ def record_overlay_node_reject(tmdb_id, title, node, scan):
         "reasons": reasons,
         "summary": _overlay_summary(scan),
         "rejected_at": int(time.time()),
+        **extra,
     })
     with _overlay_node_lock:
         _overlay_node_table().setdefault(normalize_tmdb_id(tmdb_id), {})[key] = reason
@@ -6296,6 +6348,9 @@ def finalize_one_entry(conversion_job, processed_ids):
             # 决定 SubDL 的 type 参数——电影与剧集是两个独立编号空间。
             "title_type": (conversion_job.get("entry") or {}).get("title_type"),
             "url": conversion_job["url"],
+            # 下的是哪个版本：临门槛人工 reject 时只判这个版本、换别的版本重下。
+            **({"provider": node.get("provider"), "node_type": node.get("type"),
+                "node_key": overlay_node_key(node)} if node else {}),
             "final_path": final_path,
             # 成品字节数。必须在这里取——上传成功后本地文件就删了，事后再想
             # 统计总容量只能去 R2 查。取不到时记 None，不影响成片。
@@ -8004,12 +8059,64 @@ def _latest_by_id(path):
     return latest
 
 
+def _manual_reject_times():
+    """人工 reject 处置过的片 -> 最近一次处置时刻。
+
+    两种记录都算：老口径的整片判死（判死台账 manual=True），与 2026-10-24 起的
+    版本级记录（节点级台账 manual=True，片子会换别的版本重下）。
+    """
+    times = {}
+    for path, field in ((DOWNLOAD_DEAD_LOG, "dead_at"), (OVERLAY_NODE_REJECT_LOG, "rejected_at")):
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                tmdb_id = normalize_tmdb_id(record.get("tmdbId"))
+                if tmdb_id and record.get("manual"):
+                    at = parse_int(record.get(field)) or 1
+                    times[tmdb_id] = max(times.get(tmdb_id, 0), at)
+    return times
+
+
 def _manually_rejected_ids():
-    """人工确认后由 reject 处置掉的片（判死账本里 manual=True 的记录）。"""
-    return {
-        tmdb_id for tmdb_id, record in _latest_by_id(DOWNLOAD_DEAD_LOG).items()
-        if record.get("manual")
-    }
+    """人工确认后由 reject 处置过的片（整片判死或版本级，见 _manual_reject_times）。"""
+    return set(_manual_reject_times())
+
+
+def _uploaded_node(tmdb_id, record):
+    """成品是从哪个节点（版本）下的；找不到返回 None。
+
+    2026-10-24 起 success.jsonl 直接带 provider / node_type；更早的记录只有下载链接，
+    拿它回 results.jsonl 里找当时那条节点（取流结果与重取结果都写在那里）。
+    """
+    url = (record.get("url") or "").strip()
+    if not url:
+        return None
+    if record.get("provider") and record.get("node_type"):
+        return _normalize_url_entry(
+            {"url": url, "provider": record["provider"], "type": record["node_type"]}
+        )
+    if not os.path.exists(INPUT_JSONL):
+        return None
+    with open(INPUT_JSONL, encoding="utf-8") as fh:
+        for line in fh:
+            if url not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if normalize_tmdb_id(entry.get("tmdbId")) != tmdb_id:
+                continue
+            for item in entry.get("urls") or []:
+                node = _normalize_url_entry(item)
+                if node and node["url"] == url:
+                    return node
+    return None
 
 
 def report_near_miss():
@@ -8027,12 +8134,13 @@ def report_near_miss():
         print(f"{HARDSUB_SCAN_LOG} 里没有临门槛的片，无需核对。")
         return
     success = _latest_by_id(SUCCESS_LOG)
-    rejected = _manually_rejected_ids()
+    rejected = _manual_reject_times()
 
     pending = []
     done = 0
     for tmdb_id, scan in scans.items():
-        if tmdb_id in rejected:
+        # 处置之后换别的版本重下、又临门槛了的片，扫描记录比处置新：要重新列出来。
+        if tmdb_id in rejected and rejected[tmdb_id] >= (parse_int(scan.get("checked_at")) or 0):
             done += 1
             continue
         record = success.get(tmdb_id) or {}
@@ -8110,10 +8218,13 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
     """人工确认临门槛片确实带硬字幕/水印后，按 kill 模式的口径处置。
 
     逐片：删 R2 上该片目录下全部对象（视频、meta.json、字幕）→ 确认删干净 →
-    从 SUCCESS_LOG 移除（storage 容量统计随之扣减）→ 记判死（manual=True，下次运行
-    跳过、--retry-dead 永不放回）→ 失败台账记一笔 → 清本地残留 → 截图从 near_miss/
-    挪到判死目录。R2 删除没确认成功之前**不动任何台账**：宁可留着重试，也不能台账说
-    删了而 R2 里还在。
+    从 SUCCESS_LOG 移除（storage 容量统计随之扣减）→ **只判这个版本**：节点级台账记
+    一条（manual=True），下次运行这部片换别的版本重下，所有版本都检出才整片判死
+    （与自动检出同一口径，2026-10-24）→ 失败台账记一笔 → 清本地残留 → 截图从
+    near_miss/ 挪到判死目录下该版本的子目录。查不出成品是哪个版本（老记录没有下载
+    链接、results.jsonl 里也找不到）或关了 retry_other_nodes 时，退回整片判死
+    （manual=True，下次运行跳过、--retry-dead 永不放回）。
+    R2 删除没确认成功之前**不动任何台账**：宁可留着重试，也不能台账说删了而 R2 里还在。
 
     reason 不给时取该片临门槛记录里的理由（两者都有时记 hardsub）；不在临门槛清单里
     的片必须显式给 reason。返回 (处置部数, 释放的 R2 字节数)。
@@ -8164,16 +8275,44 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
             print(f"[{tmdb_id}] ⚠️ R2 上仍有 {len(leftover)} 个对象未删掉，台账未改动，可重新执行")
             continue
 
-        # 截图先挪到判死目录，判死记录里记挪动后的实际位置——扫描记录里的
-        # evidence_dir 还是 near_miss/ 下的旧路径，照抄会指向一个已不存在的目录。
+        node = _uploaded_node(tmdb_id, record) if OVERLAY_RETRY_OTHER_NODES else None
+        label = "硬字幕" if film_reason == "hardsub" else "水印"
+
+        # 截图先挪到判死目录（版本级处置挪到该版本的子目录），记录里记挪动后的实际
+        # 位置——扫描记录里的 evidence_dir 还是 near_miss/ 下的旧路径，照抄会指向一个
+        # 已不存在的目录。
         near_dir = os.path.join(HARDSUB_EVIDENCE_DIR, "near_miss", safe_file_token(tmdb_id))
         dead_dir = os.path.join(HARDSUB_EVIDENCE_DIR, safe_file_token(tmdb_id))
+        if node:
+            dead_dir = os.path.join(dead_dir, safe_file_token(_overlay_version_label(node)))
         if os.path.isdir(near_dir) and not os.path.exists(dead_dir):
+            os.makedirs(os.path.dirname(dead_dir), exist_ok=True)
             os.replace(near_dir, dead_dir)
         evidence_dir = next((p for p in (near_dir, dead_dir) if os.path.isdir(p)), None)
 
         _remove_success_records(tmdb_id)
         remove_pending_record(tmdb_id)
+        if node:
+            version = f"{node['provider']}/{node['type']}"
+            record_overlay_node_reject(
+                tmdb_id, record.get("title"), node, {"reasons": [film_reason]},
+                manual=True, summary=f"临门槛人工确认{label}，已从 R2 移除",
+                removed_bytes=size, evidence_dir=evidence_dir,
+            )
+            write_log(FAILED_LOG, {
+                "tmdbId": tmdb_id,
+                "title": record.get("title") or "",
+                "error": f"临门槛人工确认{label}（{version}），已从 R2 移除，换其它版本重下",
+                "stage": f"{film_reason}_retry",
+            })
+            folder = movie_dir(tmdb_id, year)
+            if os.path.isdir(folder):
+                shutil.rmtree(folder, ignore_errors=True)
+            done += 1
+            freed += size
+            print(f"[{tmdb_id}] 已处置：R2 删除 {len(keys)} 个对象，这个版本（{version}）"
+                  f"记为已检出，下次运行换其它版本重下（没有别的版本时整片判死）")
+            continue
         write_log(DOWNLOAD_DEAD_LOG, {
             "tmdbId": tmdb_id,
             "title": record.get("title") or "",
@@ -8251,9 +8390,9 @@ def migrate_overlay_dead(apply=False, data_dir=None, log_path=None, report_path=
       1. 只处理判死原因是 hardsub/watermark 的片；人工 reject 过的（manual）、同时
          还有其它判死原因的、找不到当时节点列表的一律不动；
       2. 推断当时下的节点：日志里判死前最后一次「切换备用节点 N」（没有则第 1 个），
-         对到 failed.jsonl（含 archive/）里当时的 urls；下的是 mp4 时把同一 provider
-         的全部 mp4 一起记为已检出——mp4 之间按实测码率重排、日志不记链接，定位不到
-         具体文件，而它们多半是同一片源转出的不同分辨率；
+         对到 failed.jsonl（含 archive/）里当时的 urls。mp4 之间按实测码率重排、日志
+         不记链接，定位不到具体文件——但 mp4 本来就按 provider 整家算一个版本
+         （overlay_node_key），落在哪个 mp4 位置都一样；
       3. 用 results.jsonl 里该片最新的节点组去掉已检出版本：一个不剩的保持判死，
          有剩的才迁移。
 
@@ -8268,9 +8407,14 @@ def migrate_overlay_dead(apply=False, data_dir=None, log_path=None, report_path=
         raise SystemExit("--data-dir 只用于试运行，不能和 --apply 一起用")
 
     def rebase(path):
+        # 只把脚本目录下的路径换到 data_dir；config 里写了脚本目录之外的绝对路径时，
+        # 它本来就指向真实文件，原样读（relpath 会算出 ../.. 拼到 data_dir 下读空）。
         if not data_dir:
             return path
-        return os.path.join(data_dir, os.path.relpath(path, str(_SCRIPT_DIR)))
+        rel = os.path.relpath(path, str(_SCRIPT_DIR))
+        if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+            return path
+        return os.path.join(data_dir, rel)
 
     dead_log = rebase(DOWNLOAD_DEAD_LOG)
     failed_log = rebase(FAILED_LOG)
@@ -8349,12 +8493,7 @@ def migrate_overlay_dead(apply=False, data_dir=None, log_path=None, report_path=
             inferred = "log" if index else "first_node"
             if not index or index > len(nodes):
                 index, inferred = 1, "first_node"
-            used = nodes[index - 1]
-            if used["type"] == "mp4":
-                killed = [n for n in nodes
-                          if n["type"] == "mp4" and n["provider"] == used["provider"]]
-            else:
-                killed = [used]
+            killed = [nodes[index - 1]]
             rejected = {overlay_node_key(n) for n in killed} | existing.get(tmdb_id, set())
             now_nodes = _entry_nodes(current.get(tmdb_id) or {"urls": kill_urls[tmdb_id]})
             remaining = [n for n in now_nodes if overlay_node_key(n) not in rejected]

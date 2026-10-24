@@ -399,8 +399,8 @@ def test_refetched_entry_rejoins_queue_ahead_of_later_arrivals():
 def test_partial_refetch_keeps_old_hls_node_in_its_original_position():
     """🔴 重取时 videasy 瞬时缺席（videasy-seed 403）：不能把 HLS 节点换丢。
 
-    旧 paleoak 节点补回原位（仍排第一），新 mp4 节点替换旧的；年龄按旧链接算；
-    这次直接派发，不立刻再重取一遍（再取多半还是同样残缺）。
+    旧 paleoak 节点补回原位（仍排第一），新 mp4 节点替换旧的；补回的旧节点带着
+    自己的取流时刻，条目时刻仍是新结果的；这次直接派发，不立刻再重取一遍。
     """
     r = Refetcher()
     src = Src([pal("p1", age_min=200, mp4=True)], closed=False, refetcher=r)
@@ -414,7 +414,10 @@ def test_partial_refetch_keeps_old_hls_node_in_its_original_position():
     assert ids(got) == ["p1"]
     urls = [u["url"] for u in got[0]["urls"]]
     assert urls == [f"https://{PALEO}/r6/p1/master.m3u8", f"https://{HAKUNA}/p1-new.mp4"]
-    assert got[0]["fetched_at"] == NOW - 200 * 60
+    assert got[0]["fetched_at"] == NOW
+    assert got[0]["urls"][0]["fetched_at"] == NOW - 200 * 60       # 旧节点按旧时刻
+    assert "fetched_at" not in got[0]["urls"][1]                    # 新节点按条目时刻
+    assert d.node_link_age(got[0], d._normalize_url_entry(got[0]["urls"][0]), NOW) == 200 * 60
     assert r.dispatched == ["p1"]
     assert gate.stats["jit_partial"] == 1
 
@@ -1036,3 +1039,88 @@ def test_queue_source_reports_refetch_capability_and_buffer():
     busy.clear()
     assert source.poll()[1]["tmdbId"] == "1"
     assert not source.has_buffered("1")
+
+
+# ------------------------------------------------------------ 审查修复（2026-10-24 第二轮）
+
+def test_waiting_film_with_lower_verdict_does_not_burn_refetch_budget():
+    """🔴 评估结论为「mp4 更低、继续等」的片：等待期间链接过期也不为它重取，
+    额度留给真正派发的那一刻。"""
+    r = Refetcher()
+    clock = Clock()
+    probe = Probe("lower")
+    src = Src([pal("p1"), pal("p2"), pal("p3", provider="vidup", age_min=0, mp4=True)],
+              closed=False, refetcher=r)
+    gate = make_gate(src, refetcher=r, clock=clock, probe=probe)
+    got, _ = drain(gate)
+    clock.advance(121)                      # 让行满 120 分钟，链接也 121 分钟（vidup 阈值 120）
+    drain(gate)
+    assert r.dispatched == ["p3"]           # 为评估换一次新链接（额度还能留一次给派发）
+    fresh = pal("p3", provider="vidup", mp4=True)
+    fresh["fetched_at"] = clock.t
+    src.items.append(fresh)
+    drain(gate)                             # 回到原位，投评估
+    drain(gate)                             # 结论：更低
+    clock.advance(600)                      # 又等了 10 小时，链接早过期
+    drain(gate)
+    drain(gate)
+    assert r.dispatched == ["p3"], "等待期间不能再为它重取"
+    gate.release(got[0])
+    assert drain(gate) == ([], "wait")      # 轮到派发：链接 600 分钟 → 派发前重取
+    assert r.dispatched == ["p3", "p3"]
+    assert gate.stats["jit_budget_out"] == 0
+
+
+def test_probe_refetch_leaves_one_refetch_for_dispatch():
+    """额度只剩一次时不为评估重取（也不拿过期链接去评估），这一次留给派发。"""
+    r = Refetcher()
+    clock = Clock()
+    probe = Probe("ok")
+    src = Src([pal("p1"), pal("p2"), pal("p3", provider="vidup", age_min=0, mp4=True)],
+              closed=False, refetcher=r)
+    gate = make_gate(src, refetcher=r, clock=clock, probe=probe)
+    gate._jit_counts["p3"] = 1              # 本例上限 2，只剩 1 次
+    got, _ = drain(gate)
+    clock.advance(121)
+    drain(gate)
+    drain(gate)
+    assert r.dispatched == [] and probe.calls == []
+    gate.release(got[0])
+    drain(gate)
+    assert r.dispatched == ["p3"]
+
+
+def test_gate_keeps_asking_source_after_it_reported_done():
+    """来源报过 done 之后还可能来片（下面的 NodeRetrySource 收到换节点重下）：
+    闸门不能记住 done 就再也不问。"""
+    r = Refetcher()
+    src = Src([pal("p1", age_min=200)], closed=True, refetcher=r)
+    gate = make_gate(src, refetcher=r)
+    assert drain(gate) == ([], "wait")      # p1 去重取；来源已 done
+    r.pending.discard("p1")                 # 重取无果
+    src.items.append(fast("f9"))            # 之后又来了一部（换节点重下）
+    got, state = drain(gate)
+    assert set(ids(got)) == {"p1", "f9"}
+
+
+def test_refetch_check_uses_the_first_nodes_own_age():
+    """补回的旧节点排第一：即使条目时刻是新的，也按旧节点的年龄判要不要重取。"""
+    r = Refetcher()
+    entry = pal("p1", age_min=0)
+    entry["urls"][0]["fetched_at"] = NOW - 200 * 60
+    src = Src([entry], refetcher=r)
+    assert drain(make_gate(src, refetcher=r)) == ([], "wait")
+    assert r.dispatched == ["p1"]
+
+
+def test_playlist_500_judged_by_the_nodes_own_age(tmp_path, monkeypatch):
+    """新取回的节点不因条目里混着旧节点就被算老；旧节点也不因条目时刻新就被算年轻。"""
+    monkeypatch.setattr(d, "TEMP_DIR", str(tmp_path / "temp"))
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "get_session", lambda: _Session(500))
+    monkeypatch.setattr(d, "PLAYLIST_RETRY_MAX", 1)
+    entry = pal("v1", provider="vidup")
+    entry["fetched_at"] = int(time.time())                     # 条目是新的
+    entry["urls"][0]["fetched_at"] = int(time.time()) - 160 * 60   # 这个节点是补回的旧节点
+    _, ok, info = d.process_one_entry(entry, set())
+    assert d.needs_refetch(info["node_failures"][0]["error"])
