@@ -14,6 +14,7 @@
 import random
 import threading
 import time
+from concurrent.futures import Future
 
 import pytest
 import requests
@@ -34,7 +35,7 @@ def _limits(**override):
         "jit_refetch_max_per_movie": 2,
         "mp4_fallback_after_minutes": 120,
         "max_deferred": 3,
-        "playlist_500_means_expired": True,
+        "playlist_500_expired_after_minutes": 150,
     }
     cfg.update(override)
     return d._parse_host_limits({PALEO: cfg})
@@ -119,11 +120,39 @@ class Refetcher:
         return key in self.pending
 
 
-def make_gate(src, refetcher=None, extra=None, clock=None):
+class Probe:
+    """mp4 兜底画质评估的替身：按 tmdbId 给结论，记下被评估了几次。
+
+    verdicts[id] 为 "ok" / "lower" / "unknown"，或 None 表示评估还没跑完。
+    """
+
+    def __init__(self, default="ok"):
+        self.default = default
+        self.verdicts = {}
+        self.calls = []
+        self.pending = {}
+
+    def __call__(self, entry):
+        key = entry["tmdbId"]
+        self.calls.append(key)
+        future = Future()
+        verdict = self.verdicts.get(key, self.default)
+        if verdict is None:
+            self.pending[key] = future
+        else:
+            future.set_result((verdict, f"stub {verdict}"))
+        return future
+
+    def finish(self, key, verdict):
+        self.pending.pop(key).set_result((verdict, f"stub {verdict}"))
+
+
+def make_gate(src, refetcher=None, extra=None, clock=None, probe=None, limits=None):
     gate = d.HostCapGate(
-        d.HOST_LIMITS, refetcher=refetcher,
+        limits or d.HOST_LIMITS, refetcher=refetcher,
         extra_active=(lambda host: extra.get(host, 0)) if extra is not None else None,
         clock=clock or Clock(),
+        probe_submit=probe or Probe(),
     )
     gate.set_source(src)
     return gate
@@ -367,18 +396,131 @@ def test_refetched_entry_rejoins_queue_ahead_of_later_arrivals():
     assert ids(drain(gate)[0]) == ["p2"]
 
 
+def test_partial_refetch_keeps_old_hls_node_in_its_original_position():
+    """🔴 重取时 videasy 瞬时缺席（videasy-seed 403）：不能把 HLS 节点换丢。
+
+    旧 paleoak 节点补回原位（仍排第一），新 mp4 节点替换旧的；年龄按旧链接算；
+    这次直接派发，不立刻再重取一遍（再取多半还是同样残缺）。
+    """
+    r = Refetcher()
+    src = Src([pal("p1", age_min=200, mp4=True)], closed=False, refetcher=r)
+    gate = make_gate(src, refetcher=r)
+    assert drain(gate) == ([], "wait")
+    fresh = fast("p1")                              # 新结果只有 vidlink
+    fresh["urls"][0]["url"] = f"https://{HAKUNA}/p1-new.mp4"
+    fresh["fetched_at"] = NOW
+    src.items.append(fresh)
+    got, _ = drain(gate)
+    assert ids(got) == ["p1"]
+    urls = [u["url"] for u in got[0]["urls"]]
+    assert urls == [f"https://{PALEO}/r6/p1/master.m3u8", f"https://{HAKUNA}/p1-new.mp4"]
+    assert got[0]["fetched_at"] == NOW - 200 * 60
+    assert r.dispatched == ["p1"]
+    assert gate.stats["jit_partial"] == 1
+
+
+def test_partial_refetch_that_has_to_wait_is_refetched_again_later():
+    """补回旧节点后若又要让行，轮到它时照常按（旧）年龄再重取一次，争取拿全。"""
+    r = Refetcher()
+    src = Src([pal("p0"), pal("p1", age_min=200, mp4=True)], closed=False, refetcher=r)
+    gate = make_gate(src, refetcher=r, limits=_limits(max_concurrent=1))
+    got, _ = drain(gate)
+    assert ids(got) == ["p0"]                       # p1 让行
+    gate.release(got[0])
+    assert drain(gate) == ([], "wait")              # p1 轮到时太旧 → 去重取
+    partial = fast("p1")
+    partial["fetched_at"] = NOW
+    src.items += [pal("p9"), partial]               # p9 先占住名额，p1 的残缺结果后到
+    got, _ = drain(gate)
+    assert ids(got) == ["p9"]                       # p1 补回旧节点后让行
+    gate.release(got[0])
+    assert drain(gate) == ([], "wait")
+    assert r.dispatched == ["p1", "p1"]             # 轮到时再重取一次
+
+
+def test_merge_missing_providers_only_when_something_is_missing():
+    old = pal("x", age_min=200, mp4=True)
+    full = pal("x", age_min=0, mp4=True)
+    merged, changed = d._merge_missing_providers(full, old)
+    assert merged is full and changed is False
+    extra = pal("x", age_min=0)
+    extra["urls"].append({"url": "https://moon.zenoak.top/x.m3u8",
+                          "provider": "vidup", "type": "m3u8"})
+    merged, changed = d._merge_missing_providers(extra, old)
+    # 旧次序：videasy, vidlink；新结果多出的 vidup 接在最后。
+    assert changed is True
+    assert [u["provider"] for u in merged["urls"]] == ["videasy", "vidlink", "vidup"]
+
+
+def test_no_refetch_for_films_whose_first_node_is_not_capped():
+    """paleoak 只是备用节点的快片：不为它拦下重取，免得换丢好好的第一节点。"""
+    r = Refetcher()
+    entry = fast("f1")
+    entry["urls"].append({"url": f"https://{PALEO}/r6/f1/master.m3u8",
+                          "provider": "videasy", "type": "m3u8"})
+    entry["fetched_at"] = NOW - 300 * 60
+    src = Src([entry], refetcher=r)
+    got, _ = drain(make_gate(src, refetcher=r))
+    assert ids(got) == ["f1"] and r.dispatched == []
+    assert d.capped_refetch_policy(entry) is None
+
+
+def test_failed_film_returning_from_refetch_keeps_its_queue_position():
+    """下载失败、重取回来的片按第一次进闸门的时刻排回原位，不去队尾重新排。"""
+    clock = Clock()
+    src = Src([pal("p1"), pal("p2"), pal("p3")], closed=False)
+    gate = make_gate(src, clock=clock, limits=_limits(max_concurrent=1))
+    got, _ = drain(gate)
+    assert ids(got) == ["p1"]                       # p2 p3 让行
+    clock.advance(10)
+    gate.release(got[0])
+    got, _ = drain(gate)
+    assert ids(got) == ["p2"]
+    clock.advance(10)
+    src.items.append(pal("p4"))                     # 后来的 p4
+    drain(gate)
+    gate.release(got[0])                            # p2 下载失败
+    got, _ = drain(gate)
+    assert ids(got) == ["p3"]
+    clock.advance(10)
+    src.items.append(pal("p2"))                     # p2 的新链接回来
+    drain(gate)
+    gate.release(got[0])
+    assert ids(drain(gate)[0]) == ["p2"]            # 排在 p4 前面
+
+
+def test_budget_exhausted_is_counted_once_per_film():
+    clock = Clock()
+    r = Refetcher()
+    src = Src([pal("p0"), pal("p1", age_min=200)], closed=False, refetcher=r)
+    gate = make_gate(src, refetcher=r, clock=clock, limits=_limits(max_concurrent=1))
+    gate._jit_counts["p1"] = 2
+    got, _ = drain(gate)
+    gate.release(got[0])
+    got, _ = drain(gate)                            # 额度用尽，原链接派出
+    assert ids(got) == ["p1"]
+    src.items.append(pal("p1", age_min=200))        # 失败后同一部又回来
+    drain(gate)
+    gate.release(got[0])
+    drain(gate)
+    assert gate.stats["jit_budget_out"] == 1
+
+
 # ------------------------------------------------------------ mp4 兜底
 
 def test_mp4_fallback_after_long_wait_moves_mp4_first_and_keeps_paleoak():
     clock = Clock()
+    probe = Probe("ok")
     src = Src([pal("p1"), pal("p2"), pal("p3", mp4=True), pal("p4")])
-    gate = make_gate(src, clock=clock)
+    gate = make_gate(src, clock=clock, probe=probe)
     got, _ = drain(gate)
     assert ids(got) == ["p1", "p2"]
 
     clock.advance(119)
     assert drain(gate) == ([], "wait")
+    assert probe.calls == []                       # 没到时间不评估
     clock.advance(2)
+    assert drain(gate) == ([], "wait")             # 本次只投后台评估，不等结论
     got2, state = drain(gate)
     assert ids(got2) == ["p3"] and state == "wait"
     urls = got2[0]["urls"]
@@ -391,38 +533,141 @@ def test_mp4_fallback_after_long_wait_moves_mp4_first_and_keeps_paleoak():
     assert ids(drain(gate)[0]) == ["p4"]
 
 
+def test_mp4_fallback_waits_when_mp4_is_lower_quality():
+    """🔴 画质门槛：mp4 比 HLS 低就不兜底，继续等 HLS 名额，且不反复评估。"""
+    clock = Clock()
+    probe = Probe("lower")
+    src = Src([pal("p1"), pal("p2"), pal("p3", mp4=True)])
+    gate = make_gate(src, clock=clock, probe=probe)
+    got, _ = drain(gate)
+    clock.advance(121)
+    assert drain(gate) == ([], "wait")
+    clock.advance(600)
+    assert drain(gate) == ([], "wait")
+    assert probe.calls == ["p3"]
+    assert gate.stats["fallback_lower"] == 1 and gate.stats["mp4_fallback"] == 0
+    gate.release(got[0])
+    got2, _ = drain(gate)
+    assert ids(got2) == ["p3"] and PALEO in got2[0]["urls"][0]["url"]   # 走 HLS 原顺序
+
+
+def test_mp4_fallback_unknown_quality_is_re_evaluated_later():
+    """测不出就不兜底（宁可多等不掉画质），过一阵再评估。"""
+    clock = Clock()
+    probe = Probe("unknown")
+    src = Src([pal("p1"), pal("p2"), pal("p3", mp4=True)])
+    gate = make_gate(src, clock=clock, probe=probe)
+    drain(gate)
+    clock.advance(121)
+    assert drain(gate) == ([], "wait")             # 投评估
+    assert drain(gate) == ([], "wait")             # 收到「测不出」
+    clock.advance(d.FALLBACK_PROBE_RETRY_SECONDS / 60 - 1)
+    assert drain(gate) == ([], "wait")
+    assert probe.calls == ["p3"]
+    probe.verdicts["p3"] = "ok"
+    clock.advance(2)
+    drain(gate)                                    # 到点重新评估（本次投递）
+    got, _ = drain(gate)                           # 结论回来
+    assert probe.calls == ["p3", "p3"]
+    assert ids(got) == ["p3"] and HAKUNA in got[0]["urls"][0]["url"]
+
+
+def test_mp4_fallback_does_not_block_main_loop_while_probing():
+    """评估在后台跑：没出结论前 poll 照常返回，不等它。"""
+    clock = Clock()
+    probe = Probe()
+    probe.verdicts["p3"] = None                    # 评估迟迟不出结论
+    src = Src([pal("p1"), pal("p2"), pal("p3", mp4=True), fast("f4")])
+    gate = make_gate(src, clock=clock, probe=probe)
+    got, _ = drain(gate)
+    assert ids(got) == ["p1", "p2", "f4"]
+    clock.advance(121)
+    assert drain(gate) == ([], "wait")
+    assert drain(gate) == ([], "wait")
+    assert probe.calls == ["p3"]                   # 在途期间不重复投
+    probe.finish("p3", "ok")
+    assert ids(drain(gate)[0]) == ["p3"]
+
+
+def test_mp4_fallback_probe_concurrency_is_bounded():
+    clock = Clock()
+    probe = Probe()
+    for i in range(10):
+        probe.verdicts[f"m{i}"] = None
+    src = Src([pal("p1"), pal("p2")] + [pal(f"m{i}", mp4=True) for i in range(10)])
+    gate = make_gate(src, clock=clock, probe=probe,
+                     limits=_limits(max_deferred=100))
+    drain(gate)
+    clock.advance(121)
+    drain(gate)
+    assert len(probe.calls) == d.FALLBACK_PROBE_MAX_INFLIGHT
+
+
 def test_mp4_fallback_disabled_when_minutes_is_zero(monkeypatch):
     monkeypatch.setattr(d, "HOST_LIMITS", _limits(mp4_fallback_after_minutes=0))
     clock = Clock()
+    probe = Probe("ok")
     src = Src([pal("p1"), pal("p2"), pal("p3", mp4=True)])
-    gate = make_gate(src, clock=clock)
+    gate = make_gate(src, clock=clock, probe=probe)
     drain(gate)
     clock.advance(600)
     assert drain(gate) == ([], "wait")
+    assert probe.calls == []
 
 
 def test_mp4_fallback_refetches_stale_links_and_keeps_its_wait_time():
-    """兜底前同样查年龄；换回新链接后不重新计时，下一次直接兜底。"""
+    """兜底前先查年龄（过期链接评估也只会 401/500）；换回新链接后不重新计时。"""
     r = Refetcher()
     clock = Clock()
+    probe = Probe("ok")
     src = Src([pal("p1"), pal("p2"), pal("p3", age_min=0, mp4=True)],
               closed=False, refetcher=r)
-    monkeypatch_limits = _limits(mp4_fallback_after_minutes=150)
-    gate = d.HostCapGate(monkeypatch_limits, refetcher=r, clock=clock)
-    gate.set_source(src)
+    gate = make_gate(src, refetcher=r, clock=clock, probe=probe,
+                     limits=_limits(mp4_fallback_after_minutes=150))
     drain(gate)
     clock.advance(140)                             # 让行 140 < 150，还不到兜底
     assert drain(gate) == ([], "wait")
     clock.advance(50)                              # 让行 190：该兜底了，但链接 190 > 180
     assert drain(gate) == ([], "wait")
-    assert r.dispatched == ["p3"]
+    assert r.dispatched == ["p3"] and probe.calls == []
     assert gate.stats["mp4_fallback"] == 0
 
     fresh = pal("p3", mp4=True)
     fresh["fetched_at"] = clock.t
     src.items.append(fresh)
+    drain(gate)                                    # 回到队里，投评估
     got, _ = drain(gate)
+    assert probe.calls == ["p3"]
     assert ids(got) == ["p3"] and HAKUNA in got[0]["urls"][0]["url"]
+
+
+def _fake_variants(*resolutions):
+    return [(res, f"https://{PALEO}/v/{i}.m3u8", 0.0) for i, res in enumerate(resolutions)]
+
+
+@pytest.mark.parametrize("hls,mp4,verdict", [
+    (("1920x1080", "1280x720"), "1920x800", "ok"),     # 同为 1920 宽：宽银幕不算低
+    (("1920x1080",), "1280x720", "lower"),
+    (("3840x2160", "1920x1080"), "1920x1080", "lower"),
+    (("unknown",), "1920x1080", "unknown"),            # HLS 没声明分辨率
+])
+def test_compare_fallback_quality(hls, mp4, verdict, monkeypatch):
+    monkeypatch.setattr(d, "parse_master_playlist", lambda *a, **k: _fake_variants(*hls))
+    monkeypatch.setattr(d, "_mp4_preflight",
+                        lambda node, label, runtime=None: {"probed": (mp4, 0, 2000, "h264")})
+    assert d.compare_fallback_quality(pal("x", mp4=True))[0] == verdict
+
+
+def test_compare_fallback_quality_unknown_when_either_side_fails(monkeypatch):
+    monkeypatch.setattr(d, "_mp4_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(d, "parse_master_playlist", lambda *a, **k: _fake_variants("1920x1080"))
+    assert d.compare_fallback_quality(pal("x", mp4=True))[0] == "unknown"
+
+    def boom(*a, **k):
+        raise RuntimeError("HTTP 502")
+
+    monkeypatch.setattr(d, "parse_master_playlist", boom)
+    assert d.compare_fallback_quality(pal("x", mp4=True))[0] == "unknown"
 
 
 # ------------------------------------------------------------ 链接年龄与启动预检
@@ -437,6 +682,11 @@ def test_is_stale_entry_uses_stricter_host_threshold(monkeypatch):
     assert not d.is_stale_entry(slow_mp4, now)
     slow_mp4["fetched_at"] = NOW - 13 * 3600
     assert d.is_stale_entry(slow_mp4, now)
+    # paleoak 只是备用节点：按普通的 12 小时，不按 paleoak 的阈值。
+    backup = fast("3")
+    backup["urls"].append(pal("3")["urls"][0])
+    backup["fetched_at"] = NOW - 300 * 60
+    assert not d.is_stale_entry(backup, now)
 
 
 def test_startup_precheck_leaves_capped_host_entries_to_the_gate(monkeypatch):
@@ -468,7 +718,7 @@ def test_shipped_config_values():
     assert shipped["refetch_after_seconds"] == {"vidup": 7200, "videasy": 10800}
     assert shipped["mp4_fallback_after_seconds"] == 7200
     assert shipped["max_deferred"] == 1000
-    assert shipped["playlist_500_means_expired"] is True
+    assert shipped["playlist_500_expired_after_seconds"] == 9000
     assert d._CFG["max_workers"] == 20
     assert d._CFG["download_queue_depth"] == 40
 
@@ -499,38 +749,61 @@ class _Session:
         return _Resp(self.status)
 
 
-@pytest.mark.parametrize("parse", ["master", "media"])
-def test_capped_host_playlist_500_is_marked_for_refetch(parse, monkeypatch):
-    """vidup 在 paleoak 上的过期链接返回 500：必须挂需重新取流。"""
+def _http_500_error(url, status=500):
+    """拿到 request_with_retry 对某状态码抛出的原样异常。"""
+    import download_movies as dm
+    real = dm.get_session
+    dm.get_session = lambda: _Session(status)
+    try:
+        dm.request_with_retry("GET", url, retries=1, as_text=True)
+    except RuntimeError as exc:
+        return exc
+    finally:
+        dm.get_session = real
+    raise AssertionError("expected RuntimeError")
+
+
+@pytest.mark.parametrize("age_min,status,url,marked", [
+    (160, 500, f"https://{PALEO}/b3f8c21a/x/master.m3u8", True),
+    (149, 500, f"https://{PALEO}/b3f8c21a/x/master.m3u8", False),   # 新链接的过载 500
+    (None, 500, f"https://{PALEO}/b3f8c21a/x/master.m3u8", False),  # 年龄未知
+    (160, 502, f"https://{PALEO}/b3f8c21a/x/master.m3u8", False),   # 别的 5xx
+    (160, 500, "https://moon.zenoak.top/x/master.m3u8", False),     # 别的主机
+])
+def test_playlist_500_counts_as_expiry_only_when_link_is_old(age_min, status, url, marked):
+    exc = _http_500_error(url, status)
+    age = None if age_min is None else age_min * 60
+    expired = d._playlist_500_as_expired(exc, url, age)
+    assert (expired is not None) is marked
+    if marked:
+        assert d.needs_refetch(str(expired))
+        assert not d._classify_failure(str(expired))
+
+
+def test_playlist_500_rule_off_when_host_limits_disabled(monkeypatch):
+    url = f"https://{PALEO}/b3f8c21a/x/master.m3u8"
+    exc = _http_500_error(url)
+    monkeypatch.setattr(d, "HOST_LIMITS", {})
+    assert d._playlist_500_as_expired(exc, url, 9999 * 60) is None
+
+
+@pytest.mark.parametrize("age_min,marked", [(160, True), (10, False)])
+def test_master_playlist_500_marking_reaches_node_failures(
+        age_min, marked, tmp_path, monkeypatch):
+    """接线：process_one_entry 里按这部片的 fetched_at 判年龄。"""
+    monkeypatch.setattr(d, "TEMP_DIR", str(tmp_path / "temp"))
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
     monkeypatch.setattr(d, "get_session", lambda: _Session(500))
     monkeypatch.setattr(d, "PLAYLIST_RETRY_MAX", 1)
-    url = f"https://{PALEO}/b3f8c21a/x/master.m3u8"
-    with pytest.raises(RuntimeError) as excinfo:
-        if parse == "master":
-            d.parse_master_playlist(url)
-        else:
-            d.parse_media_playlist(url)
-    message = str(excinfo.value)
-    assert d.needs_refetch(message)
-    assert not d._classify_failure(message)
-
-
-@pytest.mark.parametrize("url,status,limits", [
-    ("https://moon.zenoak.top/x/master.m3u8", 500, None),     # 别的主机
-    (f"https://{PALEO}/x/master.m3u8", 502, None),            # 别的 5xx
-    (f"https://{PALEO}/x/master.m3u8", 500, {}),              # 功能关闭
-])
-def test_other_playlist_5xx_stays_transient(url, status, limits, monkeypatch):
-    if limits is not None:
-        monkeypatch.setattr(d, "HOST_LIMITS", limits)
-    monkeypatch.setattr(d, "get_session", lambda: _Session(status))
-    with pytest.raises(RuntimeError) as excinfo:
-        d.parse_master_playlist(url, retries=1)
-    assert not d.needs_refetch(str(excinfo.value))
+    entry = pal("v1", provider="vidup")
+    entry["fetched_at"] = int(time.time()) - age_min * 60
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    assert d.needs_refetch(info["node_failures"][0]["error"]) is marked
 
 
 def test_segment_500_on_capped_host_stays_transient(monkeypatch):
-    """分片不走播放列表包装：过载时的分片 500 仍是瞬时错误、照常重试。"""
+    """分片不走播放列表那条判断：过载时的分片 500 仍是瞬时错误、照常重试。"""
     monkeypatch.setattr(d, "get_session", lambda: _Session(500))
     with pytest.raises(RuntimeError) as excinfo:
         d.request_with_retry("GET", f"https://{PALEO}/r6/s/seg", retries=1)

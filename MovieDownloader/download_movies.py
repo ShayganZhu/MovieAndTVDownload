@@ -280,7 +280,9 @@ def _parse_host_limits(raw):
                 0.0, float(cfg.get("mp4_fallback_after_minutes") or 0)
             ) * 60,
             "max_deferred": max(1, int(cfg.get("max_deferred") or 1000)),
-            "playlist_500_means_expired": bool(cfg.get("playlist_500_means_expired")),
+            "playlist_500_expired_after_seconds": max(
+                0.0, float(cfg.get("playlist_500_expired_after_minutes") or 0)
+            ) * 60,
         }
     return limits
 
@@ -2036,22 +2038,23 @@ def capped_host_of(entry):
 
 
 def capped_refetch_policy(entry):
-    """条目里落在 host_limits 主机上的节点的派发前重取策略。
+    """第一个节点落在 host_limits 主机上的片的派发前重取策略。
 
-    返回 (年龄阈值秒, 单片重取上限)，取各节点里最严的；没有这类节点、或主机
-    没配 refetch_after_minutes 时返回 None。provider 没单独配时按该主机的最小值。
-    看全部节点而不只第一个：重取会换回整组新链接，备用节点上的过期链接也一并修好。
+    返回 (年龄阈值秒, 单片重取上限)；第一个节点不在受限主机、或主机没配
+    refetch_after_minutes 时返回 None。provider 没单独配时按该主机的最小值。
+
+    🔴 只看第一个节点：受限主机只是备用节点的片（如 vidup zenoak 打头），第一
+    节点好好的，为一个多半用不上的备用节点去重取，既拖慢快片，又可能因重取时
+    某家瞬时缺席而把好好的第一节点换丢。
     """
-    limit = jit_max = None
-    for node in _entry_nodes(entry):
-        cfg = HOST_LIMITS.get(_host_of(node["url"]))
-        if not cfg or not cfg["refetch_after_seconds"]:
-            continue
-        ages = cfg["refetch_after_seconds"]
-        value = ages.get(node["provider"], min(ages.values()))
-        limit = value if limit is None else min(limit, value)
-        jit_max = cfg["jit_refetch_max"] if jit_max is None else min(jit_max, cfg["jit_refetch_max"])
-    return None if limit is None else (limit, jit_max)
+    nodes = _entry_nodes(entry)
+    if not nodes:
+        return None
+    cfg = HOST_LIMITS.get(_host_of(nodes[0]["url"]))
+    if not cfg or not cfg["refetch_after_seconds"]:
+        return None
+    ages = cfg["refetch_after_seconds"]
+    return ages.get(nodes[0]["provider"], min(ages.values())), cfg["jit_refetch_max"]
 
 
 def is_stale_entry(entry, now=None):
@@ -2206,6 +2209,91 @@ def _mp4_first(entry):
     return reordered
 
 
+def _merge_missing_providers(new, old):
+    """派发前重取的新结果缺了旧条目里的某家 provider 时，把旧节点补回原位。
+
+    返回 (条目, 是否补过)。重取走代理逐家取，某家瞬时失败（如 videasy-seed
+    403）时结果里就没有它——若整组替换，这部片会凭空丢掉画质更好的 HLS 节点，
+    而旧链接离过期其实还有约一小时余量（阈值 = 有效期 − 60 分钟）。
+
+    合并按旧条目的 provider 次序（即 config providers 的次序）：每家有新节点用
+    新的，没有就用旧的，新结果多出来的 provider 接在最后。这样节点尝试顺序与
+    原来一致，不会因为缺了一家就让低画质节点排到最前。
+    补过旧节点时 fetched_at 取旧值：条目里有旧链接，年龄按最旧的算。
+    """
+    new_nodes = [(item, _normalize_url_entry(item)) for item in (new.get("urls") or [])]
+    old_nodes = [(item, _normalize_url_entry(item)) for item in (old.get("urls") or [])]
+    new_providers = {node["provider"] for _item, node in new_nodes if node}
+    if all(node["provider"] in new_providers for _item, node in old_nodes if node):
+        return new, False
+    order = []
+    for _item, node in old_nodes + new_nodes:
+        if node and node["provider"] not in order:
+            order.append(node["provider"])
+    urls = []
+    for provider in order:
+        source = new_nodes if provider in new_providers else old_nodes
+        urls += [item for item, node in source if node and node["provider"] == provider]
+    merged = dict(new)
+    merged["urls"] = urls
+    merged["fetched_at"] = old.get("fetched_at")
+    return merged, True
+
+
+# mp4 兜底画质评估结论为「测不出」时，隔多久再评估一次（秒）。
+FALLBACK_PROBE_RETRY_SECONDS = 1800
+# 同时在跑的 mp4 兜底画质评估上限（每次评估 = 1 次播放列表请求 + mp4 头部采样）。
+FALLBACK_PROBE_MAX_INFLIGHT = 4
+
+
+def compare_fallback_quality(entry):
+    """mp4 兜底的画质门槛：mp4 实测分辨率不低于受限主机 HLS 声明的最高分辨率才放行。
+
+    返回 (结论, 说明)，结论 ∈ ok / lower / unknown：
+      - ok：mp4 宽度 ≥ HLS 最高档宽度，兜底不掉画质；
+      - lower：mp4 更低，这部片继续等 HLS 名额（本次运行不再评估）；
+      - unknown：任一边测不出（播放列表读不到 / 没声明分辨率 / mp4 预检失败），
+        宁可多等也不冒掉画质的险，过 FALLBACK_PROBE_RETRY_SECONDS 再评估。
+    比宽度而不比高度：宽银幕片同为 1080p 档，mp4 常是 1920x800，HLS 声明的却
+    可能是 1920x1080，比高度会把同档误判成更低。
+
+    会发网络请求，只能在后台线程里跑（见 HostCapGate 的 probe_submit），
+    绝不能放进主循环。
+    """
+    nodes = _entry_nodes(entry)
+    hls = next(
+        (n for n in nodes if n["type"] == "m3u8" and _host_of(n["url"]) in HOST_LIMITS),
+        None,
+    )
+    mp4_nodes = [n for n in nodes if n["type"] == "mp4"]
+    if hls is None or not mp4_nodes:
+        return "unknown", "缺少可比较的 HLS / mp4 节点"
+    try:
+        variants = parse_master_playlist(
+            hls["url"], retries=1, headers=hls.get("headers") or None
+        )
+    except Exception as exc:  # noqa: BLE001
+        return "unknown", f"HLS 播放列表读不到: {exc}"
+    hls_sizes = [size for size in (parse_resolution(v[0]) for v in variants) if size]
+    if not hls_sizes:
+        return "unknown", "HLS 没有声明分辨率"
+    hls_best = max(hls_sizes)
+    label = normalize_tmdb_id(entry.get("tmdbId")) or "fallback"
+    mp4_best = None
+    for node in mp4_nodes:
+        info = _mp4_preflight(node, label, entry.get("runtime_minutes"))
+        probed = (info or {}).get("probed")
+        size = parse_resolution(probed[0]) if probed else None
+        if size and (mp4_best is None or size > mp4_best):
+            mp4_best = size
+    if mp4_best is None:
+        return "unknown", "mp4 预检测不出分辨率"
+    detail = (
+        f"mp4 {mp4_best[0]}x{mp4_best[1]} vs HLS 最高 {hls_best[0]}x{hls_best[1]}"
+    )
+    return ("ok" if mp4_best[0] >= hls_best[0] else "lower"), detail
+
+
 class HostCapGate:
     """按 CDN 主机限制在途片数的派发闸门（config.yaml host_limits，2026-10-24）。
 
@@ -2214,34 +2302,42 @@ class HostCapGate:
 
     1. **并发上限 + 让行**：第一个节点落在受限主机的片，在途（含已提交未开跑）
        最多 max_concurrent 部；满了就整片放进让行队列，后面的片照常派发——
-       慢主机不再能把全部槽位占光。有空位时让行队列先进先出。
+       慢主机不再能把全部槽位占光。有空位时让行队列按**第一次进闸门的时刻**
+       先来先走：下载失败、重取回来的片排回它原来的位置，不去队尾重新排。
        节点循环切到受限主机的「额外占用」（见 _host_extra_active）也算在途。
-    2. **派发前重取**：片在真正派发那一刻（不是进让行队列时——排几个小时
-       又会过期）链接年龄超过 refetch_after_minutes，就先交给取流线程换新链接，
-       新链接经首轮来源的重取结果通道回到本闸门再派发。重取无果沿用原链接，
-       每片每次运行最多 jit_refetch_max_per_movie 次，用完也沿用原链接
-       （真过期会 401/500，走既有的过期重取闭环）。
-       只在来源能回送重取结果时启用（pipeline 首轮的 QueueEntrySource），
-       否则新链接回不来，闸门会一直等。
-    3. **mp4 兜底**：让行满 mp4_fallback_after_minutes 且带 mp4 节点的片，
-       把 mp4 节点挪到最前派发，不占名额，原节点留在后面兜底。
+    2. **派发前重取**：第一个节点在受限主机的片，在真正派发那一刻（不是进让行
+       队列时——排几个小时又会过期）链接年龄超过 refetch_after_minutes，就先
+       交给取流线程换新链接，新链接经首轮来源的重取结果通道回到本闸门再派发。
+       新结果缺了某家 provider 时把旧节点补回原位（_merge_missing_providers），
+       不让一次瞬时缺席换丢 HLS 节点。重取无果沿用原链接；每片每次运行最多
+       jit_refetch_max_per_movie 次，用完也沿用原链接（真过期会 401/500，走既有
+       的过期重取闭环）。只在来源能回送重取结果时启用（pipeline 首轮的
+       QueueEntrySource），否则新链接回不来，闸门会一直等。
+    3. **mp4 兜底（带画质门槛）**：让行满 mp4_fallback_after_minutes 且带 mp4 节点
+       的片，先在后台评估 mp4 实测分辨率是否不低于 HLS 声明的最高档
+       （compare_fallback_quality）；不低才把 mp4 挪到最前派发（不占名额，原节点
+       留在后面兜底），更低就继续等 HLS 名额，测不出过一阵再评估。
 
     🔴 本轮收尾：来源取空后，只要让行队列 / 等重取的片还在，就报 wait 而不是
     done——让行的片必须在本轮内下完，不能被静默丢掉。
     让行队列只在内存里：中断时这些片本就在 results.jsonl 里，下次运行是存量。
 
     只由主循环线程调用，内部状态无需加锁；extra_active 由下载线程更新，
-    自带锁（host_extra_active）。
+    自带锁（host_extra_active）；画质评估在 probe_submit 的后台线程里跑。
     """
 
     STATUS_INTERVAL_SECONDS = 600
 
-    def __init__(self, limits, refetcher=None, extra_active=None, clock=None):
+    def __init__(self, limits, refetcher=None, extra_active=None, clock=None,
+                 probe_submit=None):
         self._limits = limits
         # 判断「重取是否还有下文」要靠 is_pending；没有它就无法安全地等结果。
         self._refetcher = refetcher if hasattr(refetcher, "is_pending") else None
         self._extra_active = extra_active or (lambda host: 0)
         self._clock = clock or time.time
+        # probe_submit(entry) -> Future，结果为 compare_fallback_quality 的返回值。
+        self._probe_submit = probe_submit or self._default_probe_submit
+        self._probe_executor = None
         self._source = None
         self._source_done = False
         self._jit_enabled = False
@@ -2249,16 +2345,20 @@ class HostCapGate:
         self._held = deque()
         self._reserved = {}          # id(已派发条目) -> 主机
         self._reserved_count = {}    # 主机 -> 闸门派发的在途数
-        # 每个主机两条先进先出的道：带 mp4 节点的（可兜底）与不带的。
+        # 每个主机两条道：带 mp4 节点的（可兜底）与不带的，各按 _queued_since 排序。
         self._queues = {host: {"mp4": deque(), "plain": deque()} for host in limits}
-        self._first_deferred_at = {}  # tmdbId -> 第一次让行的时刻（重取回来不重计）
+        self._queued_since = {}       # tmdbId -> 第一次进闸门的时刻（排队位置，整次运行不变）
+        self._first_deferred_at = {}  # tmdbId -> 本次让行开始的时刻（mp4 兜底计时，派发即清）
         self._refetching = {}         # tmdbId -> 已送去派发前重取的原条目
         self._jit_counts = {}         # tmdbId -> 本次运行已派发前重取次数
         self._skip_jit = set()        # 重取无果：下次派发不再查年龄，沿用原链接
+        self._budget_out = set()      # 派发前重取额度已用尽的 tmdbId（只为按片计数）
+        self._fallback_probes = {}    # tmdbId -> 进行中的画质评估 Future
+        self._fallback_verdicts = {}  # tmdbId -> (结论, 测不出时的下次评估时刻)
         self._last_status = self._clock()
         self.stats = {
-            "deferred": 0, "mp4_fallback": 0, "jit_refetch": 0,
-            "jit_no_result": 0, "jit_budget_out": 0,
+            "deferred": 0, "mp4_fallback": 0, "fallback_lower": 0,
+            "jit_refetch": 0, "jit_partial": 0, "jit_no_result": 0, "jit_budget_out": 0,
         }
 
     # ---- 主循环接口 ----
@@ -2321,18 +2421,20 @@ class HostCapGate:
         for host, queues in self._queues.items():
             waiting = len(queues["mp4"]) + len(queues["plain"])
             oldest = min(
-                (self._first_deferred_at.get(self._key(lane[0]), now)
-                 for lane in queues.values() if lane),
+                (self._first_deferred_at.get(self._key(e), now)
+                 for lane in queues.values() for e in lane),
                 default=now,
             )
             print(
                 f"[让行] {host}: 在途 {self._reserved_count.get(host, 0)}"
                 f"(+{self._extra_active(host)}) / {self._limits[host]['max_concurrent']}，"
                 f"让行队列 {waiting} 部（带 mp4 {len(queues['mp4'])}，"
-                f"最久 {(now - oldest) / 60:.0f} 分钟），等重取 {len(self._refetching)} 部；"
-                f"累计让行 {s['deferred']}，mp4 兜底 {s['mp4_fallback']}，"
-                f"派发前重取 {s['jit_refetch']}（无果沿用原链接 {s['jit_no_result']}，"
-                f"额度用尽 {s['jit_budget_out']}）",
+                f"最久 {(now - oldest) / 60:.0f} 分钟），等重取 {len(self._refetching)} 部，"
+                f"兜底评估中 {len(self._fallback_probes)} 部；"
+                f"累计让行 {s['deferred']}，mp4 兜底 {s['mp4_fallback']}"
+                f"（mp4 画质更低而继续等 {s['fallback_lower']}），"
+                f"派发前重取 {s['jit_refetch']}（缺 provider 补回旧节点 {s['jit_partial']}，"
+                f"无果沿用原链接 {s['jit_no_result']}，额度用尽 {s['jit_budget_out']}）",
                 flush=True,
             )
 
@@ -2340,6 +2442,9 @@ class HostCapGate:
     @staticmethod
     def _key(entry):
         return normalize_tmdb_id(entry.get("tmdbId")) or None
+
+    def _since(self, entry):
+        return self._queued_since.get(self._key(entry), 0)
 
     def _room(self, host):
         return (
@@ -2364,26 +2469,72 @@ class HostCapGate:
         mp4, plain = queues["mp4"], queues["plain"]
         if not mp4 or not plain:
             return (mp4 or plain).popleft()
-        t_mp4 = self._first_deferred_at.get(self._key(mp4[0]), 0)
-        t_plain = self._first_deferred_at.get(self._key(plain[0]), 0)
-        return mp4.popleft() if t_mp4 <= t_plain else plain.popleft()
+        return mp4.popleft() if self._since(mp4[0]) <= self._since(plain[0]) else plain.popleft()
 
     def _pop_mp4_fallback(self, host, queues, now):
+        """让行够久、且画质评估通过的带 mp4 片：挪 mp4 到最前派发。
+
+        要逐个看整条道而不只看队首：排在前面的可能是刚回来、计时才开始的老片，
+        也可能是评估结论为 mp4 更低、只能继续等的片。
+        """
         after = self._limits[host]["mp4_fallback_after_seconds"]
         lane = queues["mp4"]
-        while after > 0 and lane:
-            key = self._key(lane[0])
+        if after <= 0 or not lane:
+            return None
+        for entry in list(lane):
+            key = self._key(entry)
             if now - self._first_deferred_at.get(key, now) < after:
-                return None
-            entry = lane.popleft()
-            # 兜底同样先查链接年龄：mp4 签名直链放了两个多小时也可能过期。
-            # 换回的新链接回到队首（第一次让行时刻不变），下一次照样走兜底。
-            if self._send_to_refetch(entry, key, now):
                 continue
+            # 先查链接年龄：链接过期了，评估读 HLS 播放列表也只会 401/500。
+            # 换回的新链接回到原排队位置，计时不变，下一次照样评估、兜底。
+            if self._send_to_refetch(entry, key, now):
+                lane.remove(entry)
+                continue
+            if self._fallback_verdict(entry, key, now) != "ok":
+                continue
+            lane.remove(entry)
             self._first_deferred_at.pop(key, None)
             self.stats["mp4_fallback"] += 1
             return _mp4_first(entry)
         return None
+
+    def _fallback_verdict(self, entry, key, now):
+        """取这部片的 mp4 兜底画质结论；还没有就在后台发起评估、本次返回 None。"""
+        probe = self._fallback_probes.get(key)
+        if probe is not None:
+            if not probe.done():
+                return None
+            del self._fallback_probes[key]
+            try:
+                verdict, detail = probe.result()
+            except Exception as exc:  # noqa: BLE001
+                verdict, detail = "unknown", f"评估异常: {exc}"
+            retry_at = now + FALLBACK_PROBE_RETRY_SECONDS if verdict == "unknown" else None
+            self._fallback_verdicts[key] = (verdict, retry_at)
+            if verdict == "lower":
+                self.stats["fallback_lower"] += 1
+            outcome = {
+                "ok": "可兜底", "lower": "mp4 更低，继续等 HLS 名额",
+            }.get(verdict, f"测不出，{FALLBACK_PROBE_RETRY_SECONDS // 60} 分钟后再评估")
+            print(f"  [mp4 兜底评估] {key}: {detail} → {outcome}", flush=True)
+        record = self._fallback_verdicts.get(key)
+        if record is not None:
+            verdict, retry_at = record
+            if verdict != "unknown" or now < retry_at:
+                return verdict
+        if len(self._fallback_probes) < FALLBACK_PROBE_MAX_INFLIGHT:
+            try:
+                self._fallback_probes[key] = self._probe_submit(entry)
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ mp4 兜底评估投递失败 {key}: {exc}", flush=True)
+        return None
+
+    def _default_probe_submit(self, entry):
+        if self._probe_executor is None:
+            self._probe_executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="fallback-probe"
+            )
+        return self._probe_executor.submit(compare_fallback_quality, entry)
 
     def _admit(self, entry, now):
         """处理一条新到（或暂扣）的条目。返回要派发的条目 / None / _GATE_BLOCKED。"""
@@ -2391,15 +2542,24 @@ class HostCapGate:
         if key is None:
             return entry
         # 派发前重取换回的新链接（或重取无果、沿用的原条目）。
-        self._refetching.pop(key, None)
+        merged = False
+        old = self._refetching.pop(key, None)
+        if old is not None and old is not entry:
+            entry, merged = _merge_missing_providers(entry, old)
+            if merged:
+                self.stats["jit_partial"] += 1
         host = capped_host_of(entry)
-        if host is not None and (
-            not self._room(host)
-            or self._queues[host]["mp4"] or self._queues[host]["plain"]
-        ):
-            # 没空位，或前面还有人在排：进让行队列（保持先来先走）。
-            return None if self._defer(entry, host, key, now) else _GATE_BLOCKED
-        return self._deliver(entry, host, key, now)
+        if host is not None:
+            self._queued_since.setdefault(key, now)
+            if (
+                not self._room(host)
+                or self._queues[host]["mp4"] or self._queues[host]["plain"]
+            ):
+                # 没空位，或前面还有人在排：进让行队列（按第一次进闸门的时刻排位）。
+                return None if self._defer(entry, host, key, now) else _GATE_BLOCKED
+        # 刚补过旧节点的不再查年龄：它的年龄就是旧链接的年龄，再查只会立刻又
+        # 重取一遍、换回同样残缺的结果；能派就趁旧链接还在余量里派出去。
+        return self._deliver(entry, host, key, now, check_age=not merged)
 
     def _defer(self, entry, host, key, now):
         queues = self._queues[host]
@@ -2407,18 +2567,20 @@ class HostCapGate:
             return False
         has_mp4 = any(node["type"] == "mp4" for node in _entry_nodes(entry))
         lane = queues["mp4" if has_mp4 else "plain"]
-        if key in self._first_deferred_at:
-            # 让行过、送去重取后回来的老片：回到队首，不丢排队位置。
-            lane.appendleft(entry)
-        else:
+        since = self._since(entry)
+        if not lane or self._since(lane[-1]) <= since:
             lane.append(entry)
+        else:
+            # 下载失败 / 重取后回来的老片：插回它原来的位置。
+            lane.insert(next(i for i, e in enumerate(lane) if self._since(e) > since), entry)
+        if key not in self._first_deferred_at:
             self._first_deferred_at[key] = now
             self.stats["deferred"] += 1
         return True
 
-    def _deliver(self, entry, host, key, now):
+    def _deliver(self, entry, host, key, now, check_age=True):
         """派发前的最后一关：链接太旧就先送去重取（返回 None），否则占名额放行。"""
-        if self._send_to_refetch(entry, key, now):
+        if host is not None and check_age and self._send_to_refetch(entry, key, now):
             return None
         if host is not None:
             self._reserved[id(entry)] = host
@@ -2441,7 +2603,9 @@ class HostCapGate:
             return False
         used = self._jit_counts.get(key, 0)
         if used >= jit_max:
-            self.stats["jit_budget_out"] += 1
+            if key not in self._budget_out:
+                self._budget_out.add(key)
+                self.stats["jit_budget_out"] += 1
             return False
         try:
             # 同一 id 已在重取（如下载失败刚投过）时 dispatch 会合并，结果照样回来。
@@ -2474,7 +2638,8 @@ class HostCapGate:
                 continue
             if has_buffered is not None and has_buffered(key):
                 continue
-            back.append(self._refetching.pop(key))
+            entry = self._refetching.pop(key)
+            back.append(entry)
             self._skip_jit.add(key)
             self.stats["jit_no_result"] += 1
         return back
@@ -3281,29 +3446,33 @@ def _assert_playlist_body(text, url):
     )
 
 
-def _playlist_request(url, **kwargs):
-    """取 master / media 播放列表文本（request_with_retry 的薄包装）。
+def _playlist_500_as_expired(exc, url, link_age):
+    """播放列表请求的 HTTP 500 该不该按签名过期处理；该就返回补挂了重取标记的新异常。
 
-    host_limits 里开了 playlist_500_means_expired 的主机：重试耗尽仍是
-    HTTP 500 时补挂 _NEEDS_REFETCH_MARKER。sun.paleoak.top 上 vidup 的过期链接
-    返回的是 500 而不是 401（2026-10-24 实测：~170 分钟内 200，~180 分钟起 500），
-    不挂的话它被当成普通瞬时错误，这部片永远换不到新链接。
-    只管播放列表：分片层不走这里，分片 500 仍是瞬时错误。
+    host_limits 里配了 playlist_500_expired_after_minutes 的主机：重试耗尽仍是
+    HTTP 500、且链接年龄（link_age，秒，从 fetched_at 算）已到该值时才算。
+    sun.paleoak.top 上 vidup 的过期链接返回的是 500 而不是 401（2026-10-24 实测：
+    ~170 分钟内 200，~180 分钟起 500），不挂 _NEEDS_REFETCH_MARKER 的话它被当成
+    普通瞬时错误，这部片永远换不到新链接。
+
+    🔴 必须看年龄：源站过载时新链接也会偶发 500。不分年龄一律判过期的话，
+    这次瞬时失败会变成确定性失败（retriable=False）并白耗重取额度，
+    本可重试成功的片当轮就放弃了。年龄未知（无 fetched_at）一律按瞬时错误。
+    只用于主/媒体播放列表（见 _attempt_download）；分片 500 仍是瞬时错误。
+    不该算过期时返回 None。
     """
-    try:
-        return request_with_retry("GET", url, as_text=True, **kwargs)
-    except RuntimeError as exc:
-        cfg = HOST_LIMITS.get(_host_of(url))
-        if (
-            cfg and cfg["playlist_500_means_expired"]
-            and _status_of(exc.__cause__) == 500
-            and _NEEDS_REFETCH_MARKER not in str(exc)
-        ):
-            raise RuntimeError(
-                f"{exc}；播放列表持续 HTTP 500（{_host_of(url)} 上签名过期的表现），"
-                f"{_NEEDS_REFETCH_MARKER}"
-            ) from exc
-        raise
+    cfg = HOST_LIMITS.get(_host_of(url))
+    after = cfg["playlist_500_expired_after_seconds"] if cfg else 0
+    if (
+        after > 0 and link_age is not None and link_age >= after
+        and _status_of(exc.__cause__) == 500
+        and _NEEDS_REFETCH_MARKER not in str(exc)
+    ):
+        return RuntimeError(
+            f"{exc}；链接已 {link_age / 60:.0f} 分钟、播放列表持续 HTTP 500"
+            f"（{_host_of(url)} 上签名过期的表现），{_NEEDS_REFETCH_MARKER}"
+        )
+    return None
 
 
 def parse_master_playlist(master_url, retries=None, headers=None):
@@ -3315,8 +3484,8 @@ def parse_master_playlist(master_url, retries=None, headers=None):
 
     响应体不是 m3u8 时抛带重取标记的错误（见 `_assert_playlist_body`）。
     """
-    text = _playlist_request(
-        master_url,
+    text = request_with_retry(
+        "GET", master_url, as_text=True,
         retries=PLAYLIST_RETRY_MAX if retries is None else retries,
         backoff=PLAYLIST_RETRY_BACKOFF,
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
@@ -3373,8 +3542,8 @@ def parse_media_playlist(playlist_url, headers=None):
     响应体不是 m3u8 时抛带重取标记的错误（见 `_assert_playlist_body`）——
     master 与 media 两次请求用的是同一个 token，前者过了不代表后者也过。
     """
-    text = _playlist_request(
-        playlist_url,
+    text = request_with_retry(
+        "GET", playlist_url, as_text=True,
         retries=PLAYLIST_RETRY_MAX,
         backoff=PLAYLIST_RETRY_BACKOFF,
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
@@ -4667,10 +4836,16 @@ def process_one_entry(entry, processed_ids):
         # 该主机的 m3u8 节点已熔断：连 playlist 都不必请求，直接换下一个节点。
         _raise_if_hls_host_tripped(url, "该节点")
 
-        variants = parse_master_playlist(
-            url, retries=None if is_last_node else PLAYLIST_RETRY_FALLBACK,
-            headers=node_headers,
-        )
+        try:
+            variants = parse_master_playlist(
+                url, retries=None if is_last_node else PLAYLIST_RETRY_FALLBACK,
+                headers=node_headers,
+            )
+        except RuntimeError as exc:
+            expired = _playlist_500_as_expired(exc, url, link_age_seconds(entry))
+            if expired is None:
+                raise
+            raise expired from exc
         if not variants:
             raise RuntimeError("没有找到媒体播放列表或清晰度变体")
 
@@ -4765,9 +4940,17 @@ def process_one_entry(entry, processed_ids):
             remove_file(sample_path)
 
             try:
-                segment_urls, durations, init_url = parse_media_playlist(
-                    playlist_url, headers=node_headers
-                )
+                try:
+                    segment_urls, durations, init_url = parse_media_playlist(
+                        playlist_url, headers=node_headers
+                    )
+                except RuntimeError as exc:
+                    expired = _playlist_500_as_expired(
+                        exc, playlist_url, link_age_seconds(entry)
+                    )
+                    if expired is None:
+                        raise
+                    raise expired from exc
                 # 分片主机已熔断：整条流的分片都在同一台主机上，不必开采样。
                 if segment_urls:
                     _raise_if_hls_host_tripped(segment_urls[0], "该节点的分片")
