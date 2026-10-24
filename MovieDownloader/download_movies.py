@@ -2101,8 +2101,9 @@ def refetch_entries(entries, refetch_counts):
                     print(f"  [重取失败] {tmdb_id}: {exc}", flush=True)
                     continue
                 if status != "ok" or not result or not result.get("urls"):
-                    # dead（源站确认无此片）与 retry（瞬时错误耗尽）都不再重投本轮：
-                    # 前者救不回来，后者留给下次运行——本轮已无新链接可用。
+                    # dead（源站确认无此片）、retry（瞬时错误耗尽）、deferred（有源在
+                    # 熔断、其余源无此片）都不再重投本轮：前者救不回来，后两者留给
+                    # 下次运行——本轮已无新链接可用。
                     print(f"  [重取无果] {tmdb_id}: {status}", flush=True)
                     continue
                 # 落盘新结果，与取流侧行为一致（追加写，下游按 fetched_at 择新）。

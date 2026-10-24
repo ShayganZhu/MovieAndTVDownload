@@ -40,14 +40,18 @@ def _install_fake_session(monkeypatch, *, vidup_streams=(), vidup_page_status=20
                           vidfast_streams=(), vidfast_page_status=404,
                           vidlink_resp=None, videasy_seed="SEED",
                           videasy_sources=None, videasy_seed_status=200,
-                          videasy_decoded=None, vidup_stage1_status=200):
+                          videasy_decoded=None, vidup_stage1_status=200, direct_hook=None):
     """四家取流源的假 Session，按域名路由。
 
     默认：vidup 按 vidup_streams 出流；vidfast 页面 404（无源）；
     vidlink 返回 null（无源）；videasy 各 server 返回空（无源）。
     这样单独测某一家时，其余三家都是"明确无源"而非瞬时错误，语义干净。
+
+    seen["routes"] 按顺序记录每个请求走的线路（"proxy" / "direct"）。
+    direct_hook(method, url) 只对直连 session 生效：返回响应即用它作答（模拟直连被拒），
+    抛异常即模拟直连出错，返回 None 则照常路由。
     """
-    seen = {"order": [], "urls": [], "headers": {}}
+    seen = {"order": [], "urls": [], "headers": {}, "routes": []}
 
     sites = {
         "vidup": {"host": "https://vidup.to/", "base": "https://x",
@@ -67,7 +71,16 @@ def _install_fake_session(monkeypatch, *, vidup_streams=(), vidup_page_status=20
         def __exit__(self, *a):
             return False
 
+        def _hooked(self, method, url):
+            seen["routes"].append((url, "proxy" if self.proxies else "direct"))
+            if direct_hook is not None and not self.proxies:
+                return direct_hook(method, url)
+            return None
+
         def get(self, url, timeout=None, headers=None):
+            hooked = self._hooked("get", url)
+            if hooked is not None:
+                return hooked
             seen["urls"].append(url)
             for name, site in sites.items():
                 if url.startswith(site["host"]):
@@ -110,6 +123,9 @@ def _install_fake_session(monkeypatch, *, vidup_streams=(), vidup_page_status=20
             raise AssertionError(f"unexpected GET {url}")
 
         def post(self, url, headers=None, json=None, timeout=None):
+            hooked = self._hooked("post", url)
+            if hooked is not None:
+                return hooked
             seen["urls"].append(url)
             for name, site in sites.items():
                 if url == site["base"] + "/stage1":
@@ -1127,3 +1143,402 @@ def test_run_batch_without_stop_event_behaves_as_before(tmp_path, monkeypatch):
     assert retry == []
     lines = [x for x in results.read_text().splitlines() if x.strip()]
     assert len(lines) == 2
+
+
+# ------------------------------------------------- 取流源熔断（A1）
+
+P3 = ["vidup", "videasy", "vidlink"]
+_VIDLINK_OK = {"stream": {"qualities": {"1080": {"url": "https://link/a.mp4"}}}}
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def _use_breaker(monkeypatch, trip=3, interval=600, clock=None):
+    b = m.ProviderBreaker(trip_after=trip, probe_interval=interval, enabled=True,
+                          clock=clock or _Clock())
+    monkeypatch.setattr(m, "PROVIDER_BREAKER", b)
+    return b
+
+
+def test_breaker_trips_only_after_consecutive_outages():
+    b = m.ProviderBreaker(trip_after=3, enabled=True, clock=_Clock())
+    b.record("videasy", "down")
+    b.record("videasy", "down")
+    assert b.allow("videasy") == "call"
+    b.record("videasy", "down")
+    assert b.is_down("videasy")
+    assert b.allow("videasy") == "skip"
+
+
+def test_breaker_streak_resets_on_answer_and_ignores_neutral():
+    """源站正常作答（含"无此片"）就清零；超时之类的中性结局不加也不清。"""
+    b = m.ProviderBreaker(trip_after=3, enabled=True, clock=_Clock())
+    for outcome in ("down", "down", None, "up", "down", "down"):
+        b.record("v", outcome)
+    assert not b.is_down("v")
+    b.record("v", None)
+    b.record("v", "down")
+    assert b.is_down("v")
+
+
+def test_breaker_probes_one_call_per_interval_and_recovers():
+    clock = _Clock()
+    b = m.ProviderBreaker(trip_after=1, probe_interval=600, enabled=True, clock=clock)
+    b.record("v", "down")
+    assert b.allow("v") == "skip"
+    clock.t += 600
+    assert b.allow("v") == "probe"
+    assert b.allow("v") == "skip", "同一时刻只放一部片去试探"
+    b.record("v", "down", probe=True)
+    assert b.is_down("v") and b.allow("v") == "skip"
+    clock.t += 600
+    assert b.allow("v") == "probe"
+    b.record("v", None, probe=True)          # 试探超时：说明不了死活
+    assert b.allow("v") == "probe", "中性结局后下一个调用马上再试探"
+    b.record("v", "up", probe=True)
+    assert not b.is_down("v") and b.allow("v") == "call"
+
+
+def test_breaker_disabled_never_skips():
+    b = m.ProviderBreaker(trip_after=1, enabled=False, clock=_Clock())
+    for _ in range(5):
+        b.record("v", "down")
+    assert b.allow("v") == "call" and not b.is_down("v")
+
+
+@pytest.mark.parametrize("name,exc,expected", [
+    ("videasy", None, "up"),
+    ("videasy", m.NoSource("none"), "up"),
+    ("videasy", m.HttpStatusError(403, "videasy-seed"), "down"),
+    ("videasy", m.HttpStatusError(429, "videasy-seed"), None),      # 单个出口限流
+    ("videasy", m.HttpStatusError(500, "videasy-miami"), None),     # 个别 server 故障
+    ("vidup", m.HttpStatusError(502, "page"), "down"),
+    ("vidup", m.HttpStatusError(500, "enc-vidup(stage1)"), None),   # enc-dec 不算源的账
+    ("vidup", m.HttpStatusError(403, "stage1"), None),              # 不是第一跳
+    ("vidlink", m.HttpStatusError(403, "vidlink-api"), "down"),
+    ("vidlink", m.HttpStatusError(500, "enc-vidlink"), None),
+    ("vidup", Exception("curl: (28) Operation timed out"), None),
+])
+def test_breaker_outcome_classification(name, exc, expected):
+    assert m._breaker_outcome(name, exc) == expected
+
+
+def test_blocked_seed_trips_breaker_and_videasy_is_no_longer_called(monkeypatch):
+    """videasy 的真实故障：seed 一律 403。熔断前照旧按瞬时重试，熔断后不再请求它。"""
+    seen = _install_fake_session(monkeypatch, vidup_page_status=404, videasy_seed_status=403)
+    b = _use_breaker(monkeypatch, trip=3)
+
+    assert m.process_tmdb_id("1", providers=P3) == ("retry", None)
+    assert b.is_down("videasy") and seen["videasy_seeds"] == 3
+
+    status, result = m.process_tmdb_id("2", providers=P3)
+    assert status == "deferred"
+    assert result == {"tmdbId": "2", "providers": ["videasy"]}
+    assert seen["videasy_seeds"] == 3, "熔断后不该再请求 seed"
+
+
+def test_deferred_takes_one_attempt_and_is_never_dead(monkeypatch):
+    seen = _install_fake_session(monkeypatch, vidup_page_status=404)
+    _use_breaker(monkeypatch, trip=1).record("videasy", "down")
+    sleeps = []
+    monkeypatch.setattr(m.time, "sleep", sleeps.append)
+
+    status, result = m.process_tmdb_id("42", providers=P3)
+
+    assert status == "deferred" and result["providers"] == ["videasy"]
+    assert seen["order"].count("vidup") == 1, "不重试，也不走判死二次确认"
+    assert sleeps == []
+
+
+def test_other_provider_url_is_ok_while_one_is_down(monkeypatch):
+    _install_fake_session(monkeypatch, vidup_streams=[{"url": "https://up/m.m3u8", "title": "T"}])
+    _use_breaker(monkeypatch, trip=1).record("videasy", "down")
+    status, result = m.process_tmdb_id("42", providers=P3)
+    assert status == "ok"
+    assert [u["provider"] for u in result["urls"]] == ["vidup"]
+
+
+def test_transient_on_a_live_provider_still_retries_while_one_is_down(monkeypatch):
+    _install_fake_session(monkeypatch, vidup_page_status=404,
+                          vidlink_resp=_FakeResp(500, text="oops"))
+    _use_breaker(monkeypatch, trip=1).record("videasy", "down")
+    assert m.process_tmdb_id("42", providers=P3) == ("retry", None)
+
+
+def test_breaker_tripping_during_dead_confirm_defers_instead_of_killing(monkeypatch):
+    """首次全家无源只算疑似；确认前 videasy 熔断了——没问到它就绝不能判死。"""
+    seen = _install_fake_session(monkeypatch, vidup_page_status=404)
+    b = _use_breaker(monkeypatch, trip=1)
+    monkeypatch.setattr(m, "DEAD_CONFIRM", True)
+    monkeypatch.setattr(m.time, "sleep", lambda _s: b.record("videasy", "down"))
+
+    status, result = m.process_tmdb_id("42", providers=P3)
+
+    assert status == "deferred" and result["providers"] == ["videasy"]
+    assert seen["order"].count("vidup") == 2
+
+
+def test_probe_call_brings_the_provider_back(monkeypatch):
+    clock = _Clock()
+    _install_fake_session(monkeypatch, vidup_page_status=404)   # videasy 正常作答"无此片"
+    b = _use_breaker(monkeypatch, trip=1, interval=600, clock=clock)
+    b.record("videasy", "down")
+    assert m.process_tmdb_id("1", providers=P3)[0] == "deferred"
+
+    clock.t += 600
+    status, _ = m.process_tmdb_id("2", providers=P3)
+
+    assert not b.is_down("videasy")
+    assert status == "dead", "恢复后三家都答过无源，才走正常判死"
+
+
+def test_interrupted_probe_releases_the_probe_slot(monkeypatch):
+    """试探被 BaseException 打断也要释放"试探中"标记，否则这个源永远熔断下去。"""
+    clock = _Clock()
+    b = _use_breaker(monkeypatch, trip=1, interval=600, clock=clock)
+    b.record("videasy", "down")
+    clock.t += 600
+
+    def interrupted(session, tid):
+        raise KeyboardInterrupt
+
+    monkeypatch.setitem(m.PROVIDERS, "videasy", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        m._call_provider("videasy", None, "42")
+    assert b.allow("videasy") == "probe"
+
+
+def test_all_providers_answering_nosource_is_still_dead(monkeypatch):
+    _install_fake_session(monkeypatch, vidup_page_status=404)
+    _use_breaker(monkeypatch, trip=1)
+    assert m.process_tmdb_id("42", providers=P3) == ("dead", None)
+
+
+# ------------------------------------------------- 直连分流（B1 enc-dec / B2 vidlink）
+
+def _enable_direct(monkeypatch, encdec=True, vidlink=True, clock=None):
+    clock = clock or _Clock()
+    monkeypatch.setattr(m, "ENCDEC_ROUTE", m._DirectRoute("enc-dec", encdec, 600, clock))
+    monkeypatch.setattr(m, "VIDLINK_ROUTE", m._DirectRoute("vidlink", vidlink, 600, clock))
+    return clock
+
+
+def _routes(seen, needle):
+    return [route for url, route in seen["routes"] if needle in url]
+
+
+def test_encdec_and_vidlink_go_direct_while_sites_stay_on_proxy(monkeypatch):
+    _enable_direct(monkeypatch)
+    seen = _install_fake_session(
+        monkeypatch,
+        vidup_streams=[{"url": "https://up/m.m3u8", "title": "T"}],
+        vidlink_resp=_FakeResp(200, _VIDLINK_OK),
+        videasy_sources=_FakeResp(200, text="PAYLOAD"),
+    )
+    assert m.process_tmdb_id("42", providers=P3)[0] == "ok"
+    assert set(_routes(seen, m.API)) == {"direct"}
+    assert set(_routes(seen, "vidlink.pro")) == {"direct"}
+    assert set(_routes(seen, "vidup.to")) == {"proxy"}            # 机房 IP 会被拦
+    assert set(_routes(seen, "https://x/")) == {"proxy"}          # vidup 站内 stage1/servers/stream
+    assert set(_routes(seen, m.VIDEASY_HOST)) == {"proxy"}
+
+
+def test_direct_disabled_keeps_everything_on_proxy(monkeypatch):
+    _enable_direct(monkeypatch, encdec=False, vidlink=False)
+    seen = _install_fake_session(monkeypatch, vidup_streams=[{"url": "https://up/m.m3u8"}],
+                                 vidlink_resp=_FakeResp(200, _VIDLINK_OK))
+    assert m.process_tmdb_id("42", providers=["vidup", "vidlink"])[0] == "ok"
+    assert {route for _, route in seen["routes"]} == {"proxy"}
+
+
+def test_rejected_direct_request_is_resent_via_proxy_then_cools_down(monkeypatch):
+    clock = _enable_direct(monkeypatch)
+
+    def reject_encdec(method, url):
+        return _FakeResp(429, text="Too Many Requests") if url.startswith(m.API) else None
+
+    seen = _install_fake_session(monkeypatch, vidlink_resp=_FakeResp(200, _VIDLINK_OK),
+                                 direct_hook=reject_encdec)
+
+    assert m.process_tmdb_id("42", providers=["vidlink"])[0] == "ok", "被拒的请求改走代理，片子不白丢"
+    assert _routes(seen, "/enc-vidlink") == ["direct", "proxy"]
+    assert m.ENCDEC_ROUTE.fallbacks == 1
+
+    seen["routes"].clear()
+    m.process_tmdb_id("43", providers=["vidlink"])
+    assert _routes(seen, "/enc-vidlink") == ["proxy"], "冷却期内 enc-dec 直接走代理"
+    assert _routes(seen, "vidlink.pro") == ["direct"], "冷却只管被拒的那一类"
+
+    clock.t += 600
+    seen["routes"].clear()
+    m.process_tmdb_id("44", providers=["vidlink"])
+    assert _routes(seen, "/enc-vidlink") == ["direct", "proxy"], "冷却结束重新试直连"
+
+
+def test_vidlink_api_403_on_direct_falls_back_to_proxy(monkeypatch):
+    _enable_direct(monkeypatch)
+    seen = _install_fake_session(
+        monkeypatch, vidlink_resp=_FakeResp(200, _VIDLINK_OK),
+        direct_hook=lambda method, url: _FakeResp(403, text="blocked") if "vidlink.pro" in url else None,
+    )
+    assert m.process_tmdb_id("42", providers=["vidlink"])[0] == "ok"
+    assert _routes(seen, "vidlink.pro") == ["direct", "proxy"]
+    assert (m.VIDLINK_ROUTE.fallbacks, m.ENCDEC_ROUTE.fallbacks) == (1, 0)
+
+
+def test_direct_timeout_is_transient_and_not_resent_via_proxy(monkeypatch):
+    _enable_direct(monkeypatch)
+
+    def time_out(method, url):
+        if url.startswith(m.API):
+            raise TimeoutError("curl: (28) Operation timed out")
+        return None
+
+    seen = _install_fake_session(monkeypatch, vidlink_resp=_FakeResp(200, _VIDLINK_OK),
+                                 direct_hook=time_out)
+    assert m.process_tmdb_id("42", providers=["vidlink"]) == ("retry", None)
+    assert set(_routes(seen, m.API)) == {"direct"}
+    assert m.ENCDEC_ROUTE.fallbacks == 0
+
+
+def test_dead_confirm_attempt_runs_entirely_through_proxy(monkeypatch):
+    """只在直连路径上出现的"无此片"（比如对机房 IP 返回 null）不能单独把片判死。"""
+    _enable_direct(monkeypatch)
+    monkeypatch.setattr(m, "DEAD_CONFIRM", True)
+    seen = _install_fake_session(monkeypatch)        # vidlink 默认 null → 无源
+    assert m.process_tmdb_id("42", providers=["vidlink"]) == ("dead", None)
+    assert _routes(seen, "/enc-vidlink") == ["direct", "proxy"]
+    assert _routes(seen, "vidlink.pro") == ["direct", "proxy"]
+
+
+@pytest.mark.parametrize("status,text,encdec,rejected", [
+    (429, "", False, True),
+    (403, "", True, True),
+    (200, '{"status": 429, "error": "oop! too many requests"}', True, True),
+    (200, '{"title": "Too Many Requests"}', False, False),   # vidlink 正常作答的正文
+    (500, "oops", True, False),
+    (500, "Too Many Requests", False, True),
+])
+def test_direct_rejection_detection(status, text, encdec, rejected):
+    route = m.ENCDEC_ROUTE if encdec else m.VIDLINK_ROUTE
+    assert m._rejects_direct(_FakeResp(status, text=text), route) is rejected
+
+
+def test_provider_functions_still_accept_a_plain_session(monkeypatch):
+    """探测脚本直接拿普通 Session 调 provider，分流层不能成为必需品。"""
+    _install_fake_session(monkeypatch, vidlink_resp=_FakeResp(200, _VIDLINK_OK))
+    urls, _, _ = m._fetch_vidlink(m.requests.Session(), "42")
+    assert urls[0]["url"] == "https://link/a.mp4"
+
+
+# ------------------------------------------------- 推迟名单与多轮
+
+def test_run_batch_records_deferred_outside_retry_and_fail(tmp_path, monkeypatch):
+    results, fail = tmp_path / "results.jsonl", tmp_path / "fail.txt"
+    outcomes = {"1": ("deferred", {"tmdbId": "1", "providers": ["videasy"]}),
+                "2": ("retry", None)}
+    monkeypatch.setattr(m, "process_tmdb_id", lambda tid, providers=None: outcomes[tid])
+    deferred, got = {}, []
+
+    retry = m.run_batch(["1", "2"], results, fail, max_workers=2, on_result=got.append,
+                        deferred=deferred)
+
+    assert retry == ["2"]
+    assert deferred == {"1": ["videasy"]}
+    assert got == [] and not fail.exists(), "推迟的片不进下载队列，更不能写 fail.txt"
+
+
+def test_run_batch_without_a_deferred_dict_treats_deferred_as_retry(tmp_path, monkeypatch):
+    results, fail = tmp_path / "results.jsonl", tmp_path / "fail.txt"
+    monkeypatch.setattr(m, "process_tmdb_id",
+                        lambda tid, providers=None: ("deferred", {"tmdbId": tid, "providers": ["v"]}))
+    assert m.run_batch(["1"], results, fail, max_workers=1) == ["1"]
+    assert not fail.exists()
+
+
+@pytest.fixture
+def fetch_dir(tmp_path, monkeypatch):
+    """把主流程读写的文件全指到临时目录，ids = 1 2 3。"""
+    monkeypatch.setattr(m, "resolve_file", lambda value, default: tmp_path / default)
+    monkeypatch.setattr(m, "FETCH_LOCK_FILE", str(tmp_path / "fetch.lock"))
+    monkeypatch.setattr(m.time, "sleep", lambda *_: None)
+    (tmp_path / "ids.txt").write_text("1\n2\n3\n")
+    return tmp_path
+
+
+def test_main_keeps_deferred_out_of_later_rounds_and_lists_them(fetch_dir, monkeypatch):
+    _use_breaker(monkeypatch, trip=1).record("videasy", "down")
+    calls = []
+
+    def fake(tid, providers=None):
+        calls.append(tid)
+        if tid == "1":
+            return "deferred", {"tmdbId": "1", "providers": ["videasy"]}
+        if tid == "2":
+            return "ok", {"tmdbId": "2", "urls": [], "title": "T"}
+        return ("retry", None) if calls.count("3") == 1 else ("dead", None)
+
+    monkeypatch.setattr(m, "process_tmdb_id", fake)
+    m.main([])
+
+    assert calls.count("1") == 1, "推迟的片不该进后续轮次"
+    assert calls.count("3") == 2
+    assert (fetch_dir / "provider_down.txt").read_text() == "1\tvideasy\n"
+    assert (fetch_dir / "unresolved.txt").read_text() == ""
+    processed = m.load_processed_ids(fetch_dir / "results.jsonl", fetch_dir / "fail.txt")
+    assert "1" not in processed, "下次运行要自动重查"
+
+
+def test_main_requeues_deferred_films_once_the_provider_recovers(fetch_dir, monkeypatch):
+    b = _use_breaker(monkeypatch, trip=1)
+    b.record("videasy", "down")
+    calls = []
+
+    def fake(tid, providers=None):
+        calls.append(tid)
+        if tid == "1" and calls.count("1") == 1:
+            return "deferred", {"tmdbId": "1", "providers": ["videasy"]}
+        if tid == "3" and calls.count("3") == 1:
+            b.record("videasy", "up")            # 本轮里试探成功，videasy 恢复
+            return "retry", None
+        return "ok", {"tmdbId": tid, "urls": [], "title": "T"}
+
+    monkeypatch.setattr(m, "process_tmdb_id", fake)
+    m.main([])
+
+    assert calls.count("1") == 2, "源恢复后推迟的片要放回下一轮"
+    assert (fetch_dir / "provider_down.txt").read_text() == ""
+
+
+def test_refetch_mode_leaves_provider_down_list_alone(fetch_dir, monkeypatch):
+    (fetch_dir / "provider_down.txt").write_text("9\tvideasy\n")
+    _use_breaker(monkeypatch, trip=1).record("videasy", "down")
+    monkeypatch.setattr(m, "load_refetch_ids", lambda *a, **k: ["1"])
+    monkeypatch.setattr(m, "process_tmdb_id",
+                        lambda tid, providers=None: ("deferred", {"tmdbId": tid, "providers": ["videasy"]}))
+    m.main(["--refetch-failed"])
+    assert (fetch_dir / "provider_down.txt").read_text() == "9\tvideasy\n"
+
+
+def test_write_provider_down_overwrites_and_clears(tmp_path):
+    path = tmp_path / "provider_down.txt"
+    m.write_provider_down(path, {"1": ["videasy"], "2": ["videasy", "vidlink"]})
+    assert path.read_text() == "1\tvideasy\n2\tvideasy,vidlink\n"
+    m.write_provider_down(path, {})
+    assert path.read_text() == ""
+
+
+def test_shipped_config_enables_breaker_and_direct_routes():
+    cfg = m.load_config()
+    assert cfg["provider_breaker"] == {"enabled": True, "trip_after": 30, "probe_interval_minutes": 10}
+    assert cfg["direct"] == {"encdec": True, "vidlink": True, "fallback_cooldown_minutes": 10}
+    assert cfg["provider_down_file"] == "provider_down.txt"
+    assert (m.BREAKER_ENABLED, m.BREAKER_TRIP_AFTER, m.BREAKER_PROBE_INTERVAL) == (True, 30, 600)
+    assert m.DIRECT_FALLBACK_COOLDOWN == 600
+    assert m.ENCDEC_ROUTE.enabled and m.VIDLINK_ROUTE.enabled

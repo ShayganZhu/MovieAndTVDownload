@@ -102,6 +102,11 @@ tmdb_ids_to_links:
   #     也避免两类记录混在一起后再也分不出哪些是真 dead。
   # 每次运行结束覆盖写（含清空），始终只反映最近一次运行的残留。
   unresolved_file: "unresolved.txt"
+  # 因取流源熔断而推迟的 tmdb_id（见下方 provider_breaker）：被问到的源都说无此片，
+  # 但还有源在熔断中、没问到，下不了"无源"的结论。每行 "tid<TAB>熔断中的源"。
+  # 与 unresolved_file 同样不计入"已处理"、下次运行自动重查、每次运行结束覆盖写；
+  # 分开存放是因为成因不同（源挂了 vs 网络不稳），事后要能分开统计。
+  provider_down_file: "provider_down.txt"
   # ---- 闭环修复：重取下载侧判定“直链已失效”的影片 ----
   # vidlink 出的是带时效签名的 mp4 直链，过期后下载侧拿到 403/410，判死并写进
   # download_movies.failed_log。但那些 id 当初取流是成功的、已在 results.jsonl 里，
@@ -197,6 +202,32 @@ tmdb_ids_to_links:
     # port_range: [9000, 9050]
     # 与 dataedpt 的差异：proxyrack 靠「随机端口」换出口 IP，故需 9000-9050 的范围；
     # dataedpt 由网关自动轮换，单端口即可。两者同为 HTTP 协议，build_proxy() 无需改动。
+  # ---- 取流源熔断 ----
+  # 2026-10-23 起 videasy 的接口对所有来源一律返回 Cloudflare 封禁页。它的 403 按瞬时
+  # 错误处理，凡是 vidup / vidlink 都说无源的片永远判不了死，每部 3 次 × 8 轮空转后
+  # 落进 unresolved，下次启动接着空转（24 号机实测：3 小时判死 0 部，约 69% 的取流
+  # 尝试花在这上面）。熔断后：
+  #   - 不再调用该源，每 probe_interval_minutes 分钟放一部片去试探，拿到结果或"无此片"即恢复；
+  #   - 其余源都说无此片的片记为"推迟"：不重试、**不判死**（没问到所有源），
+  #     写 provider_down_file；本次运行中源恢复了就在下一轮放回重查。
+  # 只看各源第一跳（vidup/vidfast 页面、videasy seed、vidlink 接口）的 403/451/502/503/52x；
+  # 超时、429、enc-dec 出错不计数——那多半是代理出口或共用服务的问题，不代表源挂了。
+  provider_breaker:
+    enabled: true
+    trip_after: 30              # 连续多少次"整体不可用"才熔断；个别被拉黑的出口凑不满
+    probe_interval_minutes: 10
+  # ---- 直连分流 ----
+  # 代理网关在新加坡（24 号机往返 230ms），经它的请求中位 1.2–5.4 秒、约 8% 在 12 秒内
+  # 超时；直连只要 0.2 秒。2026-10-24 在 24 号机实测：enc-dec.app 直连 40 次全 200、
+  # 未被限流（README 标注限流 40 次/秒）；vidlink 整条链路直连 4/4 部正常（0.3 秒 vs
+  # 走代理 6–8 秒）。vidup.to 对机房 IP 返回 403，仍走代理。
+  # 直连被拒（403/429/限流文案）时同一请求立刻改走代理重发，这一类请求在
+  # fallback_cooldown_minutes 分钟内都走代理；超时不回退（换代理解决不了）。
+  # 判死二次确认那一跳全部走代理，防止只在直连路径上出现的"无此片"把片判死。
+  direct:
+    encdec: true                # enc-dec.app 加解密接口
+    vidlink: true               # vidlink.pro（enc 在 enc-dec，接口在 vidlink.pro）
+    fallback_cooldown_minutes: 10
 
 
 # ----------------------------------------------------------------------------

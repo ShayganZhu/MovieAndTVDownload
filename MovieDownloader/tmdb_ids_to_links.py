@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import threading
 
 import yaml
@@ -290,8 +290,254 @@ def _is_retriable(exc):
     return not isinstance(exc, NoSource)
 
 
+# ---------- 取流源熔断（A1）----------
+# 2026-10-23 起 videasy 的接口 api.wecollege.net 对所有来源一律返回 Cloudflare 封禁页。
+# 它的 403 按瞬时错误处理，结果凡是 vidup / vidlink 都说无源的片永远判不了死：
+# 每部 3 次 × 8 轮空转后落进 unresolved.txt，下次启动接着空转（24 号机实测 3 小时
+# 判死 0 部、约 69% 的取流尝试花在这上面）。熔断器认出"整个源不可用"后暂停调用它，
+# 只因它缺席而无法下结论的片记为 deferred，另记名单、等它恢复后再查——
+# 既不空转，也不因为少问了一家就把片判死。
+_BREAKER_CFG = _CFG.get("provider_breaker") or {}
+BREAKER_ENABLED = bool(_BREAKER_CFG.get("enabled", True))
+BREAKER_TRIP_AFTER = max(1, int(_BREAKER_CFG.get("trip_after", 30)))
+BREAKER_PROBE_INTERVAL = max(1.0, float(_BREAKER_CFG.get("probe_interval_minutes", 10)) * 60)
+
+# 各家的第一跳（源站自己的接口，不含 enc-dec）。只有这一步被拒才说明"整个源不可用"；
+# 后面环节的错误多半只关乎某部片或某个 server。enc-dec 是三家共用的服务，它坏了
+# 不能算到任何一家头上（那由轮间的 outage 退避处理）。
+_PROVIDER_ENTRY = {"vidup": "page", "vidfast": "page", "videasy": "videasy-seed",
+                   "vidlink": "vidlink-api"}
+# 封禁 / 源站整体故障的状态码。429 不在内：videasy 的 seed 对单个出口限流很紧，
+# 那是"这个出口问太快"，换个 IP 就好，不代表整个源挂了。
+_OUTAGE_STATUSES = frozenset({403, 451, 502, 503}) | frozenset(range(520, 531))
+
+
+class ProviderDown(Exception):
+    """该源正处于熔断中，本次没有调用它。既不是无源证据，也不该触发重试。"""
+
+
+def _breaker_outcome(name, exc):
+    """把一次 provider 调用的结局归成熔断器认识的三类：
+
+      "up"   源站正常作答（拿到结果或明确说无此片）→ 连续计数清零 / 熔断恢复；
+      "down" 第一跳被封禁或源站整体故障 → 连续计数 +1；
+      None   其余（超时、个别 server 出错、enc-dec 出错……）→ 不加也不清，
+             超时多半是代理出口的问题，不能拿来判断源的死活。
+    """
+    if exc is None or isinstance(exc, NoSource):
+        return "up"
+    if (isinstance(exc, HttpStatusError) and exc.where == _PROVIDER_ENTRY.get(name)
+            and exc.status in _OUTAGE_STATUSES):
+        return "down"
+    return None
+
+
+class ProviderBreaker:
+    """按源熔断：连续 trip_after 次"整体不可用"即暂停调用，每 probe_interval 秒放一部片
+    去试探，试探拿到结果或"无此片"就恢复。全进程共用一份（取流主流程、pipeline 的
+    派发前重取、下载侧的就地重取都走 process_tmdb_id），线程安全。"""
+
+    def __init__(self, trip_after=BREAKER_TRIP_AFTER, probe_interval=BREAKER_PROBE_INTERVAL,
+                 enabled=BREAKER_ENABLED, clock=time.monotonic):
+        self.trip_after = trip_after
+        self.probe_interval = probe_interval
+        self.enabled = enabled
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._state = {}
+
+    def _st(self, name):
+        return self._state.setdefault(name, {"streak": 0, "open": False, "next_probe": 0.0,
+                                             "probing": False, "skipped": 0, "trips": 0})
+
+    def allow(self, name):
+        """返回 "call"（正常调用）、"probe"（熔断中、由本次调用试探）或 "skip"（跳过）。"""
+        if not self.enabled:
+            return "call"
+        with self._lock:
+            st = self._st(name)
+            if not st["open"]:
+                return "call"
+            if not st["probing"] and self._clock() >= st["next_probe"]:
+                st["probing"] = True
+                return "probe"
+            st["skipped"] += 1
+            return "skip"
+
+    def record(self, name, outcome, probe=False, detail=""):
+        if not self.enabled:
+            return
+        message = None
+        with self._lock:
+            st = self._st(name)
+            if probe:
+                st["probing"] = False
+            if outcome == "up":
+                st["streak"] = 0
+                if st["open"]:
+                    st["open"] = False
+                    message = (f"[取流源熔断] {name} 已恢复（{'试探' if probe else '在途请求'}拿到正常响应），"
+                               f"重新调用；熔断期间跳过 {st['skipped']} 次")
+                    st["skipped"] = 0
+            elif outcome == "down":
+                if st["open"]:
+                    if probe:
+                        st["next_probe"] = self._clock() + self.probe_interval
+                        message = (f"[取流源熔断] {name} 试探仍不可用（{detail}），"
+                                   f"{self.probe_interval / 60:g} 分钟后再试")
+                else:
+                    st["streak"] += 1
+                    if st["streak"] >= self.trip_after:
+                        st["open"] = True
+                        st["trips"] += 1
+                        st["next_probe"] = self._clock() + self.probe_interval
+                        message = (f"[取流源熔断] {name} 连续 {st['streak']} 次整体不可用"
+                                   f"（最近一次：{detail}），暂停调用；"
+                                   f"每 {self.probe_interval / 60:g} 分钟用一部片试探")
+            elif probe and st["open"]:
+                # 试探撞上超时之类的中性结局：说明不了死活，下一个调用马上再试探。
+                st["next_probe"] = self._clock()
+        if message:
+            print(message, flush=True)
+
+    def is_down(self, name):
+        with self._lock:
+            return bool(self._state.get(name, {}).get("open"))
+
+    def summary(self):
+        """熔断中的源及其跳过次数，供轮次小结打印；没有熔断时返回空串。"""
+        with self._lock:
+            down = [f"{n}（已跳过 {st['skipped']} 次）" for n, st in sorted(self._state.items())
+                    if st["open"]]
+        return f"熔断中：{'、'.join(down)}" if down else ""
+
+
+PROVIDER_BREAKER = ProviderBreaker()
+
+
+def _call_provider(name, net, tmdb_id):
+    """调一家 provider，并把结局报给熔断器。熔断中直接抛 ProviderDown。"""
+    gate = PROVIDER_BREAKER.allow(name)
+    if gate == "skip":
+        raise ProviderDown(name)
+    outcome, detail = None, ""
+    try:
+        out = PROVIDERS[name](net, tmdb_id)
+        outcome = "up"
+        return out
+    except Exception as exc:  # noqa: BLE001
+        outcome, detail = _breaker_outcome(name, exc), str(exc)[:80]
+        raise
+    finally:
+        # finally 而不是只在 except 里报：试探被 BaseException 打断时也要释放
+        # "试探中"标记，否则这个源再也不会被试探、永远熔断下去。
+        PROVIDER_BREAKER.record(name, outcome, probe=gate == "probe", detail=detail)
+
+
+# ---------- 直连分流（B1 enc-dec / B2 vidlink）----------
+# 取流请求原本全走住宅代理。代理网关在新加坡（24 号机往返 230ms），经它的请求中位
+# 1.2–5.4 秒、约 8% 在 12 秒内超时；直连只要 0.2 秒。enc-dec.app 与 vidlink 整条
+# 链路实测直连可用（2026-10-24，24 号机）；vidup.to 对机房 IP 返回 403，必须走代理。
+# 直连被拒（403/429/限流文案）时，同一请求立刻改走代理重发，并让这一类请求冷却一段
+# 时间都走代理，不让一部片因此白丢一次尝试。超时不回退：直连超时说明对方本身有问题，
+# 换代理解决不了，照常按瞬时错误处理。
+_DIRECT_CFG = _CFG.get("direct") or {}
+DIRECT_FALLBACK_COOLDOWN = max(0.0, float(_DIRECT_CFG.get("fallback_cooldown_minutes", 10)) * 60)
+
+
+class _DirectRoute:
+    """一类可以直连的请求。线程安全；fallbacks / served 供统计。"""
+
+    def __init__(self, name, enabled, cooldown=DIRECT_FALLBACK_COOLDOWN, clock=time.monotonic):
+        self.name = name
+        self.enabled = enabled
+        self.cooldown = cooldown
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._until = 0.0
+        self.served = 0
+        self.fallbacks = 0
+
+    def use_direct(self):
+        if not self.enabled:
+            return False
+        with self._lock:
+            return self._clock() >= self._until
+
+    def note_served(self):
+        with self._lock:
+            self.served += 1
+
+    def note_rejected(self, status):
+        with self._lock:
+            self.fallbacks += 1
+            first = self._clock() >= self._until
+            self._until = self._clock() + self.cooldown
+        if first:
+            print(f"[直连回退] {self.name} 直连被拒（HTTP {status}），"
+                  f"接下来 {self.cooldown / 60:g} 分钟改走代理", flush=True)
+
+
+ENCDEC_ROUTE = _DirectRoute("enc-dec", bool(_DIRECT_CFG.get("encdec", False)))
+VIDLINK_ROUTE = _DirectRoute("vidlink", bool(_DIRECT_CFG.get("vidlink", False)))
+
+
+def _route_for(url):
+    if url.startswith(API):
+        return ENCDEC_ROUTE
+    host = urlsplit(url).hostname or ""
+    if host == "vidlink.pro" or host.endswith(".vidlink.pro"):
+        return VIDLINK_ROUTE
+    return None
+
+
+def _rejects_direct(resp, route):
+    """直连是否被对方拒绝（而不是正常作答）。enc-dec 的限流可能以 200 + 文案出现。"""
+    if resp.status_code in (403, 429):
+        return True
+    if resp.status_code < 400 and route is not ENCDEC_ROUTE:
+        return False
+    text = (resp.text or "")[:300].lower()
+    return "too many requests" in text or "rate limit" in text
+
+
+class _Net:
+    """一次尝试用的两条线路：住宅代理与本机直连，按网址分流。provider 照常调
+    get/post，不感知分流；传入普通 Session 的老调用方（探测脚本）行为不变。
+
+    allow_direct=False 时全部走代理：判死二次确认那一跳用它，免得只在直连路径上
+    出现的"无此片"（比如对机房 IP 返回 null）把片判死。"""
+
+    def __init__(self, proxied, direct=None, allow_direct=True):
+        self.proxied = proxied
+        self.direct = direct if allow_direct else None
+
+    def get(self, url, **kwargs):
+        return self._send("get", url, kwargs)
+
+    def post(self, url, **kwargs):
+        return self._send("post", url, kwargs)
+
+    def _send(self, method, url, kwargs):
+        route = _route_for(url) if self.direct is not None else None
+        if route is not None and route.use_direct():
+            resp = getattr(self.direct, method)(url, **kwargs)
+            if not _rejects_direct(resp, route):
+                route.note_served()
+                return resp
+            route.note_rejected(resp.status_code)
+        return getattr(self.proxied, method)(url, **kwargs)
+
+
+def _direct_summary():
+    parts = [f"{r.name} 直连 {r.served} 次、回退代理 {r.fallbacks} 次"
+             for r in (ENCDEC_ROUTE, VIDLINK_ROUTE) if r.enabled]
+    return "直连：" + "；".join(parts) if parts else ""
+
+
 # ---------- 取流源（provider）----------
 # 每个 provider 的签名：fn(session, tmdb_id) -> (urls, title, captions)
+#   session  只用 get/post；process_tmdb_id 传的是按网址分流的 _Net，探测脚本可传普通 Session
 #   urls     非空列表，每项 {url, provider, type("m3u8"|"mp4"), headers, quality, size}
 #   title    源站给的片名，可为 None
 #   captions 源站附带的外挂字幕列表，每项 {url, language, type}；无字幕时为 []
@@ -874,33 +1120,40 @@ ACTIVE_PROVIDERS = _resolve_providers(_CFG.get("providers") or DEFAULT_PROVIDERS
 def process_tmdb_id(tmdb_id, providers=None):
     """处理单个 TMDB ID，仅对瞬时错误重试。
 
-    返回 (status, 结果字典或None)，status 三态供多轮捞回区分：
-      - "ok"    成功，附结果字典 {urls, tmdbId, title, fetched_at, + movies.jsonl 静态元数据}
-      - "dead"  确认真无源（NoSource）→ 永久排除，绝不再抓
-      - "retry" 瞬时错误换 IP 重试 MAX_RETRIES 次仍失败 → 下一轮重跑
+    返回 (status, 结果字典或None)，status 四态供多轮捞回区分：
+      - "ok"       成功，附结果字典 {urls, tmdbId, title, fetched_at, + movies.jsonl 静态元数据}
+      - "dead"     确认真无源（NoSource）→ 永久排除，绝不再抓
+      - "retry"    瞬时错误换 IP 重试 MAX_RETRIES 次仍失败 → 下一轮重跑
+      - "deferred" 被调用的源都说无此片，但有源正处于熔断、没问到 → 附 {tmdbId, providers}，
+                   不重试、不判死，另记名单，等那个源恢复后再查（见 ProviderBreaker）
 
     多源：同一次尝试内按 providers 顺序逐家取流，把各家给出的 url 全部汇总
     （按 url 去重、保持 providers 顺序），下载侧按节点顺序逐个尝试，某家的流
     画质/码率不达标时还能落到下一家；有任一家给出 url 即 ok。
     全部跑完仍无 url 时，只要有任一家是瞬时错误就按瞬时处理（重试），
-    全部 NoSource 才算一次"疑似无源"。
+    全部 NoSource 才算一次"疑似无源"——熔断中没问到的源不算答过，故只要有源被
+    跳过就绝不判死。
 
     判死二次确认（DEAD_CONFIRM）：首次全家 NoSource 不立即判死，换 IP 再完整跑一次，
     累计两次全家 NoSource 才返回 dead；确认过程最多多花 1 次尝试（总尝试数 ≤ MAX_RETRIES+1）。
     若确认那次是瞬时错误且尝试已耗尽，返回 retry 交给下一轮（宁可多试，不误判永久丢片）。
+    确认那一跳全部走代理，不走直连（见 _Net）。
     """
     providers = list(ACTIVE_PROVIDERS if providers is None else providers)
     attempt = 0
     nosource_hits = 0
     while True:
         attempt += 1
-        # 每个 id、每次重试用一个独立 Session：
+        # 每个 id、每次重试用一组独立 Session：
         # - session 内部复用 TCP/TLS 连接，减少同一 id 内多次请求的握手开销；
-        # - session 绑定本次 build_proxy() 的随机出口 IP，作用域仅限本次尝试。
-        with requests.Session(impersonate="chrome") as session:
+        # - 代理 session 绑定本次 build_proxy() 的随机出口 IP，作用域仅限本次尝试；
+        # - 直连 session 只承载 enc-dec / vidlink（见 _Net），不走代理时用不上。
+        with requests.Session(impersonate="chrome") as session, \
+                requests.Session(impersonate="chrome") as direct:
             proxy = build_proxy()
             if proxy:
                 session.proxies = proxy
+            net = _Net(session, direct if proxy else None, allow_direct=nosource_hits == 0)
             try:
                 urls = []
                 seen_urls = set()
@@ -908,10 +1161,14 @@ def process_tmdb_id(tmdb_id, providers=None):
                 result_captions = []
                 nosource_errors = []
                 transient_errors = []
+                down_providers = []
                 for name in providers:
                     try:
                         provider_urls, provider_title, provider_captions = \
-                            PROVIDERS[name](session, tmdb_id)
+                            _call_provider(name, net, tmdb_id)
+                    except ProviderDown:
+                        down_providers.append(name)
+                        continue
                     except NoSource as e:
                         nosource_errors.append(f"{name}: {e}")
                         continue
@@ -972,6 +1229,10 @@ def process_tmdb_id(tmdb_id, providers=None):
 
                 if transient_errors:
                     raise Exception(f"All providers failed for {tmdb_id}: {transient_errors}")
+                if down_providers:
+                    # 问到的源都说无此片，但还有源在熔断中没问到：这时下不了"无源"的结论，
+                    # 再重试也只是空转（它恢复前每次都一样），交给上层另记名单。
+                    return "deferred", {"tmdbId": tmdb_id, "providers": down_providers}
                 raise NoSource("; ".join(nosource_errors))
 
             except Exception as e:  # noqa: BLE001
@@ -1072,6 +1333,7 @@ def load_processed_ids(results_file, fail_file):
 
     刻意**不含** unresolved_file：那里面是"多轮跑满仍是瞬时错误"的 ID，
     从未被判定为 NoSource，下次重跑必须自动重试（见 run_all 的写入处注释）。
+    provider_down_file（因源熔断推迟的片）同理，也不含。
     """
     processed = set()
     if results_file.exists():
@@ -1096,12 +1358,15 @@ def load_processed_ids(results_file, fail_file):
 
 
 def run_batch(to_process, results_file, fail_file, max_workers, providers=None,
-              on_result=None, stop_event=None):
+              on_result=None, stop_event=None, deferred=None):
     """并发处理一批 ID，实时落盘 ok/dead，返回本批"瞬时耗尽"待重跑的 ID 列表。
 
-      - "ok"    → 追加写 results_file（output）
-      - "dead"  → 追加写 fail_file，永久排除
-      - "retry" → 不落盘，收集返回，交给上层多轮循环下一轮重跑
+      - "ok"       → 追加写 results_file（output）
+      - "dead"     → 追加写 fail_file，永久排除
+      - "retry"    → 不落盘，收集返回，交给上层多轮循环下一轮重跑
+      - "deferred" → 记进 deferred（{tid: [熔断中的源]}），不进下一轮、不落 fail_file，
+                     由上层在源恢复后放回或写进 provider_down 名单。
+                     不传 deferred 时按 retry 处理（老调用方的语义不变）。
 
     on_result（可选，§12 pipeline 模式用）：取到一条 ok 结果时回调一次，
     让下游（下载侧）立刻拿到它，而不必等整轮跑完再读文件。
@@ -1120,6 +1385,7 @@ def run_batch(to_process, results_file, fail_file, max_workers, providers=None,
     lock = threading.Lock()
     ok_count = 0
     dead_count = 0
+    deferred_count = 0
     retry_ids = []
     skipped = 0
 
@@ -1140,6 +1406,15 @@ def run_batch(to_process, results_file, fail_file, max_workers, providers=None,
             elif status == "retry":
                 retry_ids.append(tid)
                 print(f"🔁 RETRY-LATER: {tid}")
+            elif status == "deferred":
+                # ⚠️ 必须排在下面的兜底分支之前：兜底会写 fail_file 永久排除，
+                # 而推迟的片从未被所有源判过无源。
+                down = (result or {}).get("providers") or []
+                if deferred is None:
+                    retry_ids.append(tid)
+                else:
+                    deferred[tid] = down
+                print(f"⏸️ DEFERRED: {tid}（{','.join(down) or '?'} 熔断中，其余源无此片）")
             else:  # "dead" 或异常兜底
                 with open(fail_file, 'a', encoding='utf-8') as f:
                     f.write(f"{tid}\n")
@@ -1170,6 +1445,8 @@ def run_batch(to_process, results_file, fail_file, max_workers, providers=None,
                     ok_count += 1
                 elif status in ("retry", "skipped"):
                     pass  # 已收集进 retry_ids
+                elif status == "deferred":
+                    deferred_count += 1
                 else:
                     dead_count += 1
                 if status == "skipped":
@@ -1184,7 +1461,11 @@ def run_batch(to_process, results_file, fail_file, max_workers, providers=None,
     executor.shutdown(wait=True)
 
     print(f"\n本批完成 | 成功 {ok_count} | 真无源 {dead_count} | 待重跑 {len(retry_ids)}"
+          + (f" | 推迟（源熔断） {deferred_count}" if deferred_count else "")
           + (f" | 因停止信号跳过 {skipped}" if skipped else ""))
+    health = "；".join(s for s in (PROVIDER_BREAKER.summary(), _direct_summary()) if s)
+    if health:
+        print(f"   {health}")
     return retry_ids
 
 
@@ -1226,8 +1507,14 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
     results_file = resolve_file(_CFG.get("output"), "results.jsonl")
     fail_file = resolve_file(_CFG.get("fail_file"), "fail.txt")
     unresolved_file = resolve_file(_CFG.get("unresolved_file"), "unresolved.txt")
+    provider_down_file = resolve_file(_CFG.get("provider_down_file"), "provider_down.txt")
 
     print(f"取流源: {', '.join(providers)}")
+    print(f"[取流源熔断] {'开启' if PROVIDER_BREAKER.enabled else '关闭'}"
+          + (f"：连续 {PROVIDER_BREAKER.trip_after} 次整体不可用即暂停，"
+             f"每 {PROVIDER_BREAKER.probe_interval / 60:g} 分钟试探一次" if PROVIDER_BREAKER.enabled else ""))
+    direct_on = [r.name for r in (ENCDEC_ROUTE, VIDLINK_ROUTE) if r.enabled]
+    print(f"[直连] {'、'.join(direct_on) + ' 直连（被拒时回退代理）' if direct_on and USE_PROXY else '全部走代理'}")
 
     if args.refetch_failed:
         # 闭环修复模式：只处理下载侧判定"直链已失效、需重新取流"的片。
@@ -1275,6 +1562,9 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
     pending = to_process
     round_no = 0
     unresolved = []
+    # 因源熔断而推迟的片 {tid: [源]}：不进后续轮次（它恢复前每轮结果都一样），
+    # 每轮结束时把源已恢复的放回下一轮，跑完仍推迟的写进 provider_down_file。
+    deferred = {}
     while pending:
         # 停止信号：下载侧已收工或被 Ctrl+C，别再开新一轮（一轮就是几万个请求）。
         if stop_event is not None and stop_event.is_set():
@@ -1289,20 +1579,25 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
         batch_size = len(pending)
         retry_ids = run_batch(pending, results_file, fail_file, max_workers,
                               providers=providers, on_result=on_result,
-                              stop_event=stop_event)
+                              stop_event=stop_event, deferred=deferred)
+        recovered = _take_recovered(deferred)
+        if recovered:
+            print(f"\n==> 熔断的源已恢复，{len(recovered)} 部之前推迟的片放回下一轮。")
 
-        if not retry_ids:
-            print("\n==> 瞬时失败已清零，所有有源 ID 已捞干净，正常结束。")
+        if not retry_ids and not recovered:
+            print("\n==> 瞬时失败已清零，所有有源 ID 已捞干净，正常结束。"
+                  + (f"（另有 {len(deferred)} 部因源熔断推迟）" if deferred else ""))
             break
         if round_no >= max_rounds:
             # 常规轮次已跑满。这些 ID 从未被判过 NoSource，是被超时/5xx/代理故障
             # 打下来的。不在进程内再做长冷却重试（与下载侧的跨运行重试对齐），
-            # 直接写 unresolved.txt，下次运行自动接力。
-            unresolved = retry_ids
+            # 直接写 unresolved.txt，下次运行自动接力。刚恢复的源还没来得及重查的
+            # 推迟片一并算进去：它们同样没被判过无源。
+            unresolved = retry_ids + recovered
             print(f"\n==> 已达最大轮数 {max_rounds}，剩余 {len(unresolved)} 个瞬时失败 ID "
                   f"写入 {unresolved_file.name}（未判死，下次运行会自动重试）。")
             break
-        pending = retry_ids
+        pending = retry_ids + recovered
 
         # 轮间退避：给 enc-dec / 代理 / 源站的短时故障留恢复窗口。
         # 整批几乎全是"待重跑"时判定为基础设施故障（而非个别片抖动），直接等满上限。
@@ -1337,13 +1632,24 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
     # ⚠️ --refetch-failed 模式下**跳过写入**：该模式只处理 failed.jsonl 里的一小撮
     # 直链过期片，跑完就覆盖 unresolved.txt 会把全量运行留下的残留清单冲掉，
     # 那些 ID 就此失去"下次自动重试"的线索。两种模式的 unresolved 语义不通用。
+    #
+    # 因源熔断推迟的片同理：既不能判死（没问到所有源），也不算已处理，下次运行自动
+    # 重查。单独落 provider_down_file 而不混进 unresolved：两者成因不同（源挂了 vs
+    # 网络不稳），事后要能分开统计。同样覆盖写、--refetch-failed 下不写。
     if args.refetch_failed:
         if unresolved:
             print(f"\n==> 本次重取仍有 {len(unresolved)} 个瞬时失败，"
                   f"未写入 {unresolved_file.name}（避免覆盖全量运行的残留清单）；"
                   f"再跑一次 --refetch-failed 即可继续重试。")
+        if deferred:
+            print(f"\n==> 本次重取有 {len(deferred)} 部因源熔断推迟，"
+                  f"未写入 {provider_down_file.name}。")
     else:
         write_unresolved(unresolved_file, unresolved)
+        write_provider_down(provider_down_file, deferred)
+        if deferred:
+            print(f"\n==> {len(deferred)} 部因源熔断推迟，写入 {provider_down_file.name}"
+                  f"（未判死，下次运行会自动重查）。")
 
     print(f"\nAll done. 共跑 {round_no} 轮，结果已合并写入 {results_file}")
 
@@ -1426,6 +1732,25 @@ def write_unresolved(unresolved_file, ids):
     except OSError as exc:
         # 这只是给人看的残留清单，写不进去不该让整轮取流的成果白费。
         print(f"⚠️ 写 {unresolved_file} 失败（不影响已落盘的结果）: {exc}")
+
+
+def _take_recovered(deferred):
+    """从 deferred 里取出（并删掉）推迟原因已消失的片：它们等的源都不在熔断中了。"""
+    back = [tid for tid, down in deferred.items()
+            if not any(PROVIDER_BREAKER.is_down(name) for name in down)]
+    for tid in back:
+        del deferred[tid]
+    return back
+
+
+def write_provider_down(path, deferred):
+    """覆盖写 provider_down.txt，每行 "tid<TAB>源1,源2"；没有就写空文件（清掉上次的残留）。"""
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            for tid, down in deferred.items():
+                f.write(f"{tid}\t{','.join(down)}\n")
+    except OSError as exc:
+        print(f"⚠️ 写 {path} 失败（不影响已落盘的结果）: {exc}")
 
 
 if __name__ == "__main__":

@@ -197,3 +197,13 @@ def test_cli_entry(machine, capsys):
     out = capsys.readouterr().out
     assert "已完成（已进 R2）2 个" in out and "按 --exclude-dead 排除判死的 3 个" in out
     assert (machine / "rep.jsonl").exists()
+
+
+def test_provider_down_is_its_own_reason(machine):
+    """因取流源熔断推迟的片单独成类（排在 unresolved 前面），每行第二列的源名不影响读取。"""
+    (machine / "provider_down.txt").write_text("9\tvideasy\n10\tvideasy,vidlink\n", encoding="utf-8")
+    summary = r.run(machine)
+    assert summary["remaining"]["provider_down"] == 2
+    assert "fetch_unresolved" not in summary["remaining"]
+    assert "not_fetched" not in summary["remaining"]
+    assert {"9", "10"} <= set(_lines(machine / "ids_remaining.txt"))

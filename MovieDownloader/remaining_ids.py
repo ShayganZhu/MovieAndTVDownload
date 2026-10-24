@@ -46,6 +46,7 @@ REASONS = {
     "download_failed": "取到过链接，下载失败",
     "links_not_downloaded": "取到过链接，还没下载过",
     "no_source": "确认无源（fail.txt）",
+    "provider_down": "有取流源熔断、其余源无此片，待它恢复后再查（provider_down.txt）",
     "fetch_unresolved": "取流多轮仍是瞬时错误（unresolved.txt）",
     "not_fetched": "还没取到链接（没轮到 / 取流瞬时失败）",
 }
@@ -82,6 +83,7 @@ def build_paths(base_dir, ids=None, config=None):
         "results": _resolve(base_dir, fetch.get("output"), "results.jsonl"),
         "fail": _resolve(base_dir, fetch.get("fail_file"), "fail.txt"),
         "unresolved": _resolve(base_dir, fetch.get("unresolved_file"), "unresolved.txt"),
+        "provider_down": _resolve(base_dir, fetch.get("provider_down_file"), "provider_down.txt"),
         "success": _resolve(base_dir, dl.get("success_log"), "success.jsonl"),
         "dead": _resolve(base_dir, dl.get("download_dead_log"), "download_dead.jsonl"),
         "failed": _resolve(base_dir, dl.get("failed_log"), "failed.jsonl"),
@@ -151,7 +153,8 @@ def _ids_from_lines(path):
     if not path.exists():
         return set()
     with open(path, encoding="utf-8") as fh:
-        return {line.strip() for line in fh if line.strip()}
+        # 只取每行第一列：provider_down.txt 每行是 "tid<TAB>源"。
+        return {line.split()[0] for line in fh if line.strip()}
 
 
 def _local_mp4_ids(downloads):
@@ -197,6 +200,7 @@ def load_ledgers(paths):
         "failed": _ids_by_regex(failed_paths),
         "fail": _ids_from_lines(paths["fail"]),
         "unresolved": _ids_from_lines(paths["unresolved"]),
+        "provider_down": _ids_from_lines(paths["provider_down"]),
         "local_mp4": _local_mp4_ids(paths["downloads"]),
         "bad_lines": bad,
     }
@@ -284,6 +288,8 @@ def classify(tid, ledgers, r2=None):
         return False, "download_failed" if tid in ledgers["failed"] else "links_not_downloaded"
     if tid in ledgers["fail"]:
         return False, "no_source"
+    if tid in ledgers["provider_down"]:
+        return False, "provider_down"
     if tid in ledgers["unresolved"]:
         return False, "fetch_unresolved"
     return False, "not_fetched"

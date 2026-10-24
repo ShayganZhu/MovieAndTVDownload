@@ -671,11 +671,13 @@ def test_collect_returns_revived_entries_and_preserves_metadata(
 
 
 def test_dead_and_retry_outcomes_are_not_revived(monkeypatch, tmp_path):
-    """dead（真无源）与 retry（瞬时耗尽）都救不回来，不能当成新链接投出去。"""
-    outcomes = {"1": ("dead", None), "2": ("retry", None)}
+    """dead（真无源）、retry（瞬时耗尽）、deferred（有源熔断、其余源无此片）都救不回来，
+    不能当成新链接投出去。deferred 带着结果字典（没有 urls），也不能被误当成功。"""
+    outcomes = {"1": ("dead", None), "2": ("retry", None),
+                "3": ("deferred", {"tmdbId": "3", "providers": ["videasy"]})}
     r, stop, written = _make_refetcher(monkeypatch, tmp_path, outcomes)
     try:
-        r.dispatch([{"tmdbId": "1"}, {"tmdbId": "2"}])
+        r.dispatch([{"tmdbId": "1"}, {"tmdbId": "2"}, {"tmdbId": "3"}])
         time.sleep(0.5)
         assert r.collect() == []
         assert written == []

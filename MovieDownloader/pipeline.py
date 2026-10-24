@@ -464,7 +464,8 @@ class AsyncRefetcher:
             print(f"  [重取失败] {tmdb_id}: {exc}", flush=True)
             return
         if status != "ok" or not result or not result.get("urls"):
-            # dead（源站确认无此片）与 retry（瞬时错误耗尽）都救不回来。
+            # dead（源站确认无此片）、retry（瞬时错误耗尽）、deferred（有源在熔断、
+            # 其余源无此片）都没有新链接，救不回来。
             print(f"  [重取无果] {tmdb_id}: {status}", flush=True)
             return
         # 落盘，与取流侧行为一致（追加写，下游按 fetched_at 择新）。
