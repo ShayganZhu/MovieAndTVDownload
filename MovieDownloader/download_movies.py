@@ -283,13 +283,71 @@ def _parse_host_limits(raw):
             "playlist_500_expired_after_seconds": max(
                 0.0, float(cfg.get("playlist_500_expired_after_minutes") or 0)
             ) * 60,
+            "ramp": _parse_ramp(cfg.get("ramp"), cap),
         }
     return limits
+
+
+def _parse_ramp(raw, cap):
+    """host_limits.<主机>.ramp：专用槽位分档放量。没配 = 一开始就是 max_concurrent。
+
+    档位只保留 (0, cap] 内严格递增的值；最后一档不是 cap 时补上 cap，
+    保证放量的终点就是 max_concurrent。
+    """
+    raw = raw or {}
+    steps = []
+    for value in raw.get("steps") or []:
+        try:
+            step = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 < step <= cap and (not steps or step > steps[-1]):
+            steps.append(step)
+    if not steps:
+        return None
+    if steps[-1] != cap:
+        steps.append(cap)
+    return {
+        "steps": steps,
+        "step_seconds": max(60.0, float(raw.get("step_minutes") or 15) * 60),
+        "backoff_breaker_trips": max(1, int(raw.get("backoff_breaker_trips") or 3)),
+        "backoff_segment_fail_ratio": float(raw.get("backoff_segment_fail_ratio") or 0.02),
+        "min_segment_requests": max(1, int(raw.get("min_segment_requests") or 2000)),
+        "backoff_playlist_fail_ratio": float(raw.get("backoff_playlist_fail_ratio") or 0.2),
+        "min_playlist_requests": max(1, int(raw.get("min_playlist_requests") or 20)),
+        "step_up_min_load": float(raw.get("step_up_min_load") or 0.9),
+        "recover_after_windows": max(1, int(raw.get("recover_after_windows") or 4)),
+    }
+
+
+def _parse_general_slots(raw):
+    """general_slots：普通片专用槽位数。≤ 0 或没配 = 不限（与分通道之前一致）。"""
+    try:
+        slots = int(raw or 0)
+    except (TypeError, ValueError):
+        return None
+    return slots if slots > 0 else None
+
+
+def _parse_demote_patterns(raw):
+    """demote_nodes：「主机/路径前缀」列表，统一成不带协议头的小写。"""
+    patterns = []
+    for item in raw or []:
+        text = str(item or "").strip().lower()
+        text = text.split("://", 1)[-1].lstrip("/")
+        if text and text not in patterns:
+            patterns.append(text)
+    return patterns
 
 
 # 按 CDN 主机的并发上限 + 让行队列（2026-10-24，见 config.yaml host_limits 与
 # HostCapGate）。空字典 = 功能整体关闭。
 HOST_LIMITS = _parse_host_limits(_CFG.get("host_limits"))
+# 普通片（第一个节点不在 host_limits 主机上）的专用槽位，与受限主机的专用槽位
+# 互不外借（2026-10-24）。只在 HOST_LIMITS 非空、闸门存在时生效。
+GENERAL_SLOTS = _parse_general_slots(_CFG.get("general_slots"))
+# 长期不可用的节点路径：派发和下载时挪到节点列表最后（不删，仍作最后一试）。
+DEMOTE_NODE_PATTERNS = _parse_demote_patterns(_CFG.get("demote_nodes"))
 
 # 流式来源（§12）下"在途任务已排空、生产者仍未产出新片"时的轮询间隔（秒）。
 # 只在这一种情况下才会 sleep：此刻 pending 为空，wait() 会立即返回、退化成
@@ -533,9 +591,11 @@ processing_lock = threading.Lock()
 processing_ids = set()
 _thread_local = threading.local()
 
-# host_limits 主机的「额外占用」：片的第一个节点不在该主机（派发闸门没给它占
-# 名额），节点循环却切到了该主机上下载——比如第一节点失败后的备用节点、
-# mp4 兜底失败后回落。闸门把它算进在途数，超出的部分由后续派发自动消化。
+# host_limits 主机的「额外占用」：片的第一个节点不在该主机（走的是普通槽位），
+# 节点循环却切到了该主机上下载——比如第一节点失败后的备用节点、mp4 兜底失败后
+# 回落。只在闸门状态行里显示：分通道后它占的是普通槽位，不占该主机专用槽位的
+# 名额（2026-10-24 前算进名额，结果被 zenoak /r2/ 回落的片占满、把 paleoak
+# 打头的片饿死）。
 _host_extra_lock = threading.Lock()
 _host_extra_active = {}
 
@@ -857,6 +917,57 @@ _HLS_HOST_CIRCUIT_STATUS = frozenset({429, 500, 502, 503, 504})
 # 熔断文案。⚠️ 有意**不**加入 _PERMANENT_FAILURE_MARKERS。
 _HLS_HOST_BLOCKED_MARKER = "分片主机疑似故障已熔断"
 
+# 按主机累计的 HLS 请求结果（2026-10-24，供专用槽位分档放量判断源站是否吃得消）。
+# 整次运行累计，由读的一方自己做差：
+#   segments / seg_troubled：开始下载的分片数 / 其中出过「像过载」的失败的分片数。
+#     按分片计一次、不按重试次数：一个坏分片重试 20 次只算 1，免得一部片的几个
+#     坏分片把整体失败率顶上去。「像过载」= 超时、连接错、5xx、429；
+#     401/403/404/410/416 与「返回的不是视频」是链接或片源的问题，不算。
+#   ok / bytes：下完的分片数与字节数（只供显示均速）。
+#   playlists / playlist_fail：主 / 媒体播放列表的**每次**请求与其中像过载的失败
+#     （不含 500：vidup 在该主机的签名过期就是 500）。10-23 过载时最先出现的
+#     就是播放列表 502，片子在这一步就失败，分片统计看不到。
+#   trips：分片主机熔断次数。
+_hls_seg_lock = threading.Lock()
+_hls_seg_stats = {}
+_HLS_STAT_FIELDS = (
+    "segments", "seg_troubled", "ok", "bytes", "playlists", "playlist_fail", "trips",
+)
+
+
+def _hls_seg_add(url, **amounts):
+    host = _host_of(url)
+    if not host:
+        return
+    with _hls_seg_lock:
+        stats = _hls_seg_stats.setdefault(host, dict.fromkeys(_HLS_STAT_FIELDS, 0))
+        for field, amount in amounts.items():
+            stats[field] += amount
+
+
+def hls_host_stats(host):
+    """某主机到此刻为止的累计（字段见 _HLS_STAT_FIELDS；没有记录时全 0）。"""
+    with _hls_seg_lock:
+        return dict(_hls_seg_stats.get(host) or dict.fromkeys(_HLS_STAT_FIELDS, 0))
+
+
+def _looks_like_overload(exc, count_500=True):
+    """这次失败像不像源站扛不住：超时、连接错、5xx、429 算；确定性失败不算。"""
+    status = _status_in_chain(exc)
+    if status is not None:
+        return status == 429 or (500 <= status < 600 and (count_500 or status != 500))
+    if is_permanent_http_failure(exc) or "服务器返回的不是视频分片" in str(exc):
+        return False
+    return True
+
+
+def _count_playlist_attempt(url, exc):
+    """request_with_retry 的 on_attempt：记一次播放列表请求（exc 为 None 即成功）。"""
+    _hls_seg_add(
+        url, playlists=1,
+        playlist_fail=int(exc is not None and _looks_like_overload(exc, count_500=False)),
+    )
+
 
 class HostCircuitOpenError(RuntimeError):
     """分片主机已熔断：整个节点应立即放弃并换下一个，不再逐流/逐片尝试。"""
@@ -912,6 +1023,7 @@ def _hls_host_record_result(url, status):
             _hls_host_tripped.pop(host, None)
         tripped = host in _hls_host_tripped
     if newly_tripped:
+        _hls_seg_add(url, trips=1)
         print(
             f"  [主机熔断] {host} 连续 {count} 次 HTTP {status}，暂时跳过该主机的"
             f"全部 m3u8 节点（其余节点不受影响），"
@@ -1038,9 +1150,12 @@ def get_session():
 
 def request_with_retry(
     method, url, retries=3, backoff=0.5, backoff_max=45.0, as_text=False,
-    **kwargs
+    on_attempt=None, **kwargs
 ):
     """发起 HTTP 请求；成功时返回 str 或 bytes。
+
+    on_attempt(url, exc)：每次请求结束后回调一次（成功时 exc 为 None），供按主机
+    统计请求结果；回调自身出错不影响请求。
 
     退避采用指数增长并封顶到 backoff_max，附加少量抖动，避免多线程同时重试；
     这样 playlist 解析等关键请求能扛过源站几十秒级的临时 5xx 抽风。
@@ -1077,13 +1192,17 @@ def request_with_retry(
             ) as response:
                 response.raise_for_status()
                 if method.upper() == "HEAD":
-                    return None
-                if as_text:
+                    body = None
+                elif as_text:
                     response.encoding = response.encoding or "utf-8"
-                    return response.text
-                return response.content
+                    body = response.text
+                else:
+                    body = response.content
+            _notify_attempt(on_attempt, url, None)
+            return body
         except (requests.RequestException, ConnectionError, TimeoutError) as exc:
             last_error = exc
+            _notify_attempt(on_attempt, url, exc)
             status = _status_of(exc)
             if status in (403, 429, 503):
                 record_block_status(status)
@@ -1110,6 +1229,15 @@ def request_with_retry(
             time.sleep(wait)
 
     raise RuntimeError(f"请求失败: {url}; {last_error}") from last_error
+
+
+def _notify_attempt(on_attempt, url, exc):
+    if on_attempt is None:
+        return
+    try:
+        on_attempt(url, exc)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------- 通用辅助 ----------
@@ -2039,12 +2167,60 @@ def node_link_age(entry, node=None, now=None):
     return link_age_seconds(entry, now)
 
 
+def _is_demoted_url(url):
+    """url 是否命中 demote_nodes（按「主机/路径」前缀匹配，不分大小写）。"""
+    if not DEMOTE_NODE_PATTERNS:
+        return False
+    text = str(url or "").split("://", 1)[-1].lower()
+    return any(text.startswith(pattern) for pattern in DEMOTE_NODE_PATTERNS)
+
+
+def _demote_nodes(nodes):
+    """归一化后的节点列表：命中 demote_nodes 的挪到最后，各自相对次序不变。"""
+    if not DEMOTE_NODE_PATTERNS:
+        return nodes
+    live = [node for node in nodes if not _is_demoted_url(node["url"])]
+    if len(live) == len(nodes):
+        return nodes
+    return live + [node for node in nodes if _is_demoted_url(node["url"])]
+
+
+def demote_dead_nodes(entry):
+    """条目副本：命中 demote_nodes 的节点挪到最后。返回 (条目, 是否挪过)。
+
+    背景（2026-10-24 实测）：vidup 的 zenoak `/r2/` 节点在 19 号机 1528 次、
+    23 号机 349 次请求里全部 502、从未成功，而它常排在 paleoak 节点前面——
+    这类片实际是去 paleoak 下的，却按第一节点被当成普通片、绕开了 paleoak
+    的专用槽位。挪到最后而不是删掉：万一恢复了，仍可作最后一试。
+    原条目不改（来源、台账还可能引用它）。
+    """
+    raw = list(entry.get("urls") or [])
+    if not DEMOTE_NODE_PATTERNS or not raw:
+        return entry, False
+
+    def _demoted(item):
+        node = _normalize_url_entry(item)
+        return bool(node) and _is_demoted_url(node["url"])
+
+    flags = [_demoted(item) for item in raw]
+    reordered = (
+        [item for item, dead in zip(raw, flags) if not dead]
+        + [item for item, dead in zip(raw, flags) if dead]
+    )
+    if all(a is b for a, b in zip(reordered, raw)):
+        return entry, False
+    copy = dict(entry)
+    copy["urls"] = reordered
+    return copy, True
+
+
 def _entry_nodes(entry):
-    return [
+    """条目的归一化节点列表，按实际尝试顺序（已应用 demote_nodes）。"""
+    return _demote_nodes([
         node for node in (
             _normalize_url_entry(item) for item in (entry.get("urls") or [])
         ) if node
-    ]
+    ])
 
 
 def capped_host_of(entry):
@@ -2052,7 +2228,7 @@ def capped_host_of(entry):
 
     只看第一个节点：节点按顺序尝试、首个成功即止，第一个节点就是这部片
     实际会去下的地方。process_one_entry 的 mp4 择优只在 mp4 节点之间重排，
-    不改变首位的 m3u8 节点。
+    不改变首位的 m3u8 节点。「第一个」按 demote_nodes 降级之后的顺序算。
     """
     nodes = _entry_nodes(entry)
     if not nodes:
@@ -2213,10 +2389,6 @@ def dispatch_stale_entries_async(entries, refetch_counts):
     return len(to_dispatch)
 
 
-# HostCapGate._admit 的返回值：让行队列已满，这一条暂时放不下。
-_GATE_BLOCKED = object()
-
-
 def _mp4_first(entry):
     """返回一份 mp4 节点挪到最前的条目副本（各类节点内部相对次序不变）。"""
     raw = list(entry.get("urls") or [])
@@ -2326,33 +2498,200 @@ def compare_fallback_quality(entry):
     return ("ok" if mp4_best[0] >= hls_best[0] else "lower"), detail
 
 
+# 普通片通道在闸门里的名字（与受限主机名并列作为通道键）。
+GENERAL_LANE = "_general"
+# 普通通道排队超过这个数就告警（只告警、不阻塞；与 host_limits 的 max_deferred 同义）。
+GENERAL_QUEUE_WARN = 1000
+
+
+class LaneRamp:
+    """受限主机专用槽位的分档放量（host_limits.<主机>.ramp，2026-10-24）。
+
+    从第一档起步，每满 step_seconds 看一次这段时间（一个「窗口」）里该主机的表现
+    （hls_host_stats 做差）：
+      - **坏**：熔断 ≥ backoff_breaker_trips 次；或出过问题的分片占比 ≥
+        backoff_segment_fail_ratio（分片数不足 min_segment_requests 不判）；或播放列表
+        请求失败占比 ≥ backoff_playlist_fail_ratio（请求数不足 min_playlist_requests
+        不判）→ 退一档，并进入**冷却**：要连续 recover_after_windows 个好窗口才允许
+        再升；同一档第 n 次退下来，冷却翻倍（× 2^(n-1)，最多 8 倍）。源站临时
+        出事（与我们无关）恢复后能自己升回去；某一档本身就扛不住时，越往后越少去试。
+        冷却中再坏继续退，最低到第一档。
+      - **好且跑满**（窗口内按时间加权的平均在途 ≥ step_up_min_load × 上限）→ 升一档；
+      - **好但没跑满** → 保持：这一档的负载根本没压上去，升了等于没验证就放量。
+    在途数由闸门在占位 / 归还时 observe() 报进来。
+    放量进度只在内存里：重启后从第一档重新开始。
+    """
+
+    MAX_COOLDOWN_FACTOR = 8
+
+    def __init__(self, host, cfg, clock, stats=None):
+        self.host = host
+        self.steps = list(cfg["steps"])
+        self.step_seconds = cfg["step_seconds"]
+        self.backoff_trips = cfg["backoff_breaker_trips"]
+        self.backoff_ratio = cfg["backoff_segment_fail_ratio"]
+        self.min_requests = cfg["min_segment_requests"]
+        self.backoff_playlist_ratio = cfg["backoff_playlist_fail_ratio"]
+        self.min_playlists = cfg["min_playlist_requests"]
+        self.min_load = cfg["step_up_min_load"]
+        self.recover_windows = cfg["recover_after_windows"]
+        self._stats = stats or hls_host_stats
+        self._clock = clock
+        self.level = 0
+        self.cooldown_left = 0        # 还要几个好窗口才允许再升档
+        self._backoffs = {}           # 档位 -> 从这一档退下来过几次
+        now = clock()
+        self._window_start = now
+        self._base = self._stats(host)
+        self._in_flight = 0
+        self._load_since = now
+        self._load_area = 0.0         # 窗口内 在途数 × 秒 的累计（按时间加权求平均在途）
+
+    @property
+    def cap(self):
+        return self.steps[self.level]
+
+    def describe(self):
+        text = f"第 {self.level + 1}/{len(self.steps)} 档"
+        if self.cooldown_left:
+            text += f"，冷却中还要 {self.cooldown_left} 个正常窗口"
+        return text
+
+    def observe(self, in_flight, now=None):
+        """闸门在途数变化时调用（占位 / 归还），用于按时间加权算平均在途。"""
+        now = self._clock() if now is None else now
+        self._load_area += self._in_flight * max(0.0, now - self._load_since)
+        self._in_flight, self._load_since = in_flight, now
+
+    def tick(self, now=None):
+        """到点判档；返回上限是否变了。"""
+        now = self._clock() if now is None else now
+        elapsed = now - self._window_start
+        if elapsed < self.step_seconds:
+            return False
+        self.observe(self._in_flight, now)
+        avg_load = self._load_area / elapsed if elapsed > 0 else 0.0
+        snap = self._stats(self.host)
+        delta = {k: snap.get(k, 0) - self._base.get(k, 0) for k in _HLS_STAT_FIELDS}
+        self._window_start, self._base, self._load_area = now, snap, 0.0
+        segments, playlists = delta["segments"], delta["playlists"]
+        seg_ratio = delta["seg_troubled"] / segments if segments else 0.0
+        pl_ratio = delta["playlist_fail"] / playlists if playlists else 0.0
+        problems = []
+        if delta["trips"] >= self.backoff_trips:
+            problems.append(f"熔断 {delta['trips']} 次")
+        if segments >= self.min_requests and seg_ratio >= self.backoff_ratio:
+            problems.append(f"出问题的分片 {seg_ratio:.1%}")
+        if playlists >= self.min_playlists and pl_ratio >= self.backoff_playlist_ratio:
+            problems.append(f"播放列表失败 {pl_ratio:.0%}")
+        old_cap = self.cap
+        if problems:
+            verdict = self._back_off(problems)
+        else:
+            if self.cooldown_left:
+                self.cooldown_left -= 1
+            if self.cooldown_left:
+                verdict = f"正常 → 冷却中，保持 {self.cap} 部"
+            elif self.level == len(self.steps) - 1:
+                verdict = f"正常 → 保持 {self.cap} 部"
+            elif avg_load < self.min_load * self.cap:
+                verdict = (
+                    f"正常但没跑满（平均在途 {avg_load:.1f} < {self.min_load:.0%} × {self.cap}）"
+                    f" → 保持 {self.cap} 部"
+                )
+            else:
+                self.level += 1
+                verdict = f"正常 → 升到 {self.cap} 部"
+        print(
+            f"[放量] {self.host} 上限 {old_cap} 部的这 {elapsed / 60:.0f} 分钟：平均在途 "
+            f"{avg_load:.1f}，分片 {segments} 个（出问题 {seg_ratio:.2%}），"
+            f"播放列表 {playlists} 次（失败 {pl_ratio:.0%}），熔断 {delta['trips']} 次，"
+            f"均速 {delta['bytes'] * 8 / max(elapsed, 1) / 1e6:.0f} Mbps；{verdict}"
+            f"（{self.describe()}）",
+            flush=True,
+        )
+        return self.cap != old_cap
+
+    def _back_off(self, problems):
+        dropped_from = self.level
+        self.level = max(0, self.level - 1)
+        times = self._backoffs.get(dropped_from, 0) + 1
+        self._backoffs[dropped_from] = times
+        self.cooldown_left = self.recover_windows * min(
+            2 ** (times - 1), self.MAX_COOLDOWN_FACTOR
+        )
+        reason = "、".join(problems)
+        if self.level == dropped_from:
+            return f"{reason} → 已是最低档，保持 {self.cap} 部，冷却 {self.cooldown_left} 个窗口"
+        return (
+            f"{reason} → 退到 {self.cap} 部，冷却 {self.cooldown_left} 个窗口"
+            f"（这一档第 {times} 次退下来）"
+        )
+
+
+def fit_lane_caps(limits, general_slots, workers):
+    """槽位合计超过下载线程数时压低受限主机的上限（含放量档位），返回新字典。
+
+    合计超过线程数时，多出来的 future 会在线程池里排队，排在前面的不论哪条
+    通道都先跑，两条通道就不再互不占用。普通通道不动（它的数由用户定）。
+    """
+    budget = max(1, int(workers) - (general_slots or 0))
+    fitted = {}
+    for host, cfg in limits.items():
+        cap = cfg["max_concurrent"]
+        allowed = max(1, budget)
+        budget -= min(cap, allowed)
+        if cap <= allowed:
+            fitted[host] = cfg
+            continue
+        print(
+            f"⚠️ [槽位] {host} 专用 {cap} 部 + 普通 {general_slots or 0} 部超过下载线程数 "
+            f"{workers}，{host} 压到 {allowed} 部（请调大 max_workers）",
+            flush=True,
+        )
+        new_cfg = dict(cfg)
+        new_cfg["max_concurrent"] = allowed
+        ramp = cfg.get("ramp")
+        if ramp:
+            steps = [step for step in ramp["steps"] if step < allowed] + [allowed]
+            new_cfg["ramp"] = dict(ramp, steps=steps)
+        fitted[host] = new_cfg
+    return fitted
+
+
 class HostCapGate:
-    """按 CDN 主机限制在途片数的派发闸门（config.yaml host_limits，2026-10-24）。
+    """分通道的派发闸门（config.yaml host_limits + general_slots，2026-10-24）。
 
     包在每轮的来源外面，对主循环呈现同样的来源接口（poll → item / wait / done），
-    主循环在下载 future 结束时调 release() 归还名额。三件事：
+    主循环在下载 future 结束时调 release() 归还名额。
 
-    1. **并发上限 + 让行**：第一个节点落在受限主机的片，在途（含已提交未开跑）
-       最多 max_concurrent 部；满了就整片放进让行队列，后面的片照常派发——
-       慢主机不再能把全部槽位占光。有空位时让行队列按**第一次进闸门的时刻**
-       先来先走：下载失败、重取回来的片排回它原来的位置，不去队尾重新排。
-       节点循环切到受限主机的「额外占用」（见 _host_extra_active）也算在途。
-    2. **派发前重取**：第一个节点在受限主机的片，在真正派发那一刻（不是进让行
-       队列时——排几个小时又会过期）链接年龄超过 refetch_after_minutes，就先
-       交给取流线程换新链接，新链接经首轮来源的重取结果通道回到本闸门再派发。
-       新结果缺了某家 provider 时把旧节点补回原位（_merge_missing_providers），
-       不让一次瞬时缺席换丢 HLS 节点。重取无果沿用原链接；每片每次运行最多
-       jit_refetch_max_per_movie 次，用完也沿用原链接（真过期会 401/500，走既有
-       的过期重取闭环）。只在来源能回送重取结果时启用（pipeline 首轮的
-       QueueEntrySource），否则新链接回不来，闸门会一直等。
-    3. **mp4 兜底（带画质门槛）**：让行满 mp4_fallback_after_minutes 且带 mp4 节点
+    1. **专用通道**：第一个节点（按 demote_nodes 降级后的顺序）落在受限主机的片
+       走该主机的通道，其余走普通通道。每条通道有自己的在途上限和排队，互不外借：
+       受限主机通道空着，普通片也不多占；普通通道满了，后面的受限主机片照样派。
+       受限主机的上限按 ramp 分档放量（LaneRamp）；general_slots 不配 = 普通
+       通道不限（即分通道之前的行为）。排队按**第一次进闸门的时刻**先来先走：
+       下载失败、重取回来的片排回原位。节点循环切到受限主机的普通片
+       （_host_extra_active）只在状态行里显示，不占受限主机通道的名额——它占的是
+       普通槽位，受限主机的总片数因此有上界（专用 + 普通槽位数）。
+    2. **反压**：两条通道都满时不从来源取片。只要有一条通道有空位就继续取，
+       取到另一条通道的片就放进它的排队——不会因为队首在等而堵住另一条通道。
+       排队没有硬上限（max_deferred / GENERAL_QUEUE_WARN 只是告警线）：片始终
+       留在本轮内，不阻塞、不丢。
+    3. **派发前重取**：受限主机的片在真正派发那一刻（不是进排队时）链接年龄超过
+       refetch_after_minutes，就先交给取流线程换新链接，新链接经首轮来源的重取
+       结果通道回到本闸门再派发。新结果缺了某家 provider 时把旧节点补回原位
+       （_merge_missing_providers），并记一次「下次派发跳过年龄检查」——补回的
+       旧节点年龄就是旧链接的年龄，再查只会立刻又重取、换回同样残缺的结果
+       （2026-10-24 线上：499580 在 120/122/124 分钟连重 3 次把额度烧光）。
+       重取无果沿用原链接；每片每次运行最多 jit_refetch_max_per_movie 次。
+       只在来源能回送重取结果时启用（pipeline 首轮的 QueueEntrySource）。
+    4. **mp4 兜底（带画质门槛）**：排队满 mp4_fallback_after_minutes 且带 mp4 节点
        的片，先在后台评估 mp4 实测分辨率是否不低于 HLS 声明的最高档
-       （compare_fallback_quality）；不低才把 mp4 挪到最前派发（不占名额，原节点
-       留在后面兜底），更低就继续等 HLS 名额，测不出过一阵再评估。
+       （compare_fallback_quality）；不低才把 mp4 挪到最前派发。兜底的片占**普通**
+       通道的名额（它下的是 mp4），普通通道满时不评估也不兜底。
 
-    🔴 本轮收尾：来源取空后，只要让行队列 / 等重取的片还在，就报 wait 而不是
-    done——让行的片必须在本轮内下完，不能被静默丢掉。
-    让行队列只在内存里：中断时这些片本就在 results.jsonl 里，下次运行是存量。
+    🔴 本轮收尾：来源取空后，只要还有排队 / 等重取的片，就报 wait 而不是 done。
+    排队只在内存里：中断时这些片本就在 results.jsonl 里，下次运行是存量。
 
     只由主循环线程调用，内部状态无需加锁；extra_active 由下载线程更新，
     自带锁（host_extra_active）；画质评估在 probe_submit 的后台线程里跑。
@@ -2361,7 +2700,7 @@ class HostCapGate:
     STATUS_INTERVAL_SECONDS = 600
 
     def __init__(self, limits, refetcher=None, extra_active=None, clock=None,
-                 probe_submit=None):
+                 probe_submit=None, general_slots=None, segment_stats=None):
         self._limits = limits
         # 判断「重取是否还有下文」要靠 is_pending；没有它就无法安全地等结果。
         self._refetcher = refetcher if hasattr(refetcher, "is_pending") else None
@@ -2372,24 +2711,34 @@ class HostCapGate:
         self._probe_executor = None
         self._source = None
         self._jit_enabled = False
-        # 让行队列放不下而暂扣的条目；非空时不再从来源取片（把反压还给取流侧）。
+        self._general_slots = general_slots
+        self._ramps = {
+            host: LaneRamp(host, cfg["ramp"], self._clock, segment_stats)
+            for host, cfg in limits.items() if cfg.get("ramp")
+        }
+        # 重取无果、从取流线程那边收回的原条目，下一次 poll 先处理。
         self._held = deque()
-        self._reserved = {}          # id(已派发条目) -> 主机
-        self._reserved_count = {}    # 主机 -> 闸门派发的在途数
-        # 每个主机两条道：带 mp4 节点的（可兜底）与不带的，各按 _queued_since 排序。
+        self._reserved = {}          # id(已派发条目) -> 通道（主机名或 GENERAL_LANE）
+        self._reserved_count = {}    # 通道 -> 在途数
+        # 受限主机两条道：带 mp4 节点的（可兜底）与不带的，各按 _queued_since 排序。
         self._queues = {host: {"mp4": deque(), "plain": deque()} for host in limits}
+        self._general_queue = deque()
         self._queued_since = {}       # tmdbId -> 第一次进闸门的时刻（排队位置，整次运行不变）
-        self._first_deferred_at = {}  # tmdbId -> 本次让行开始的时刻（mp4 兜底计时，派发即清）
+        self._first_deferred_at = {}  # tmdbId -> 本次排队开始的时刻（mp4 兜底计时，派发即清）
         self._refetching = {}         # tmdbId -> 已送去派发前重取的原条目
         self._jit_counts = {}         # tmdbId -> 本次运行已派发前重取次数
-        self._skip_jit = set()        # 重取无果：下次派发不再查年龄，沿用原链接
+        # 下次派发不再查年龄、沿用手上链接的 tmdbId（重取无果 / 补回过旧节点）。只生效一次。
+        self._skip_jit = set()
         self._budget_out = set()      # 派发前重取额度已用尽的 tmdbId（只为按片计数）
+        self._demoted = set()         # 节点被 demote_nodes 降级过的 tmdbId（只为按片计数）
         self._fallback_probes = {}    # tmdbId -> 进行中的画质评估 Future
         self._fallback_verdicts = {}  # tmdbId -> (结论, 测不出时的下次评估时刻)
         self._last_status = self._clock()
+        self._last_overflow_warn = {}  # 通道 -> 上次告警时刻
         self.stats = {
-            "deferred": 0, "mp4_fallback": 0, "fallback_lower": 0,
+            "deferred": 0, "general_deferred": 0, "mp4_fallback": 0, "fallback_lower": 0,
             "jit_refetch": 0, "jit_partial": 0, "jit_no_result": 0, "jit_budget_out": 0,
+            "demoted": 0,
         }
 
     # ---- 主循环接口 ----
@@ -2401,16 +2750,29 @@ class HostCapGate:
             and bool(getattr(source, "delivers_refetch_results", False))
         )
 
+    def cap(self, lane):
+        """通道此刻的在途上限；None 表示不限（普通通道没配 general_slots）。"""
+        if lane == GENERAL_LANE:
+            return self._general_slots
+        ramp = self._ramps.get(lane)
+        return ramp.cap if ramp is not None else self._limits[lane]["max_concurrent"]
+
+    def in_flight(self, lane):
+        return self._reserved_count.get(lane, 0)
+
     def release(self, entry):
         """下载 future 结束时调用：归还这部片占的名额（没占过就什么都不做）。"""
         if entry is None:
             return
-        host = self._reserved.pop(id(entry), None)
-        if host is not None:
-            self._reserved_count[host] = max(0, self._reserved_count.get(host, 0) - 1)
+        lane = self._reserved.pop(id(entry), None)
+        if lane is not None:
+            self._reserved_count[lane] = max(0, self._reserved_count.get(lane, 0) - 1)
+            self._note_load(lane)
 
     def poll(self):
         now = self._clock()
+        for ramp in self._ramps.values():
+            ramp.tick(now)
         self.print_status(now)
         while True:
             entry = self._next_from_queues(now)
@@ -2421,6 +2783,9 @@ class HostCapGate:
             if self._held:
                 entry = self._held.popleft()
             else:
+                if not self._any_room():
+                    # 两条通道都满：不从来源取片，把反压还给取流侧。
+                    return "wait", None
                 # 来源报过 done 也照样再问：它下面的 NodeRetrySource 之后还可能收到
                 # 换节点重下的片（比如重取无果、本闸门刚派出去的那部检出了硬字幕）。
                 # 记住 done 不再问的话，那部片会滞留到下次运行。各来源的 done 都可重复问。
@@ -2430,13 +2795,10 @@ class HostCapGate:
                 if state == "done":
                     break
             result = self._admit(entry, now)
-            if result is _GATE_BLOCKED:
-                self._held.appendleft(entry)
-                return "wait", None
             if result is not None:
                 return "item", result
-            # 进了让行队列或送去重取：接着看下一条。
-        if self._held or self._refetching or any(
+            # 进了排队或送去重取：接着看下一条。
+        if self._held or self._refetching or self._general_queue or any(
             lane for queues in self._queues.values() for lane in queues.values()
         ):
             return "wait", None
@@ -2450,23 +2812,28 @@ class HostCapGate:
         s = self.stats
         for host, queues in self._queues.items():
             waiting = len(queues["mp4"]) + len(queues["plain"])
-            oldest = min(
-                (self._first_deferred_at.get(self._key(e), now)
-                 for lane in queues.values() for e in lane),
-                default=now,
-            )
+            ramp = self._ramps.get(host)
             print(
-                f"[让行] {host}: 在途 {self._reserved_count.get(host, 0)}"
-                f"(+{self._extra_active(host)}) / {self._limits[host]['max_concurrent']}，"
-                f"让行队列 {waiting} 部（带 mp4 {len(queues['mp4'])}，"
-                f"最久 {(now - oldest) / 60:.0f} 分钟），等重取 {len(self._refetching)} 部，"
-                f"兜底评估中 {len(self._fallback_probes)} 部；"
-                f"累计让行 {s['deferred']}，mp4 兜底 {s['mp4_fallback']}"
+                f"[让行] {host} 专用槽位：在途 {self.in_flight(host)}/{self.cap(host)}"
+                f"{'（放量' + ramp.describe() + '）' if ramp else ''}，"
+                f"排队 {waiting} 部（带 mp4 {len(queues['mp4'])}，"
+                f"最久 {self._oldest_wait(queues.values(), now):.0f} 分钟），"
+                f"节点切到该主机的普通片 {self._extra_active(host)} 部；"
+                f"等重取 {len(self._refetching)} 部，兜底评估中 {len(self._fallback_probes)} 部；"
+                f"累计排队 {s['deferred']}，mp4 兜底 {s['mp4_fallback']}"
                 f"（mp4 画质更低而继续等 {s['fallback_lower']}），"
                 f"派发前重取 {s['jit_refetch']}（缺 provider 补回旧节点 {s['jit_partial']}，"
                 f"无果沿用原链接 {s['jit_no_result']}，额度用尽 {s['jit_budget_out']}）",
                 flush=True,
             )
+        cap = self.cap(GENERAL_LANE)
+        print(
+            f"[让行] 普通槽位：在途 {self.in_flight(GENERAL_LANE)}/{cap or '不限'}，"
+            f"排队 {len(self._general_queue)} 部"
+            f"（最久 {self._oldest_wait([self._general_queue], now):.0f} 分钟）；"
+            f"累计排队 {s['general_deferred']}，节点降级的片 {s['demoted']} 部",
+            flush=True,
+        )
 
     # ---- 内部 ----
     @staticmethod
@@ -2476,23 +2843,47 @@ class HostCapGate:
     def _since(self, entry):
         return self._queued_since.get(self._key(entry), 0)
 
-    def _room(self, host):
-        return (
-            self._reserved_count.get(host, 0) + self._extra_active(host)
-            < self._limits[host]["max_concurrent"]
+    def _oldest_wait(self, lanes, now):
+        oldest = min(
+            (self._first_deferred_at.get(self._key(e), now) for lane in lanes for e in lane),
+            default=now,
         )
+        return (now - oldest) / 60
+
+    def _room(self, lane):
+        cap = self.cap(lane)
+        return cap is None or self.in_flight(lane) < cap
+
+    def _any_room(self):
+        return self._room(GENERAL_LANE) or any(self._room(host) for host in self._queues)
+
+    def _reserve(self, entry, lane):
+        self._reserved[id(entry)] = lane
+        self._reserved_count[lane] = self._reserved_count.get(lane, 0) + 1
+        self._note_load(lane)
+
+    def _note_load(self, lane):
+        """在途数变了：报给该通道的放量（它按时间加权算这一档到底跑没跑满）。"""
+        ramp = self._ramps.get(lane)
+        if ramp is not None:
+            ramp.observe(self.in_flight(lane), self._clock())
 
     def _next_from_queues(self, now):
-        """让行队列里此刻能派发的一部：先看 mp4 兜底，再看有没有空位。"""
+        """排队里此刻能派发的一部：受限主机先看 mp4 兜底再看空位，最后看普通通道。"""
         for host, queues in self._queues.items():
-            entry = self._pop_mp4_fallback(host, queues, now)
-            if entry is not None:
-                return entry
+            if self._room(GENERAL_LANE):
+                entry = self._pop_mp4_fallback(host, queues, now)
+                if entry is not None:
+                    self._reserve(entry, GENERAL_LANE)
+                    return entry
             while self._room(host) and (queues["mp4"] or queues["plain"]):
                 entry = self._pop_oldest(queues)
                 out = self._deliver(entry, host, self._key(entry), now)
                 if out is not None:
                     return out
+        if self._room(GENERAL_LANE) and self._general_queue:
+            entry = self._general_queue.popleft()
+            return self._deliver(entry, None, self._key(entry), now)
         return None
 
     def _pop_oldest(self, queues):
@@ -2589,54 +2980,71 @@ class HostCapGate:
         return self._probe_executor.submit(compare_fallback_quality, entry)
 
     def _admit(self, entry, now):
-        """处理一条新到（或暂扣）的条目。返回要派发的条目 / None / _GATE_BLOCKED。"""
+        """处理一条新到（或收回）的条目。返回要派发的条目，或 None（进了排队 / 去重取）。"""
         key = self._key(entry)
         if key is None:
+            # 没有 tmdbId 的坏条目：process_one_entry 会当场判失败，不排队，只记账。
+            self._reserve(entry, GENERAL_LANE)
             return entry
+        entry, demoted = demote_dead_nodes(entry)
+        if demoted and key not in self._demoted:
+            self._demoted.add(key)
+            self.stats["demoted"] += 1
         # 派发前重取换回的新链接（或重取无果、沿用的原条目）。
-        merged = False
         old = self._refetching.pop(key, None)
         if old is not None and old is not entry:
             entry, merged = _merge_missing_providers(entry, old)
             if merged:
                 self.stats["jit_partial"] += 1
+                # 补回的旧节点年龄就是旧链接的年龄：下次派发（哪怕先排一阵队）不再
+                # 查年龄，免得立刻又重取、换回同样残缺的结果，几分钟内把额度烧光。
+                self._skip_jit.add(key)
         host = capped_host_of(entry)
-        if host is not None:
-            self._queued_since.setdefault(key, now)
-            if (
-                not self._room(host)
-                or self._queues[host]["mp4"] or self._queues[host]["plain"]
-            ):
-                # 没空位，或前面还有人在排：进让行队列（按第一次进闸门的时刻排位）。
-                return None if self._defer(entry, host, key, now) else _GATE_BLOCKED
-        # 刚补过旧节点的不再查年龄：它的年龄就是旧链接的年龄，再查只会立刻又
-        # 重取一遍、换回同样残缺的结果；能派就趁旧链接还在余量里派出去。
-        return self._deliver(entry, host, key, now, check_age=not merged)
+        lane = host or GENERAL_LANE
+        self._queued_since.setdefault(key, now)
+        if not self._room(lane) or self._lane_queued(lane):
+            # 没空位，或同通道前面还有人在排：进排队（按第一次进闸门的时刻排位）。
+            self._defer(entry, lane, key, now)
+            return None
+        return self._deliver(entry, host, key, now)
 
-    def _defer(self, entry, host, key, now):
-        queues = self._queues[host]
-        if len(queues["mp4"]) + len(queues["plain"]) >= self._limits[host]["max_deferred"]:
-            return False
-        has_mp4 = any(node["type"] == "mp4" for node in _entry_nodes(entry))
-        lane = queues["mp4" if has_mp4 else "plain"]
+    def _lane_queued(self, lane):
+        if lane == GENERAL_LANE:
+            return bool(self._general_queue)
+        queues = self._queues[lane]
+        return bool(queues["mp4"] or queues["plain"])
+
+    def _defer(self, entry, lane, key, now):
+        if lane == GENERAL_LANE:
+            queue = self._general_queue
+            size, warn_at = len(queue), GENERAL_QUEUE_WARN
+        else:
+            queues = self._queues[lane]
+            has_mp4 = any(node["type"] == "mp4" for node in _entry_nodes(entry))
+            queue = queues["mp4" if has_mp4 else "plain"]
+            size = len(queues["mp4"]) + len(queues["plain"])
+            warn_at = self._limits[lane]["max_deferred"]
         since = self._since(entry)
-        if not lane or self._since(lane[-1]) <= since:
-            lane.append(entry)
+        if not queue or self._since(queue[-1]) <= since:
+            queue.append(entry)
         else:
             # 下载失败 / 重取后回来的老片：插回它原来的位置。
-            lane.insert(next(i for i, e in enumerate(lane) if self._since(e) > since), entry)
+            queue.insert(next(i for i, e in enumerate(queue) if self._since(e) > since), entry)
         if key not in self._first_deferred_at:
             self._first_deferred_at[key] = now
-            self.stats["deferred"] += 1
-        return True
+            self.stats["general_deferred" if lane == GENERAL_LANE else "deferred"] += 1
+        if size + 1 > warn_at and now - self._last_overflow_warn.get(lane, 0) >= self.STATUS_INTERVAL_SECONDS:
+            # 只告警不阻塞：阻塞会把另一条通道一起堵死（2026-10-24 改）。
+            self._last_overflow_warn[lane] = now
+            name = "普通槽位" if lane == GENERAL_LANE else f"{lane} 专用槽位"
+            print(f"⚠️ [让行] {name}排队已 {size + 1} 部（告警线 {warn_at}），照常收片、不阻塞",
+                  flush=True)
 
-    def _deliver(self, entry, host, key, now, check_age=True):
-        """派发前的最后一关：链接太旧就先送去重取（返回 None），否则占名额放行。"""
-        if host is not None and check_age and self._send_to_refetch(entry, key, now):
+    def _deliver(self, entry, host, key, now):
+        """派发前的最后一关：受限主机的片链接太旧就先送去重取（返回 None），否则占名额放行。"""
+        if host is not None and self._send_to_refetch(entry, key, now):
             return None
-        if host is not None:
-            self._reserved[id(entry)] = host
-            self._reserved_count[host] = self._reserved_count.get(host, 0) + 1
+        self._reserve(entry, host or GENERAL_LANE)
         self._first_deferred_at.pop(key, None)
         return entry
 
@@ -3619,6 +4027,7 @@ def parse_master_playlist(master_url, retries=None, headers=None):
         backoff=PLAYLIST_RETRY_BACKOFF,
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
         headers=headers,
+        on_attempt=_count_playlist_attempt,
     )
     _assert_playlist_body(text, master_url)
     lines = [line.strip() for line in text.splitlines()]
@@ -3677,6 +4086,7 @@ def parse_media_playlist(playlist_url, headers=None):
         backoff=PLAYLIST_RETRY_BACKOFF,
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
         headers=headers,
+        on_attempt=_count_playlist_attempt,
     )
     _assert_playlist_body(text, playlist_url)
     lines = [line.strip() for line in text.splitlines()]
@@ -3911,6 +4321,7 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
     （服务器实跑实测，见 `interrupted` 的注释）。
     """
     last_error = None
+    troubled = False
     for attempt in range(1, retry_max + 1):
         # 开跑之前先看一眼：中断后连第一次请求都不该再发。
         if interrupted.is_set() or (abort_event is not None
@@ -3919,6 +4330,8 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
         # 主机已熔断（本线程或别的线程刚触发）：不再发请求、不再退避，
         # 直接上抛让 download_segments 整片止损。
         _raise_if_hls_host_tripped(url, f"分片 {index + 1}")
+        if attempt == 1:
+            _hls_seg_add(url, segments=1)
         try:
             # 外层已经负责精确重试次数，因此这里关闭额外应用层重试。
             content = request_with_retry(
@@ -3927,12 +4340,17 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
             )
             validate_segment_content(content, url)
             _hls_host_record_result(url, 200)
+            _hls_seg_add(url, ok=1, bytes=len(content))
             return content
         except HostCircuitOpenError:
             raise
         except Exception as exc:
             last_error = exc
             message = str(exc)
+            if not troubled and _looks_like_overload(exc):
+                # 每个分片只记一次：重试多少次都只算一个出过问题的分片。
+                troubled = True
+                _hls_seg_add(url, seg_troubled=1)
             # 5xx/429 计入主机连续失败数；达到阈值当场熔断并上抛。
             # 其它失败（超时/连接错/4xx）不清零也不累加：它们说明不了
             # 主机是否活着，交给原有退避逻辑处理。
@@ -4874,11 +5292,8 @@ def process_one_entry(entry, processed_ids):
     # 不生效），会一路透传进 success.jsonl 并在日志里打成 "None"。统一兜底成 str。
     title = entry.get("title") or ""
     # urls 元素兼容 str（历史 vidup m3u8）与 dict（多源：m3u8/mp4 + headers）。
-    urls = [
-        node for node in (
-            _normalize_url_entry(item) for item in (entry.get("urls") or [])
-        ) if node
-    ]
+    # 顺序与派发闸门看到的一致（_entry_nodes 已应用 demote_nodes 降级）。
+    urls = _entry_nodes(entry)
     year = entry.get("year")
     runtime_minutes = entry.get("runtime_minutes")
     # 取流侧带回的外挂字幕（vidlink captions）。转封装阶段落盘时要用，
@@ -5371,8 +5786,9 @@ def process_one_entry(entry, processed_ids):
         # （§10.13 实测救回过片子）完全保留，urls 的总数与集合都不变。
         # m3u8 节点不参与：拿到它的码率要解析 master + 下载采样分片，成本高得多，
         # 属 §10.10 ④「跨 provider 按画质排序」的范畴，用户明确暂缓。
-        # 派发闸门按**原始**第一个节点给这部片占了名额（见 HostCapGate），
-        # 故在 mp4 重排之前记下它；之后切到别的受限主机才另记额外占用。
+        # 派发闸门按第一个节点（降级后、mp4 重排前）给这部片分了通道（见
+        # HostCapGate），故在 mp4 重排之前记下它；之后切到别的受限主机才另记
+        # 额外占用（只供状态行显示）。
         first_host = _host_of(urls[0]["url"])
         mp4_nodes = [n for n in urls if n["type"] == "mp4"]
         preflight_of = {}
@@ -7469,21 +7885,53 @@ def _run_pipeline(run_volume=None):
         # 派发前重取次数与 mp4 兜底计时在轮与轮之间连续。
         gate = None
         if HOST_LIMITS:
+            lane_limits = fit_lane_caps(HOST_LIMITS, GENERAL_SLOTS, MAX_WORKERS)
             gate = HostCapGate(
-                HOST_LIMITS, refetcher=async_refetch_hook,
-                extra_active=host_extra_active,
+                lane_limits, refetcher=async_refetch_hook,
+                extra_active=host_extra_active, general_slots=GENERAL_SLOTS,
             )
-            for host, cfg in HOST_LIMITS.items():
+            for host, cfg in lane_limits.items():
                 ages = "、".join(
                     f"{p} {sec / 60:.0f}" for p, sec in cfg["refetch_after_seconds"].items()
                 ) or "未配置"
+                ramp = cfg.get("ramp")
+                ramp_text = (
+                    f"分档放量 {'→'.join(str(step) for step in ramp['steps'])}，"
+                    f"每 {ramp['step_seconds'] / 60:.0f} 分钟判一次；"
+                    f"熔断 ≥ {ramp['backoff_breaker_trips']} 次、出问题的分片 ≥ "
+                    f"{ramp['backoff_segment_fail_ratio']:.0%}"
+                    f"（≥ {ramp['min_segment_requests']} 个才判）或播放列表失败 ≥ "
+                    f"{ramp['backoff_playlist_fail_ratio']:.0%}"
+                    f"（≥ {ramp['min_playlist_requests']} 次才判）则退一档、冷却 "
+                    f"{ramp['recover_after_windows']} 个窗口起；平均在途 ≥ "
+                    f"{ramp['step_up_min_load']:.0%} 上限才升档"
+                    if ramp else "不分档"
+                )
                 print(
-                    f"[让行] {host}: 在途上限 {cfg['max_concurrent']} 部，"
+                    f"[让行] {host}: 专用槽位 {cfg['max_concurrent']} 部（{ramp_text}），"
                     f"派发前重取阈值（分钟）{ages}，"
                     f"mp4 兜底 {cfg['mp4_fallback_after_seconds'] / 60:.0f} 分钟，"
-                    f"让行队列上限 {cfg['max_deferred']}",
+                    f"排队告警线 {cfg['max_deferred']}",
                     flush=True,
                 )
+            lane_total = sum(cfg["max_concurrent"] for cfg in lane_limits.values())
+            print(
+                f"[让行] 普通槽位 {GENERAL_SLOTS or '不限'} 部"
+                + (f"（与专用槽位互不外借，合计 {lane_total + GENERAL_SLOTS}"
+                   f" / 下载线程 {MAX_WORKERS}）" if GENERAL_SLOTS else ""),
+                flush=True,
+            )
+            if GENERAL_SLOTS and DOWNLOAD_QUEUE_DEPTH < lane_total + GENERAL_SLOTS:
+                print(
+                    f"⚠️ [槽位] download_queue_depth {DOWNLOAD_QUEUE_DEPTH} 小于槽位合计 "
+                    f"{lane_total + GENERAL_SLOTS}，槽位填不满（请调大）",
+                    flush=True,
+                )
+        if DEMOTE_NODE_PATTERNS:
+            print(
+                f"[节点降级] {'、'.join(DEMOTE_NODE_PATTERNS)}：派发和下载时排到最后（不删除）",
+                flush=True,
+            )
         while True:
             # 每轮开头清空 download_fail 状态文件，只记录本轮下载失败。
             truncate_log(DOWNLOAD_FAIL_LOG)

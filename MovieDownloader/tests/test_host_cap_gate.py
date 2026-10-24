@@ -8,7 +8,8 @@
   - 让行的片本轮内必须下完：来源取空后有让行就报 wait，不能 done；
   - 名额必须归还，否则闸门永久关死；
   - 派发前重取无果时必须沿用原链接，不能让片消失；
-  - 让行队列满了要停止从来源取片（把反压还给取流侧）。
+  - 排队超过告警线也照收不误、不阻塞（阻塞会把另一条通道一起堵死）。
+分通道（专用槽位、分档放量）与节点降级的用例见 test_download_lanes.py。
 """
 
 import random
@@ -236,15 +237,17 @@ def test_fresh_arrival_does_not_jump_ahead_of_deferred():
     assert ids(got2) == ["p3"]
 
 
-def test_extra_occupancy_counts_against_the_limit():
-    """第一个节点不在该主机、却切到该主机下载的片，同样占位。"""
-    extra = {PALEO: 1}
+def test_extra_occupancy_does_not_take_dedicated_slots():
+    """节点循环中途切到 paleoak 的普通片占的是普通槽位，不占 paleoak 专用名额。
+
+    2026-10-24 前它算进名额：zenoak /r2/ 全部 502 后回落到 paleoak 的片把名额
+    占满（在途 0(+7)/6），paleoak 打头的片 235 部只下完 19 部。
+    """
+    extra = {PALEO: 5}
     src = Src([pal("p1"), pal("p2")])
     gate = make_gate(src, extra=extra)
     got, state = drain(gate)
-    assert ids(got) == ["p1"] and state == "wait"
-    extra[PALEO] = 0
-    assert ids(drain(gate)[0]) == ["p2"]
+    assert ids(got) == ["p1", "p2"] and state == "done"
 
 
 def test_entry_whose_second_node_is_capped_is_not_held_back():
@@ -257,22 +260,23 @@ def test_entry_whose_second_node_is_capped_is_not_held_back():
     assert ids(got) == ["p1", "p2", "f1"]
 
 
-def test_full_deferred_queue_stops_pulling_from_source():
-    """🔴 让行队列满了就不再从来源取片：否则取流侧感受不到反压。
+def test_queue_beyond_warn_line_keeps_accepting_and_does_not_block(capsys):
+    """🔴 排队超过 max_deferred 只告警、不阻塞：后面的快片照常派发，一部不丢。
 
-    代价是排在后面的快片也暂时取不到（队头阻塞）——这正是把反压还给
-    取流侧的方式；名额一空就恢复。
+    2026-10-24 前到上限就停止从来源取片，排在后面的普通片也一起被堵死；
+    23 号机的排队按 40~65 部/小时增长，这次运行内必然撞上。
     """
     src = Src([pal(f"p{i}") for i in range(1, 7)] + [fast("f7")])
-    gate = make_gate(src)          # 上限 2，让行队列上限 3
+    gate = make_gate(src)          # 上限 2，告警线 3
     got, state = drain(gate)
-    assert ids(got) == ["p1", "p2"] and state == "wait"
-    assert ids(src.items) == ["f7"], "队列满了还在从来源取片"
+    assert ids(got) == ["p1", "p2", "f7"] and state == "wait"
+    assert src.items == []
+    assert "排队已 4 部（告警线 3）" in capsys.readouterr().out
 
-    gate.release(got[0])
+    for entry in got[:2]:
+        gate.release(entry)
     got2, _ = drain(gate)
-    # 空出的位给最早让行的 p3；p6 补进让行队列；f7 终于取到。
-    assert ids(got2) == ["p3", "f7"]
+    assert ids(got2) == ["p3", "p4"]           # 先来先走，排队的片都还在
 
 
 def test_entries_without_tmdb_id_are_not_gated():
@@ -422,23 +426,48 @@ def test_partial_refetch_keeps_old_hls_node_in_its_original_position():
     assert gate.stats["jit_partial"] == 1
 
 
-def test_partial_refetch_that_has_to_wait_is_refetched_again_later():
-    """补回旧节点后若又要让行，轮到它时照常按（旧）年龄再重取一次，争取拿全。"""
+def test_partial_refetch_that_has_to_wait_is_not_refetched_again():
+    """🔴 补回旧节点后又要排队：轮到它时不再按旧节点年龄重取，直接派发。
+
+    2026-10-24 23 号机：499580 的重取结果缺了 vidup，补回旧 paleoak 节点后因排队
+    非空又进排队，轮到时按旧节点 120+ 分钟再重取——120/122/124 分钟连重 3 次，
+    几分钟内把额度烧光，换回的还是同样残缺的结果。
+    """
     r = Refetcher()
     src = Src([pal("p0"), pal("p1", age_min=200, mp4=True)], closed=False, refetcher=r)
     gate = make_gate(src, refetcher=r, limits=_limits(max_concurrent=1))
     got, _ = drain(gate)
-    assert ids(got) == ["p0"]                       # p1 让行
+    assert ids(got) == ["p0"]                       # p1 排队
     gate.release(got[0])
     assert drain(gate) == ([], "wait")              # p1 轮到时太旧 → 去重取
     partial = fast("p1")
     partial["fetched_at"] = NOW
     src.items += [pal("p9"), partial]               # p9 先占住名额，p1 的残缺结果后到
     got, _ = drain(gate)
-    assert ids(got) == ["p9"]                       # p1 补回旧节点后让行
+    assert ids(got) == ["p9"]                       # p1 补回旧节点后排队
     gate.release(got[0])
+    got, _ = drain(gate)
+    assert ids(got) == ["p1"]                       # 轮到时直接派发
+    assert PALEO in got[0]["urls"][0]["url"]        # 补回的 HLS 节点仍排第一
+    assert r.dispatched == ["p1"]
+    assert gate.stats["jit_partial"] == 1
+
+
+def test_skip_after_partial_refetch_applies_only_once():
+    """「不再查年龄」只管补回后的那一次派发：之后下载失败再回来，照常按年龄重取。"""
+    r = Refetcher()
+    src = Src([pal("p1", age_min=200, mp4=True)], closed=False, refetcher=r)
+    gate = make_gate(src, refetcher=r)
+    assert drain(gate) == ([], "wait")              # 太旧 → 去重取
+    partial = fast("p1")
+    partial["fetched_at"] = NOW
+    src.items.append(partial)
+    got, _ = drain(gate)
+    assert ids(got) == ["p1"]                       # 补回旧节点，直接派发
+    gate.release(got[0])
+    src.items.append(got[0])                        # 下载失败，带着旧节点又回来
     assert drain(gate) == ([], "wait")
-    assert r.dispatched == ["p1", "p1"]             # 轮到时再重取一次
+    assert r.dispatched == ["p1", "p1"]
 
 
 def test_merge_missing_providers_only_when_something_is_missing():
@@ -717,13 +746,23 @@ def test_parse_host_limits_zero_cap_disables_whole_host():
 def test_shipped_config_values():
     """config.yaml 里这次定下的取值（2026-10-24 与用户确认）。"""
     shipped = d._parse_host_limits(d._CFG.get("host_limits"))[PALEO]
-    assert shipped["max_concurrent"] == 6
+    assert shipped["max_concurrent"] == 40
+    assert shipped["ramp"] == {
+        "steps": [16, 24, 32, 40], "step_seconds": 900.0,
+        "backoff_breaker_trips": 3, "backoff_segment_fail_ratio": 0.02,
+        "min_segment_requests": 2000, "backoff_playlist_fail_ratio": 0.2,
+        "min_playlist_requests": 20, "step_up_min_load": 0.9, "recover_after_windows": 4,
+    }
     assert shipped["refetch_after_seconds"] == {"vidup": 7200, "videasy": 10800}
     assert shipped["mp4_fallback_after_seconds"] == 7200
     assert shipped["max_deferred"] == 1000
     assert shipped["playlist_500_expired_after_seconds"] == 9000
-    assert d._CFG["max_workers"] == 20
-    assert d._CFG["download_queue_depth"] == 40
+    assert d._CFG["max_workers"] == 50
+    assert d._CFG["download_queue_depth"] == 51
+    assert d._parse_general_slots(d._CFG.get("general_slots")) == 10
+    assert d._parse_demote_patterns(d._CFG.get("demote_nodes")) == ["moon.zenoak.top/r2/"]
+    # 槽位合计不超过线程数：两条通道才真正互不占用。
+    assert shipped["max_concurrent"] + 10 <= d._CFG["max_workers"] < d._CFG["download_queue_depth"]
 
 
 # ------------------------------------------------------------ 播放列表 500
@@ -898,6 +937,8 @@ def _streaming_env(tmp_path, monkeypatch, items, workers=8, depth=16):
     monkeypatch.setattr(d, "MAX_WORKERS", workers)
     monkeypatch.setattr(d, "DOWNLOAD_QUEUE_DEPTH", depth)
     monkeypatch.setattr(d, "HOST_LIMITS", _limits(max_concurrent=3, max_deferred=1000))
+    # 本组用例只验 paleoak 上限；普通槽位不限（分通道的端到端见 test_download_lanes.py）。
+    monkeypatch.setattr(d, "GENERAL_SLOTS", None)
 
     source = Src(items, closed=False)
     # 模拟取流线程：开头先给全部片，随后收工。
