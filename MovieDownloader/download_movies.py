@@ -335,9 +335,11 @@ CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
 # 丢片。详见 convert_ts_to_mp4。
 STRIP_CLOSED_CAPTIONS = bool(_CFG.get("strip_closed_captions", True))
 # 画面叠加物检测：硬字幕（烧在画面里的字幕）+ 水印（文字水印、台标）。业务口径：
-# 带硬字幕或水印的片一概不要——检出即就地删除、不上传、整片判死，不再换节点尝试。
+# 带硬字幕或水印的**版本**一概不要——检出即就地删除、不上传；这部片还有没试过的
+# 节点（别的版本）就换节点重下，所有版本都检出才整片判死（2026-10-24 起，
+# 见 OVERLAY_RETRY_OTHER_NODES）。
 # 检测放在转封装之后、移入成品目录之前（下载后检测）：先拿到真实比例，再决定要不要
-# 挪到下载前。两者共用一套抽帧，配置都在 hardsub_check 段。详见 check_overlays。
+# 挪到下载前。两者共用一套抽帧，配置都在 hardsub_check 段。详见 inspect_overlays。
 _HARDSUB_CFG = _CFG.get("hardsub_check", {}) or {}
 # 总开关：关掉则硬字幕与水印都不检测（不抽帧）。
 HARDSUB_CHECK_ENABLED = bool(_HARDSUB_CFG.get("enabled", True))
@@ -359,6 +361,15 @@ HARDSUB_MIN_ALIGNED_RATIO = float(_HARDSUB_CFG.get("min_aligned_hit_ratio", 0.08
 HARDSUB_OCR_THREADS = max(1, int(_HARDSUB_CFG.get("ocr_threads", 2)))
 HARDSUB_SCAN_LOG = resolve_file(_HARDSUB_CFG.get("scan_log"), "hardsub_scan.jsonl")
 HARDSUB_EVIDENCE_DIR = resolve_dir(_HARDSUB_CFG.get("evidence_dir"), "hardsub_evidence")
+# 检出硬字幕/水印后先换这部片还没试过的节点重下，所有节点都检出才整片判死。
+# 关掉则回到「检出即整片判死、不再换节点」。06/08/19 截至 10-24 判死的 818 部里，
+# 442 部还有没试过的节点（295 部在别的主机上），换个版本可能就是干净的。
+OVERLAY_RETRY_OTHER_NODES = bool(_HARDSUB_CFG.get("retry_other_nodes", True))
+# 节点级台账：每检出一个版本记一行（tmdbId + 版本标识），跨运行生效——
+# 重启或重取回来的链接里，已检出的版本不会再下第二次。
+OVERLAY_NODE_REJECT_LOG = resolve_file(
+    _HARDSUB_CFG.get("node_reject_log"), "overlay_node_rejects.jsonl"
+)
 # playlist（master/media）解析阶段的请求重试。
 # 🔴 2026-09-13 由 10 降到 4（§12.37 E-2）：退避指数增长、第 7 次起封顶 60s，
 # 跑满 10 次约 4 分钟，而实跑中这些 400/500/502 全部来自 CDN 回源故障
@@ -2645,6 +2656,78 @@ class HostCapGate:
         return back
 
 
+class NodeRetrySource:
+    """硬字幕/水印换节点重下的重投入口 + 已检出版本的过滤（2026-10-24）。
+
+    包在每轮来源外面、HostCapGate 之下（重投的片照样受主机上限、让行与派发前
+    重取约束）。三件事：
+
+    1. **重投优先**：主循环在某个版本检出硬字幕/水印后 requeue() 剩余节点组成的
+       条目，下一次 poll 先出它，再看原来源。
+    2. **过滤已检出的版本**：经过这里的每一条（取流新结果、重取结果、存量）都
+       去掉节点级台账里已检出的版本——重取会换回完整的一组节点，不滤的话那个
+       带硬字幕的版本会被再下一遍。全部版本都检出过的片不再派发，交给
+       on_all_rejected 整片判死。
+    3. **收尾不丢片**：原来源取空后，只要还有下载或转封装（含检测）在跑就报
+       wait——最后几部片检出后换节点重下，仍在本轮之内。必须连下载一起算：
+       主循环一旦收到 done 就再也不来 poll，而还在下载的片下完才进转封装。
+
+    只由主循环线程调用。对 HostCapGate 透传原来源的重取能力（delivers_refetch_results
+    / has_buffered），派发前重取照常工作。
+    """
+
+    def __init__(self, work_in_flight=None, on_all_rejected=None):
+        # work_in_flight() -> 是否还有下载或转封装在跑（它们可能产出换节点重下）。
+        self._busy = work_in_flight or (lambda: False)
+        self._on_all_rejected = on_all_rejected or (lambda entry: None)
+        self._source = None
+        self._source_done = False
+        self._requeue = deque()
+        self.requeued = 0
+        self.stripped = 0
+        self.all_rejected = 0
+
+    def set_source(self, source):
+        self._source = source
+        self._source_done = False
+
+    @property
+    def delivers_refetch_results(self):
+        return bool(getattr(self._source, "delivers_refetch_results", False))
+
+    def has_buffered(self, key):
+        has_buffered = getattr(self._source, "has_buffered", None)
+        return bool(has_buffered and has_buffered(key))
+
+    def requeue(self, entry):
+        """主循环调用：某版本检出后，把剩余节点组成的条目放回来重下。"""
+        self._requeue.append(entry)
+        self.requeued += 1
+
+    def poll(self):
+        while True:
+            if self._requeue:
+                entry = self._requeue.popleft()
+            elif self._source_done:
+                # 还有下载 / 转封装在跑：其中检出的片可能马上要换节点重下，本轮先别收尾。
+                return ("wait", None) if self._busy() else ("done", None)
+            else:
+                state, entry = self._source.poll()
+                if state == "done":
+                    self._source_done = True
+                    continue
+                if state != "item":
+                    return state, entry
+            entry, removed = strip_rejected_nodes(entry)
+            if removed:
+                self.stripped += 1
+                if not _entry_nodes(entry):
+                    self.all_rejected += 1
+                    self._on_all_rejected(entry)
+                    continue
+            return "item", entry
+
+
 def update_success_log(tmdb_id, new_record):
     """按 tmdbId 去重地写 SUCCESS_LOG：同一 ID 覆盖旧记录，否则追加。
 
@@ -4817,6 +4900,8 @@ def process_one_entry(entry, processed_ids):
                 "title": title,
                 "year": year,
                 "url": url,
+                # 下的是哪个节点：检出硬字幕/水印时按它记版本、算还能换哪些节点。
+                "node": node,
                 "final_ts": final_ts,
                 "temp_mp4": temp_mp4,
                 "cleanup_paths": list(cleanup_paths),
@@ -5182,6 +5267,8 @@ def process_one_entry(entry, processed_ids):
             "title": title,
             "year": year,
             "url": url,
+            # 下的是哪个节点：检出硬字幕/水印时按它记版本、算还能换哪些节点。
+            "node": node,
             "final_ts": final_ts,
             "temp_mp4": temp_mp4,
             "cleanup_paths": list(cleanup_paths),
@@ -5447,8 +5534,11 @@ _hardsub_local = threading.local()
 _overlay_stats_lock = threading.Lock()
 # 本次运行的检测计数（_run_pipeline 开头清零、收尾打印）：比例统计的现场口径，
 # 跨运行的完整口径在 HARDSUB_SCAN_LOG。同时带硬字幕和水印的片两项各计一次。
+# rejected 按「版本」计（换节点重下的片可能计多次），dead 按整片判死计，
+# node_retry 为检出后换节点重下的次数。
 overlay_stats = {
     "checked": 0, "hardsub": 0, "watermark": 0, "rejected": 0, "unknown": 0, "near_miss": 0,
+    "dead": 0, "node_retry": 0,
 }
 
 
@@ -5878,10 +5968,11 @@ def detect_overlays(path):
     }, evidence
 
 
-def _save_overlay_evidence(tmdb_id, frames, near_miss=False):
+def _save_overlay_evidence(tmdb_id, frames, near_miss=False, version=None):
     """保存证据截图：判死的片到 {evidence_dir}/{tmdbId}/（成品会被删掉，这是事后人工
     核对有没有误判的唯一依据），临门槛的片到 {evidence_dir}/near_miss/{tmdbId}/
-    （核对有没有漏判）。没有截图时不建空目录。失败只告警。"""
+    （核对有没有漏判）。version 为版本目录名（换节点重下时同一部片会检出多次，
+    各版本分开存，不互相覆盖）。没有截图时不建空目录。失败只告警。"""
     if not frames:
         return None
     try:
@@ -5889,6 +5980,8 @@ def _save_overlay_evidence(tmdb_id, frames, near_miss=False):
 
         parts = ["near_miss"] if near_miss else []
         folder = os.path.join(HARDSUB_EVIDENCE_DIR, *parts, safe_file_token(tmdb_id))
+        if version:
+            folder = os.path.join(folder, safe_file_token(version))
         os.makedirs(folder, exist_ok=True)
         for index, frame in enumerate(frames, 1):
             cv2.imwrite(os.path.join(folder, f"{index}.jpg"), frame)
@@ -5912,38 +6005,175 @@ def _overlay_summary(scan):
     return "；".join(parts)
 
 
-def record_overlay_dead(tmdb_id, title, scan):
+def record_overlay_dead(tmdb_id, title, scan, node_rejects=None):
     """把硬字幕/水印片记进 DOWNLOAD_DEAD_LOG（纯追加，读取端按 id 聚合）。
 
     reason_class 为 hardsub 或 watermark（两者都有时记 hardsub，reasons 里列全）。
     关键在于它不是 quality：`--retry-dead` 复判只针对画质门槛，这两类永不放回
     （见 dead_record_passes_now）。
+    node_rejects：换节点重下时各版本的检出结论 {版本标识: 原因}，reasons 取全部版本的并集。
     """
-    reasons = scan.get("reasons") or []
-    write_log(DOWNLOAD_DEAD_LOG, {
+    reasons = list(scan.get("reasons") or [])
+    for reason in (node_rejects or {}).values():
+        if reason not in reasons:
+            reasons.append(reason)
+    record = {
         "tmdbId": tmdb_id,
         "title": title or "",
         "dead_at": int(time.time()),
         "reason_class": "hardsub" if "hardsub" in reasons else "watermark",
         "reasons": reasons,
-        "error": _overlay_summary(scan),
+        "error": _overlay_summary(scan) or (
+            f"全部 {len(node_rejects)} 个版本都已检出硬字幕/水印" if node_rejects else ""
+        ),
         "evidence": {
             key: scan.get(key)
             for key in ("sampled", "hits", "hit_ratio", "distinct_texts", "examples",
                         "watermark_texts", "watermark_logo")
         },
+    }
+    if node_rejects:
+        record["node_rejects"] = dict(node_rejects)
+    write_log(DOWNLOAD_DEAD_LOG, record)
+    with _overlay_stats_lock:
+        overlay_stats["dead"] += 1
+
+
+# ---- 换节点重下：节点级台账（2026-10-24）----
+_overlay_node_lock = threading.Lock()
+# tmdbId -> {版本标识: 原因（hardsub/watermark）}；None 表示还没从台账读。
+_overlay_node_rejects = None
+
+
+def overlay_node_key(node):
+    """硬字幕/水印按「版本」记账的节点标识。
+
+    签名链接的令牌每次重取都会变，不能用整条链接认节点：
+      - mp4：provider + 文件路径（去掉查询串、不含主机）——hakuna 的
+        /resource/<hash>.mp4 稳定指向同一个文件，换 CDN 主机也一样；
+      - HLS：provider + 主机——同一家同一主机视为同一个版本。
+    """
+    url = node["url"]
+    if node["type"] == "mp4":
+        rest = url.split("://", 1)[-1]
+        path = rest.split("/", 1)[1] if "/" in rest else ""
+        return f"{node['provider']}|mp4|/{path.split('?', 1)[0]}"
+    return f"{node['provider']}|m3u8|{_host_of(url)}"
+
+
+def _overlay_version_label(node):
+    """证据截图的版本目录名：provider-类型-标识摘要（同一家两个 mp4 文件也分得开）。"""
+    digest = hashlib.sha1(overlay_node_key(node).encode("utf-8")).hexdigest()[:6]
+    return f"{node['provider']}-{node['type']}-{digest}"
+
+
+def reload_overlay_node_rejects():
+    """丢掉内存里的节点级台账，下次用到时重读（每次运行开头调用）。"""
+    global _overlay_node_rejects
+    with _overlay_node_lock:
+        _overlay_node_rejects = None
+
+
+def _overlay_node_table():
+    """返回节点级台账（调用方须持有 _overlay_node_lock）。"""
+    global _overlay_node_rejects
+    if _overlay_node_rejects is None:
+        table = {}
+        if os.path.exists(OVERLAY_NODE_REJECT_LOG):
+            with open(OVERLAY_NODE_REJECT_LOG, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    tmdb_id = normalize_tmdb_id(record.get("tmdbId"))
+                    key = record.get("node_key")
+                    if tmdb_id and key:
+                        table.setdefault(tmdb_id, {})[key] = record.get("reason") or ""
+        _overlay_node_rejects = table
+    return _overlay_node_rejects
+
+
+def overlay_node_rejects(tmdb_id):
+    """这部片已检出的版本 {版本标识: 原因}（副本）。"""
+    with _overlay_node_lock:
+        return dict(_overlay_node_table().get(normalize_tmdb_id(tmdb_id), {}))
+
+
+def record_overlay_node_reject(tmdb_id, title, node, scan):
+    """记一个检出硬字幕/水印的版本（追加台账 + 更新内存）。"""
+    reasons = scan.get("reasons") or []
+    reason = "hardsub" if "hardsub" in reasons else "watermark"
+    key = overlay_node_key(node)
+    write_log(OVERLAY_NODE_REJECT_LOG, {
+        "tmdbId": tmdb_id,
+        "title": title or "",
+        "node_key": key,
+        "provider": node.get("provider"),
+        "node_type": node.get("type"),
+        "host": _host_of(node["url"]),
+        "reason": reason,
+        "reasons": reasons,
+        "summary": _overlay_summary(scan),
+        "rejected_at": int(time.time()),
     })
+    with _overlay_node_lock:
+        _overlay_node_table().setdefault(normalize_tmdb_id(tmdb_id), {})[key] = reason
 
 
-def check_overlays(tmdb_id, title, path):
-    """检测硬字幕/水印并按配置处置。返回应判死的理由列表（空列表 = 照常交付）。
+def strip_rejected_nodes(entry):
+    """去掉这部片已检出硬字幕/水印的版本。返回 (条目, 去掉了几个节点)。
 
-    每部片的结论都写进 HARDSUB_SCAN_LOG（比例统计与门槛校准用）；判出问题的片
-    另存证据截图。检测本身任何异常都按"没有"放行。只有 action=kill 时才返回
-    非空列表（record 模式照常交付）。
+    没去掉任何节点时原样返回同一个对象。解析不了的 url 原样保留（交给下载侧判）。
+    """
+    if not OVERLAY_RETRY_OTHER_NODES:
+        return entry, 0
+    rejected = overlay_node_rejects(entry.get("tmdbId"))
+    if not rejected:
+        return entry, 0
+    raw = list(entry.get("urls") or [])
+    kept = []
+    for item in raw:
+        node = _normalize_url_entry(item)
+        if node and overlay_node_key(node) in rejected:
+            continue
+        kept.append(item)
+    if len(kept) == len(raw):
+        return entry, 0
+    stripped = dict(entry)
+    stripped["urls"] = kept
+    return stripped, len(raw) - len(kept)
+
+
+def plan_overlay_retry(conversion_job, scan):
+    """检出硬字幕/水印后：记下这个版本，算出还能换哪些节点重下。
+
+    返回去掉全部已检出版本后的条目（还有节点可试），或 None（该整片判死：
+    功能关闭、不知道下的是哪个节点、或所有版本都已检出）。
+    """
+    node = conversion_job.get("node")
+    entry = conversion_job.get("entry")
+    if not OVERLAY_RETRY_OTHER_NODES or not node or not entry:
+        return None
+    record_overlay_node_reject(conversion_job["tmdbId"], conversion_job.get("title"), node, scan)
+    remaining, _removed = strip_rejected_nodes(entry)
+    if not _entry_nodes(remaining):
+        return None
+    with _overlay_stats_lock:
+        overlay_stats["node_retry"] += 1
+    return remaining
+
+
+def inspect_overlays(tmdb_id, title, path, node=None):
+    """检测硬字幕/水印。返回 (应删除这个版本的理由列表, 扫描结果)；理由为空 = 照常交付。
+
+    每个版本的结论都写进 HARDSUB_SCAN_LOG（比例统计与门槛校准用；node 已知时带上
+    版本信息）；判出问题的版本另存证据截图。检测本身任何异常都按"没有"放行。
+    只有 action=kill 时才返回非空理由（record 模式照常交付）。
+    **不写判死台账**：整片判死还是换节点重下由调用方决定（见 finalize_one_entry）。
     """
     if not HARDSUB_CHECK_ENABLED:
-        return []
+        return [], {}
     try:
         scan, evidence = detect_overlays(path)
     except Exception as exc:  # noqa: BLE001 - 检测故障不能变成丢片
@@ -5969,8 +6199,13 @@ def check_overlays(tmdb_id, title, path):
         "action": HARDSUB_ACTION,
         **scan,
     }
+    if node:
+        record.update(node_key=overlay_node_key(node), provider=node.get("provider"),
+                      node_type=node.get("type"))
     if reasons:
-        record["evidence_dir"] = _save_overlay_evidence(tmdb_id, evidence)
+        record["evidence_dir"] = _save_overlay_evidence(
+            tmdb_id, evidence, version=_overlay_version_label(node) if node else None
+        )
     elif near_miss:
         record["evidence_dir"] = _save_overlay_evidence(tmdb_id, evidence, near_miss=True)
     write_log(HARDSUB_SCAN_LOG, record)
@@ -5978,20 +6213,17 @@ def check_overlays(tmdb_id, title, path):
     if scan.get("verdict") == "unknown":
         print(f"  [{tmdb_id}] ⚠️ 硬字幕/水印检测失败，按没有放行: "
               f"{scan.get('error')}", flush=True)
-        return []
+        return [], scan
     if not reasons:
         if near_miss:
             label = "、".join({"hardsub": "硬字幕", "watermark": "水印"}[r] for r in near_miss)
             print(f"  [{tmdb_id}] {label}临门槛（未判死，照常交付），已存截图待人工核对",
                   flush=True)
-        return []
-    summary = _overlay_summary(scan)
+        return [], scan
     if HARDSUB_ACTION != "kill":
-        print(f"  [{tmdb_id}] {summary}（记录模式，照常交付）", flush=True)
-        return []
-    record_overlay_dead(tmdb_id, title, scan)
-    print(f"  [{tmdb_id}] {summary} → 删除成品并判死", flush=True)
-    return reasons
+        print(f"  [{tmdb_id}] {_overlay_summary(scan)}（记录模式，照常交付）", flush=True)
+        return [], scan
+    return reasons, scan
 
 
 def finalize_one_entry(conversion_job, processed_ids):
@@ -6014,20 +6246,42 @@ def finalize_one_entry(conversion_job, processed_ids):
         if not convert_ts_to_mp4(final_ts, temp_mp4):
             raise RuntimeError("FFmpeg 转换失败")
 
-        # 硬字幕/水印：在移入成品目录之前查。判死的片就地删掉，不进 downloads/、
-        # 不存字幕与 meta、不上传；整片判死，不再换节点尝试（业务口径）。
-        reasons = check_overlays(tmdb_id, conversion_job["title"], temp_mp4)
+        # 硬字幕/水印：在移入成品目录之前查。检出的版本就地删掉，不进 downloads/、
+        # 不存字幕与 meta、不上传。这部片还有没试过的节点就换节点重下（主循环把
+        # overlay_retry_entry 放回重投队列），所有版本都检出才整片判死（业务口径）。
+        node = conversion_job.get("node")
+        reasons, scan = inspect_overlays(
+            tmdb_id, conversion_job["title"], temp_mp4, node=node
+        )
         if reasons:
             remove_file(temp_mp4)
-            overlay_dead = True
             labels = "、".join(
                 {"hardsub": _HARDSUB_MARKER, "watermark": _WATERMARK_MARKER}[r]
                 for r in reasons
             )
+            summary = _overlay_summary(scan)
+            # 失败台账的 stage 用它：两者都有时记 hardsub，与判死记录口径一致。
+            reject = "hardsub" if "hardsub" in reasons else "watermark"
+            retry_entry = plan_overlay_retry(conversion_job, scan)
+            if retry_entry is not None:
+                version = f"{node.get('provider')}/{node.get('type')}"
+                left = len(_entry_nodes(retry_entry))
+                print(f"  [{tmdb_id}] {summary} → 删除这个版本（{version}），"
+                      f"换剩余 {left} 个节点重下", flush=True)
+                return tmdb_id, False, {
+                    "error": f"{labels}（{version}），已删除这个版本，换剩余 {left} 个节点重下",
+                    "overlay_reject": reject,
+                    "overlay_retry_entry": retry_entry,
+                }
+            record_overlay_dead(
+                tmdb_id, conversion_job["title"], scan,
+                node_rejects=overlay_node_rejects(tmdb_id) or None,
+            )
+            overlay_dead = True
+            print(f"  [{tmdb_id}] {summary} → 删除成品并判死", flush=True)
             return tmdb_id, False, {
-                "error": f"{labels}，已删除成品并判死（不上传、不再尝试其它节点）",
-                # 失败台账的 stage 用它：两者都有时记 hardsub，与判死记录口径一致。
-                "overlay_reject": "hardsub" if "hardsub" in reasons else "watermark",
+                "error": f"{labels}，已删除成品并判死（不上传；没有别的版本可换）",
+                "overlay_reject": reject,
             }
 
         print(f"  [{tmdb_id}] 转封装完成，准备移动文件", flush=True)
@@ -6589,6 +6843,7 @@ def _run_pipeline(run_volume=None):
     clean_temp_directory()
     print("已清理 temp 目录中的旧临时文件")
     _reset_overlay_stats()
+    reload_overlay_node_rejects()
 
     logged_ids = load_success_log_ids()
     disk_ids, duplicate_files = scan_downloaded_mp4_ids()
@@ -6754,6 +7009,34 @@ def _run_pipeline(run_volume=None):
     # 确定性失败每片计一次；可重试失败跨轮会重复计（同片多轮重投），打印时分块标注。
     reject_permanent = {}
     reject_retriable = {}
+
+    def _all_versions_rejected(entry):
+        """来源里来了一部所有版本都已检出硬字幕/水印的片：整片判死，不再派发。"""
+        tmdb_id = entry.get("tmdbId")
+        rejects = overlay_node_rejects(tmdb_id)
+        record_overlay_dead(tmdb_id, entry.get("title"), {"reasons": []},
+                            node_rejects=rejects)
+        with processing_lock:
+            processed_ids.add(normalize_tmdb_id(tmdb_id))
+        stage = "hardsub" if "hardsub" in rejects.values() else "watermark"
+        write_log(FAILED_LOG, {
+            "tmdbId": tmdb_id,
+            "title": entry.get("title") or "",
+            "urls": [],
+            "error": f"全部 {len(rejects)} 个版本都已检出硬字幕/水印，整片判死",
+            "stage": stage,
+        })
+        print(f"{'硬字幕' if stage == 'hardsub' else '水印'}判死: {tmdb_id}: "
+              f"全部 {len(rejects)} 个版本都已检出", flush=True)
+
+    # 硬字幕/水印换节点重下的重投入口（每轮套在来源外、HostCapGate 之下）。
+    node_retry = (
+        NodeRetrySource(
+            work_in_flight=lambda: bool(download_future_to_entry or conversion_future_to_entry),
+            on_all_rejected=_all_versions_rejected,
+        )
+        if OVERLAY_RETRY_OTHER_NODES else None
+    )
 
     def handle_done_future(future, round_failed_retriable,
                            round_failed_expired=None,
@@ -6927,19 +7210,27 @@ def _run_pipeline(run_volume=None):
                 info = {"error": str(exc)}
 
             if not conversion_success:
-                # 硬字幕/水印判死单独标 stage：它不是转封装故障，统计与排查时要分开看。
+                # 硬字幕/水印单独标 stage：它不是转封装故障，统计与排查时要分开看。
+                # 换节点重下的记 hardsub_retry / watermark_retry，与整片判死区分。
                 overlay = info.get("overlay_reject")
+                retry_entry = info.get("overlay_retry_entry")
+                stage = overlay or "conversion"
+                if overlay and retry_entry is not None:
+                    stage = f"{overlay}_retry"
                 write_log(FAILED_LOG, {
                     "tmdbId": tmdb_id,
                     "title": entry.get("title") or "",
                     "urls": entry.get("urls", []),
                     "error": info.get("error", "未知错误"),
-                    "stage": overlay or "conversion",
+                    "stage": stage,
                 })
-                label = {"hardsub": "硬字幕判死", "watermark": "水印判死"}.get(
-                    overlay, "转封装失败"
-                )
+                label = {
+                    "hardsub": "硬字幕判死", "watermark": "水印判死",
+                    "hardsub_retry": "硬字幕换节点", "watermark_retry": "水印换节点",
+                }.get(stage, "转封装失败")
                 print(f"{label}: {tmdb_id}: {info.get('error', '未知错误')}")
+                if retry_entry is not None and node_retry is not None:
+                    node_retry.requeue(retry_entry)
                 return
 
             # 转封装成功 -> 立即提交上传。反压：先 acquire 信号量（限制
@@ -7152,6 +7443,9 @@ def _run_pipeline(run_volume=None):
                 batch_total = f"{len(batch_source)} 部"
             except TypeError:
                 batch_total = "持续接收中"
+            if node_retry is not None:
+                node_retry.set_source(batch_source)
+                batch_source = node_retry
             if gate is not None:
                 gate.set_source(batch_source)
                 batch_source = gate
@@ -7487,8 +7781,12 @@ def _run_pipeline(run_volume=None):
                 f"\n硬字幕/水印检测：已检测 {checked} 部，"
                 f"硬字幕 {overlay_stats['hardsub']} 部（{overlay_stats['hardsub'] / checked:.1%}），"
                 f"水印 {overlay_stats['watermark']} 部（{overlay_stats['watermark'] / checked:.1%}），"
-                f"合计{'判死' if HARDSUB_ACTION == 'kill' else '检出'} "
-                f"{overlay_stats['rejected']} 部（{overlay_stats['rejected'] / checked:.1%}）"
+                + (f"合计判死 {overlay_stats['dead']} 部（{overlay_stats['dead'] / checked:.1%}）"
+                   if HARDSUB_ACTION == "kill" else
+                   f"合计检出 {overlay_stats['rejected']} 部"
+                   f"（{overlay_stats['rejected'] / checked:.1%}）")
+                + (f"，检出后换节点重下 {overlay_stats['node_retry']} 次"
+                   if overlay_stats["node_retry"] else "")
                 + (f"，检测失败按没有放行 {overlay_stats['unknown']} 部"
                    if overlay_stats["unknown"] else "")
                 + (f"，临门槛 {overlay_stats['near_miss']} 部（截图在 "

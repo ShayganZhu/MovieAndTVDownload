@@ -598,8 +598,9 @@ download_movies:
   strip_closed_captions: true
   # 画面叠加物检测：硬字幕（烧在画面里的字幕）+ 水印（文字水印、角落台标）。
   # 转封装之后、移入 downloads/ 之前，在片长 10%~90% 均匀抽帧做 OCR 与静止区域分析。
-  # 检出任一项的片：就地删除、不上传、整片判死（download_dead.jsonl，
-  # reason_class=hardsub/watermark，--retry-dead 永不放回），不再换节点尝试。
+  # 检出任一项的**版本**：就地删除、不上传。这部片还有没试过的节点（别的版本）就换
+  # 节点重下（retry_other_nodes）；所有版本都检出才整片判死（download_dead.jsonl，
+  # reason_class=hardsub/watermark，--retry-dead 永不放回）。
   # 检测出错一律按没有放行。依赖 rapidocr_onnxruntime（见 requirements.txt）。
   hardsub_check:
     enabled: true             # 总开关：关掉则硬字幕与水印都不检测
@@ -619,6 +620,11 @@ download_movies:
     ocr_threads: 2            # 每个检测线程的 OCR 线程数（转封装池多线程并发检测）
     scan_log: "hardsub_scan.jsonl"     # 每部片的检测结论（比例统计与门槛校准用）
     evidence_dir: "hardsub_evidence"   # 判死片的证据截图（成品删除后人工复核用）
+    # 检出后先换这部片还没试过的节点重下，所有节点都检出才整片判死（2026-10-24）。
+    # 「同一个版本」的认法：mp4 = provider + 文件路径（不含主机与签名，换 CDN 主机
+    # 仍算同一个文件）；HLS = provider + 主机。设 false 回到检出即整片判死。
+    retry_other_nodes: true
+    node_reject_log: "overlay_node_rejects.jsonl"   # 节点级台账：已检出的版本，跨运行不再下
   # ---- playlist(master/media)解析阶段的请求重试 ----
   # 源站临时 5xx 抽风时，这一层若过早放弃会直接判整部影片失败。
   #

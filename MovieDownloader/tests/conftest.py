@@ -41,4 +41,7 @@ def _isolate_hardsub_check(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "HARDSUB_SCAN_LOG", str(tmp_path / "hardsub_scan.jsonl"))
     monkeypatch.setattr(d, "HARDSUB_EVIDENCE_DIR", str(tmp_path / "hardsub_evidence"))
     monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(tmp_path / "download_dead.jsonl"))
+    monkeypatch.setattr(d, "OVERLAY_NODE_REJECT_LOG",
+                        str(tmp_path / "overlay_node_rejects.jsonl"))
+    monkeypatch.setattr(d, "_overlay_node_rejects", None)
     yield
