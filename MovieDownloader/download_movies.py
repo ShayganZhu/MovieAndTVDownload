@@ -8210,6 +8210,244 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
     return done, freed
 
 
+# migrate-overlay-dead 从日志推断「判死前下的是第几个节点」用的三行。
+_MIGRATE_START_RE = re.compile(r"开始处理: (\d+) ")
+_MIGRATE_SWITCH_RE = re.compile(r"\[(\d+)\] 切换备用节点 (\d+)/\d+ ")
+_MIGRATE_KILL_RE = re.compile(r"\[(\d+)\] .*→ 删除成品并判死")
+
+
+def _overlay_kill_node_index_from_log(log_path):
+    """扫 pipeline.log，返回 {tmdbId: 判死前最后一次尝试的节点序号（从 1 起）}。
+
+    每部片「开始处理」时序号归 1，「切换备用节点 N/M」时改成 N，遇到它的判死行就
+    记下当时的序号。下载与转封装在不同线程，日志交错，所以按 tmdbId 各记各的。
+    日志不存在返回空表（调用方退回取第 1 个节点）。
+    """
+    current, found = {}, {}
+    if not log_path or not os.path.exists(log_path):
+        return found
+    with open(log_path, "rb") as fh:
+        for raw in fh:
+            if "开始处理".encode() in raw:
+                match = _MIGRATE_START_RE.search(raw.decode("utf-8", "replace"))
+                if match:
+                    current[match.group(1)] = 1
+            elif "切换备用节点".encode() in raw:
+                match = _MIGRATE_SWITCH_RE.search(raw.decode("utf-8", "replace"))
+                if match:
+                    current[match.group(1)] = int(match.group(2))
+            elif "删除成品并判死".encode() in raw:
+                match = _MIGRATE_KILL_RE.search(raw.decode("utf-8", "replace"))
+                if match:
+                    found[match.group(1)] = current.get(match.group(1), 1)
+    return found
+
+
+def migrate_overlay_dead(apply=False, data_dir=None, log_path=None, report_path=None):
+    """把「检出即整片判死」时代的硬字幕/水印判死片，迁成节点级记录、放回换节点重下。
+
+    背景：2026-10-24 起检出后先换没试过的节点（OVERLAY_RETRY_OTHER_NODES），但此前
+    判死的片（06/08/19 共 818 部）只记了整片判死、没记下的是哪个节点。本工具逐片：
+      1. 只处理判死原因是 hardsub/watermark 的片；人工 reject 过的（manual）、同时
+         还有其它判死原因的、找不到当时节点列表的一律不动；
+      2. 推断当时下的节点：日志里判死前最后一次「切换备用节点 N」（没有则第 1 个），
+         对到 failed.jsonl（含 archive/）里当时的 urls；下的是 mp4 时把同一 provider
+         的全部 mp4 一起记为已检出——mp4 之间按实测码率重排、日志不记链接，定位不到
+         具体文件，而它们多半是同一片源转出的不同分辨率；
+      3. 用 results.jsonl 里该片最新的节点组去掉已检出版本：一个不剩的保持判死，
+         有剩的才迁移。
+
+    默认只看不改（打印分类计数与样例，report_path 给出逐部明细 jsonl）。apply=True 时：
+    主流程在跑则拒绝 → 备份判死台账 → 追加节点级记录（已有的不重复写）→ 被移出的判死
+    记录原样存进 archive/ → 临时文件 + 原子替换重写判死台账。每一步都可安全重跑。
+
+    data_dir：只读另一个目录里的台账与日志（在服务器上用新代码试运行时指向生产目录），
+    不能与 apply 同用。返回 {分类: 部数}。
+    """
+    if apply and data_dir:
+        raise SystemExit("--data-dir 只用于试运行，不能和 --apply 一起用")
+
+    def rebase(path):
+        if not data_dir:
+            return path
+        return os.path.join(data_dir, os.path.relpath(path, str(_SCRIPT_DIR)))
+
+    dead_log = rebase(DOWNLOAD_DEAD_LOG)
+    failed_log = rebase(FAILED_LOG)
+    archive_dir = rebase(os.path.join(str(_SCRIPT_DIR), "archive"))
+    results_log = rebase(INPUT_JSONL)
+    node_log = rebase(OVERLAY_NODE_REJECT_LOG)
+    log_path = log_path or rebase(os.path.join(str(_SCRIPT_DIR), "pipeline.log"))
+
+    def read_jsonl(path):
+        if not os.path.exists(path):
+            return
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+    # 1. 判死台账按 id 归拢。
+    dead_records = {}
+    for record in read_jsonl(dead_log):
+        tmdb_id = normalize_tmdb_id(record.get("tmdbId"))
+        if tmdb_id:
+            dead_records.setdefault(tmdb_id, []).append(record)
+    # 2. 当时的节点列表：failed.jsonl 与轮转进 archive/ 的历史里 stage=hardsub/watermark
+    #    的最后一条（archive 按文件名即时间排序，先读；当前文件最后读）。
+    failed_files = []
+    if os.path.isdir(archive_dir):
+        failed_files += sorted(
+            os.path.join(archive_dir, name) for name in os.listdir(archive_dir)
+            if name.startswith("failed_") and name.endswith(".jsonl")
+        )
+    failed_files.append(failed_log)
+    kill_urls = {}
+    for path in failed_files:
+        for record in read_jsonl(path):
+            if record.get("stage") in ("hardsub", "watermark") and record.get("urls"):
+                kill_urls[normalize_tmdb_id(record.get("tmdbId"))] = record["urls"]
+    # 3. 该片现在的节点组：results.jsonl 按 fetched_at 取最新。
+    current = {}
+    for record in read_jsonl(results_log):
+        tmdb_id = normalize_tmdb_id(record.get("tmdbId"))
+        if not tmdb_id or not record.get("urls"):
+            continue
+        previous = current.get(tmdb_id)
+        if previous is None or (parse_int(record.get("fetched_at")) or -1) >= (
+            parse_int(previous.get("fetched_at")) or -1
+        ):
+            current[tmdb_id] = record
+    existing = {}
+    for record in read_jsonl(node_log):
+        tmdb_id = normalize_tmdb_id(record.get("tmdbId"))
+        if tmdb_id and record.get("node_key"):
+            existing.setdefault(tmdb_id, set()).add(record["node_key"])
+    kill_index = _overlay_kill_node_index_from_log(log_path)
+
+    counts = {}
+    rows = []
+    migrate = {}   # tmdbId -> [(node, reason, inferred_from), ...] 要追加的节点级记录
+    for tmdb_id, records in sorted(dead_records.items()):
+        classes = {record.get("reason_class") for record in records}
+        if not classes & {"hardsub", "watermark"}:
+            continue
+        title = records[-1].get("title") or ""
+        reason = "hardsub" if "hardsub" in classes else "watermark"
+        row = {"tmdbId": tmdb_id, "title": title, "reason": reason}
+        if any(record.get("manual") for record in records):
+            row["action"] = "skip_manual"
+        elif classes - {"hardsub", "watermark"}:
+            row["action"] = "skip_other_dead_reason"
+        elif tmdb_id not in kill_urls:
+            row["action"] = "skip_no_node_list"
+        else:
+            nodes = [n for n in (_normalize_url_entry(i) for i in kill_urls[tmdb_id]) if n]
+            index = kill_index.get(tmdb_id)
+            inferred = "log" if index else "first_node"
+            if not index or index > len(nodes):
+                index, inferred = 1, "first_node"
+            used = nodes[index - 1]
+            if used["type"] == "mp4":
+                killed = [n for n in nodes
+                          if n["type"] == "mp4" and n["provider"] == used["provider"]]
+            else:
+                killed = [used]
+            rejected = {overlay_node_key(n) for n in killed} | existing.get(tmdb_id, set())
+            now_nodes = _entry_nodes(current.get(tmdb_id) or {"urls": kill_urls[tmdb_id]})
+            remaining = [n for n in now_nodes if overlay_node_key(n) not in rejected]
+            row.update(
+                inferred_from=inferred, node_index=index,
+                killed=sorted({overlay_node_key(n) for n in killed}),
+                remaining=[f"{n['provider']}/{n['type']}/{_host_of(n['url'])}" for n in remaining],
+            )
+            if remaining:
+                row["action"] = "migrate"
+                migrate[tmdb_id] = [
+                    (n, reason, inferred) for n in killed
+                    if overlay_node_key(n) not in existing.get(tmdb_id, set())
+                ]
+            else:
+                row["action"] = "stay_dead_no_other_version"
+        counts[row["action"]] = counts.get(row["action"], 0) + 1
+        if row.get("action") == "migrate":
+            key = f"migrate_inferred_from_{row['inferred_from']}"
+            counts[key] = counts.get(key, 0) + 1
+        rows.append(row)
+
+    total = len(rows)
+    labels = {
+        "migrate": "迁移（放回换节点重下）",
+        "migrate_inferred_from_log": "  其中按日志确定节点",
+        "migrate_inferred_from_first_node": "  其中日志里没有、按第 1 个节点推断",
+        "stay_dead_no_other_version": "保持判死（没有别的版本）",
+        "skip_manual": "不动（人工 reject 过）",
+        "skip_other_dead_reason": "不动（还有其它判死原因）",
+        "skip_no_node_list": "不动（找不到当时的节点列表）",
+    }
+    print(f"{'【试运行，不改任何文件】' if not apply else '【执行迁移】'}"
+          f"硬字幕/水印判死片 {total} 部（数据目录 {data_dir or _SCRIPT_DIR}）：")
+    for key, label in labels.items():
+        if counts.get(key):
+            print(f"  {label}: {counts[key]}")
+    for row in [r for r in rows if r["action"] == "migrate"][:10]:
+        print(f"  例 {row['tmdbId']} {row['title']}：{row['reason']}，"
+              f"已检出 {', '.join(row['killed'])}（{row['inferred_from']}）"
+              f" → 剩 {', '.join(row['remaining'])}")
+    if report_path:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"逐部明细: {report_path}")
+
+    if not apply or not migrate:
+        if apply:
+            print("没有需要迁移的片。")
+        return counts
+    if is_main_running():
+        print("检测到主流程正在运行；迁移会改写判死台账，请先停掉主流程再执行。")
+        return counts
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    backup = f"{dead_log}.bak_{stamp}"
+    shutil.copy2(dead_log, backup)
+    for tmdb_id, items in migrate.items():
+        title = dead_records[tmdb_id][-1].get("title") or ""
+        for node, reason, inferred in items:
+            write_log(node_log, {
+                "tmdbId": tmdb_id, "title": title,
+                "node_key": overlay_node_key(node),
+                "provider": node.get("provider"), "node_type": node.get("type"),
+                "host": _host_of(node["url"]), "reason": reason, "reasons": [reason],
+                "summary": "迁移自整片判死记录（版本为推断）",
+                "rejected_at": int(time.time()),
+                "migrated": True, "inferred_from": inferred,
+            })
+    os.makedirs(archive_dir, exist_ok=True)
+    moved_path = os.path.join(archive_dir, f"download_dead_overlay_migrated_{stamp}.jsonl")
+    kept_lines = []
+    with open(dead_log, encoding="utf-8") as fh, open(moved_path, "w", encoding="utf-8") as moved:
+        for line in fh:
+            try:
+                tmdb_id = normalize_tmdb_id(json.loads(line).get("tmdbId"))
+            except json.JSONDecodeError:
+                tmdb_id = None
+            if tmdb_id in migrate:
+                moved.write(line)
+            else:
+                kept_lines.append(line)
+    temp_path = f"{dead_log}.tmp_{stamp}"
+    with open(temp_path, "w", encoding="utf-8") as fh:
+        fh.writelines(kept_lines)
+    os.replace(temp_path, dead_log)
+    reload_overlay_node_rejects()
+    print(f"已迁移 {len(migrate)} 部：判死记录移到 {moved_path}，"
+          f"原台账备份在 {backup}。重启主流程后这些片会换剩下的节点重下。")
+    return counts
+
+
 def report_storage(since_days=None):
     """汇总 success.jsonl，打印已上传成品的累计容量（十进制 GB）。
 
@@ -8333,6 +8571,28 @@ if __name__ == "__main__":
                   "[--reason hardsub|watermark] [--dry-run]")
             raise SystemExit(2)
         reject_films(_ids, reason=_reason, dry_run=_dry)
+    elif len(sys.argv) > 1 and sys.argv[1] == "migrate-overlay-dead":
+        # migrate-overlay-dead [--apply] [--data-dir DIR] [--log PATH] [--report PATH]
+        _rest = sys.argv[2:]
+        _opts = {}
+        for _flag in ("--data-dir", "--log", "--report"):
+            if _flag in _rest:
+                _i = _rest.index(_flag)
+                if _i + 1 >= len(_rest):
+                    print(f"错误: {_flag} 后面要跟路径")
+                    raise SystemExit(2)
+                _opts[_flag] = _rest[_i + 1]
+                _rest = _rest[:_i] + _rest[_i + 2:]
+        _unknown = [a for a in _rest if a != "--apply"]
+        if _unknown:
+            print(f"错误: 无法识别 {' '.join(_unknown)}")
+            print("用法: python download_movies.py migrate-overlay-dead [--apply] "
+                  "[--data-dir DIR] [--log PATH] [--report PATH]")
+            raise SystemExit(2)
+        migrate_overlay_dead(
+            apply="--apply" in _rest, data_dir=_opts.get("--data-dir"),
+            log_path=_opts.get("--log"), report_path=_opts.get("--report"),
+        )
     elif len(sys.argv) > 1 and sys.argv[1] == "storage":
         # 可选的天数过滤：`storage 1` = 只看最近 1 天落库的片。
         # 参数非法就直接拒绝，不静默退回全量——那会让人把全量数字当成单次运行量。
