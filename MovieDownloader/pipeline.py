@@ -105,6 +105,9 @@ class QueueEntrySource:
         # 等那部片离开处理态再投。
         self._is_busy = is_busy
         self._revived_buf = []
+        # 派发闸门（download_movies.HostCapGate）据此决定能否做派发前重取：
+        # 只有能把重取结果送回下载侧的来源才行，否则闸门会一直等新链接。
+        self.delivers_refetch_results = refetcher is not None
         self._closed = False
         self._seen = set()
         self.delivered = 0
@@ -117,6 +120,10 @@ class QueueEntrySource:
     def _key(entry):
         tid = entry.get("tmdbId")
         return str(tid) if tid is not None else None
+
+    def has_buffered(self, key):
+        """该 id 的重取结果是否已收进本来源、还没投出去（派发闸门判"重取无果"用）。"""
+        return any(self._key(entry) == key for entry in self._revived_buf)
 
     def _poll_revived(self):
         """取一条可投的重取结果；没有返回 None。绝不阻塞。"""
@@ -362,6 +369,10 @@ class AsyncRefetcher:
         # 故在途期间的重复投递直接拒收；dispatch 返回实际接收条数，
         # 调用方据此决定是否计入每片重取上限。
         self._inflight_ids = set()
+        # 结果已放进 _done、还没被 collect 走的 id。与 _inflight_ids 合起来回答
+        # "这条重取还有没有下文"（is_pending）：worker 先登记这里再放结果、
+        # 最后才注销在途，collect 取走后才注销这里，故两者之间没有空窗。
+        self._unclaimed_ids = set()
         self._lock = threading.Lock()
         self.dispatched = 0
         self.skipped_inflight = 0
@@ -400,9 +411,20 @@ class AsyncRefetcher:
         out = []
         while True:
             try:
-                out.append(self._done.get_nowait())
+                entry = self._done.get_nowait()
             except queue.Empty:
                 return out
+            tid = entry.get("tmdbId")
+            if tid is not None:
+                with self._lock:
+                    self._unclaimed_ids.discard(str(tid))
+            out.append(entry)
+
+    def is_pending(self, key):
+        """该 id 的重取是否还有下文：仍在途，或结果已出来但还没被收走。"""
+        key = str(key)
+        with self._lock:
+            return key in self._inflight_ids or key in self._unclaimed_ids
 
     def pending_count(self):
         """还有多少条在途。主循环靠它决定"还要不要再等一会儿"。"""
@@ -456,6 +478,8 @@ class AsyncRefetcher:
         # 字幕列表同步：旧 captions 指向旧节点的字幕地址，跟旧 urls 一起作废；
         # 取流侧没给就置空，别让下载侧拿着过期地址去拉字幕。
         new_entry["captions"] = result.get("captions") or []
+        with self._lock:
+            self._unclaimed_ids.add(str(tmdb_id))
         self._done.put(new_entry)
         with self._lock:
             self.revived += 1
