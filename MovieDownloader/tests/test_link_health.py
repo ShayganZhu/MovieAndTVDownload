@@ -150,6 +150,18 @@ def test_all_dead_vidup_film_fails_fast_into_the_refetch_loop(monkeypatch):
     assert d.is_quality_dead(info["retriable"], info["error"], info["node_failures"]) is False
 
 
+def test_fully_pruned_film_that_already_succeeded_is_skipped_not_failed():
+    """🔴 已成功（或正在处理）的片哪怕节点全被剪光，也照旧按「已处理」跳过：
+    不能再记一条失败、再触发重取。"""
+    entry, _dead = d.prune_dead_nodes(
+        film("p1", hls("p1"), fetched_ago_min=400), NOW, {}, {"vidup": 300 * 60},
+    )
+    assert entry["urls"] == []
+    _, ok, info = d.process_one_entry(entry, {"p1"})
+    assert ok is False and info == {"error": "already processed successfully"}
+    assert "p1" not in d.processing_ids
+
+
 def test_link_health_off_keeps_every_node():
     r = Refetcher()
     entry = film("f1", vlink("f1", host=HCDN3, signed_ago_h=1), vlink("f1", signed_ago_h=30))

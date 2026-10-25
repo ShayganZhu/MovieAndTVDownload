@@ -5733,19 +5733,8 @@ def process_one_entry(entry, processed_ids):
     # 故随 conversion_job 一起传递。
     captions = entry.get("captions") or []
 
-    if normalized_id and not urls and entry.get("_dead_nodes"):
-        # 派发闸门把节点全剪掉了（链接都已知失效）：不下载，当场按「需重新取流」失败，
-        # 走主循环既有的过期重取闭环（auto_refetch）换新链接——与以前拿死链接去下、
-        # 下到 401/403/500 再重取是同一条路，只是不白占槽位、不白等超时。
-        dead_count = len(entry["_dead_nodes"])
-        return tmdb_id, False, {
-            "error": f"{dead_count} 个节点直链均已失效（派发前按年龄判定，未下载），"
-                     f"{_NEEDS_REFETCH_MARKER}",
-            "retriable": False,
-            "needs_refetch": True,
-            "node_failures": dead_node_failures(entry),
-        }
-    if not normalized_id or not urls:
+    all_pruned = bool(not urls and entry.get("_dead_nodes"))
+    if not normalized_id or (not urls and not all_pruned):
         return tmdb_id, False, {"error": "缺少 tmdbId 或 urls", "retriable": False}
 
     # 原子地检查“历史已完成”和“当前正在处理”，防止并发重复下载。
@@ -5756,6 +5745,19 @@ def process_one_entry(entry, processed_ids):
         if normalized_id in processing_ids:
             print(f"跳过当前运行中的重复条目: {tmdb_id}")
             return tmdb_id, False, {"error": "duplicate entry currently processing"}
+        if all_pruned:
+            # 派发闸门把节点全剪掉了（链接都已知失效）：不下载，当场按「需重新取流」
+            # 失败，走主循环既有的过期重取闭环（auto_refetch）换新链接——与以前拿死
+            # 链接去下、下到 401/403/500 再重取是同一条路，只是不白占槽位、不白等超时。
+            # 放在已完成 / 处理中的检查之后：已经成功的片不能再记一条失败、再去重取。
+            dead_count = len(entry["_dead_nodes"])
+            return tmdb_id, False, {
+                "error": f"{dead_count} 个节点直链均已失效（派发前按年龄判定，未下载），"
+                         f"{_NEEDS_REFETCH_MARKER}",
+                "retriable": False,
+                "needs_refetch": True,
+                "node_failures": dead_node_failures(entry),
+            }
         processing_ids.add(normalized_id)
 
     handed_off_to_conversion = False
