@@ -766,10 +766,10 @@ def test_shipped_config_values():
     assert shipped["mp4_fallback_after_seconds"] == 7200
     assert shipped["max_deferred"] == 1000
     assert shipped["playlist_500_expired_after_seconds"] == 9000
-    assert d._CFG["max_workers"] == 50
-    assert d._CFG["download_queue_depth"] == 51
+    assert d._CFG["max_workers"] == 56            # 2026-10-25：专用 40 + 普通 16
+    assert d._CFG["download_queue_depth"] == 57
     general = d._parse_general_lane(d._CFG.get("general_lane"))
-    assert general["slots"] == 10 and general["max_deferred"] == 1000
+    assert general["slots"] == 16 and general["max_deferred"] == 1000
     assert general["refetch_after_seconds"] == {"vidup": 7200, "videasy": 10800, "vidlink": 43200}
     assert general["signed_link_max_age_seconds"] == {"bcdn4.hakunaymatata.com": 86400}
     assert general["signed_link_margin_seconds"] == 3600 and general["jit_refetch_max"] == 2
