@@ -748,8 +748,13 @@ def test_parse_host_limits_zero_cap_disables_whole_host():
 
 
 def test_shipped_config_values():
-    """config.yaml 里这次定下的取值（2026-10-24 与用户确认）。"""
-    shipped = d._parse_host_limits(d._CFG.get("host_limits"))[PALEO]
+    """config.yaml 里这次定下的取值（2026-10-24 与用户确认；2026-10-25 主机换名）。
+
+    vidup 的慢主机 sun.paleoak.top 已改名 sun.finalsignal.top：专用通道必须跟着
+    新名走，否则通道空转、慢片全挤进普通槽位（24 号机 2026-10-25 实测）。"""
+    limits = d._parse_host_limits(d._CFG.get("host_limits"))
+    assert set(limits) == {"sun.finalsignal.top"}
+    shipped = limits["sun.finalsignal.top"]
     assert shipped["max_concurrent"] == 40
     assert shipped["ramp"] == {
         "steps": [16, 24, 32, 40], "step_seconds": 900.0,
@@ -768,10 +773,29 @@ def test_shipped_config_values():
     assert general["refetch_after_seconds"] == {"vidup": 7200, "videasy": 10800, "vidlink": 43200}
     assert general["signed_link_max_age_seconds"] == {"bcdn4.hakunaymatata.com": 86400}
     assert general["signed_link_margin_seconds"] == 3600 and general["jit_refetch_max"] == 2
-    assert d._parse_demote_patterns(d._CFG.get("demote_nodes")) == ["moon.zenoak.top/r2/"]
+    # zenoak 改名 goldenkite 后 /r2/ 照旧全部 502：新旧两个名字都降级。
+    assert d._parse_demote_patterns(d._CFG.get("demote_nodes")) == [
+        "moon.zenoak.top/r2/", "moon.goldenkite.top/r2/"]
     # 槽位合计不超过线程数：两条通道才真正互不占用。
     assert (shipped["max_concurrent"] + general["slots"]
             <= d._CFG["max_workers"] < d._CFG["download_queue_depth"])
+
+
+def test_shipped_config_routes_the_renamed_hosts(monkeypatch):
+    """用发布配置和真实形态的链接（2026-10-25 24 号机取到的）：finalsignal 打头的片
+    进专用通道；goldenkite /r2/ 打头时降级到最后，片按后面的 finalsignal 节点分通道；
+    goldenkite /vd/ 打头的片仍走普通通道。"""
+    monkeypatch.setattr(d, "HOST_LIMITS", d._parse_host_limits(d._CFG.get("host_limits")))
+    monkeypatch.setattr(d, "DEMOTE_NODE_PATTERNS", d._parse_demote_patterns(d._CFG.get("demote_nodes")))
+    fs = {"url": "https://sun.finalsignal.top/b3f8c21a/ma9y/master.m3u8", "provider": "vidup", "type": "m3u8"}
+    r2 = {"url": "https://moon.goldenkite.top/r2/cdn1/dHBk/playlist.m3u8", "provider": "vidup", "type": "m3u8"}
+    vd = {"url": "https://moon.goldenkite.top/vd/abc/master.m3u8", "provider": "vidup", "type": "m3u8"}
+
+    assert d.capped_host_of({"tmdbId": "1", "urls": [fs]}) == "sun.finalsignal.top"
+    entry, moved = d.demote_dead_nodes({"tmdbId": "2", "urls": [r2, fs]})
+    assert moved and [u["url"] for u in entry["urls"]] == [fs["url"], r2["url"]]
+    assert d.capped_host_of({"tmdbId": "2", "urls": [r2, fs]}) == "sun.finalsignal.top"
+    assert d.capped_host_of({"tmdbId": "3", "urls": [vd, fs]}) is None
 
 
 # ------------------------------------------------------------ 播放列表 500

@@ -365,7 +365,7 @@ download_movies:
     # 下调零风险：重取失败仍回退到旧链接，不会因此丢片（见上一段）。
     #
     # 📌 pipeline 模式下，下面 host_limits 里配了 refetch_after_minutes 的主机
-    # （sun.paleoak.top）**不走本项**：它们改由派发前按实测有效期就地重取，
+    # （sun.finalsignal.top，原 sun.paleoak.top）**不走本项**：它们改由派发前按实测有效期就地重取，
     # 启动时整批重取几千条存量只会让大部分新链接在排队中再过期一次。
     # 单独跑 download_movies.py 时没有派发闸门，那些主机的条目按
     # refetch_after_minutes 判陈旧（比本项严）。
@@ -388,8 +388,16 @@ download_movies:
   # 2026-10-24 由 6 改为专用 40 并分档放量：10-24 23 号机 2h43m 实测，上限 6 时
   # paleoak 熔断 0 次、分片重试只有 52 次（约 0.05%），源站吃得消；但每小时只能
   # 下完 30~40 部、需求 ~137 部，排队涨到 177 部、最久 2 小时。
+  #
+  # 🔴 2026-10-25 主机换名：vidup 的这台 HLS 主机从 sun.paleoak.top 改叫
+  # sun.finalsignal.top——路径同为 /b3f8c21a/，24 号机实测单连接 0.74~0.85 Mbps、
+  # TTFB 1.4~1.8s，与 paleoak 是同一个过载的源站。按旧名配置时专用通道整夜 0 部在途，
+  # finalsignal 打头的片（重启后新取的 9508 部里 2134 部，主机里最多）全挤进 10 个
+  # 普通槽位，普通通道排到 8499 部、最久 471 分钟，每小时只上传 ~50 部。
+  # 旧名的存量链接早已过 ~3h 有效期，派发前重取回来就是新名，故直接改名、不保留旧名。
+  # 下文注释里的 "paleoak" 即指这台主机。
   host_limits:
-    sun.paleoak.top:
+    sun.finalsignal.top:
       max_concurrent: 40       # 专用槽位（放量终点）
       # 分档放量：从第一档起，每 step_minutes（一个「窗口」）看一次该主机的表现：
       #   坏 = 熔断 ≥ backoff_breaker_trips 次；或出过问题的分片占比
@@ -611,8 +619,11 @@ download_movies:
   # zenoak /r2/：19 号机 1528 次、23 号机 349 次请求全部 502，从未成功；它常排在
   # paleoak 节点前面，不降级的话这类片会被当成普通片、绕开 paleoak 专用槽位
   # （2026-10-24 23 号机实测：paleoak 打头的片被这类片挤得只下完 19/235）。
+  # 2026-10-25：zenoak 已改名 moon.goldenkite.top，/r2/ 照旧全部 502（24 号机 118 次
+  # 失败全是 /r2/）；/vd/ 正常（分片在 wisenorth.top，10~14 Mbps）。旧名保留无害。
   demote_nodes:
     - "moon.zenoak.top/r2/"
+    - "moon.goldenkite.top/r2/"
   # 主循环同时持有的「下载 future」上限（分批投递深度）。必须 > max_workers，
   # 否则下载池喂不满。一次性把整轮几十万部全投进 pending 会让 wait() 每次对全部
   # 未完成 future 挂/摘 waiter，主循环退化成 O(N²)；分批后 wait 规模恒定。
