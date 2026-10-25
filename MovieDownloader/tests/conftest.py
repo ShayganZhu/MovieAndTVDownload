@@ -62,4 +62,7 @@ def _isolate_hardsub_check(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "GENERAL_LANE_CFG", dict(
         d.GENERAL_LANE_CFG, refetch_after_seconds={}, signed_link_max_age_seconds={},
     ))
+    # 派发前筛查（剪掉已知失效节点、vidlink 挂起重取）默认关掉：许多用例的条目
+    # fetched_at 是很久以前的固定值，开着会被当成失效链接剪掉。需要它的用例自行配置。
+    monkeypatch.setattr(d, "LINK_HEALTH_CFG", d._parse_link_health(None))
     yield

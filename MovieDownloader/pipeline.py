@@ -44,8 +44,8 @@ QUEUE_MAXSIZE = max(1, int(_PIPELINE_CFG.get("queue_maxsize", 512)))
 
 # 取流侧入队的最长等待（秒）。只在**队列满**时才起作用：队列满且下载侧长时间
 # 不消费时，不能让取流线程永久卡死（那样 Ctrl+C 都退不出去），
-# 超时就放弃走快车道——结果**已经落盘 results.jsonl**，下次运行仍能读到，
-# 是「推迟」而非「丢失」。
+# 超时就转入溢出缓冲（FetchWorker.overflow），本轮在实时队列之后接着下；
+# 结果也**已经落盘 results.jsonl**，中断了下次运行仍能读到。
 #
 # 按设计它**基本不该触发**（取流是瓶颈、队列长期偏空）。真频繁触发说明
 # "取流是瓶颈"的判断错了，那是要重新设计的信号，不是靠调这个数字解决。
@@ -85,10 +85,20 @@ class QueueEntrySource:
     ——新链接明明换回来了，本次运行却没有轮次去下。这里让来源直接从
     refetcher 拿结果，随到随投；且 backlog 与队列都发完后，只要还有重取在途
     就返回 wait 而不是 done，让首轮把最后几条也等回来下掉。
+
+    🔴 溢出片当轮下完（2026-10-26）：队列满 ENQUEUE_TIMEOUT 后取流侧不再干等，
+    结果改放进 overflow（无界缓冲）。以前这些片只落盘、本次运行就再没人下
+    （06 号机第一轮 2126 部、24 号机 3016 部，都得等手动重跑）。溢出片排在
+    实时队列之后、backlog 之前：它们是本轮刚取到的链接，比 backlog 新鲜；
+    它们的链接在缓冲里放久了，派发闸门照样按年龄先换新再下。
     """
 
-    def __init__(self, q, backlog=(), refetcher=None, is_busy=None):
+    def __init__(self, q, backlog=(), refetcher=None, is_busy=None, overflow=None):
         self._q = q
+        # FetchWorker 的溢出缓冲（queue.Queue，无界）。取流线程往里放、本来源取，
+        # 都是非阻塞调用。None = 没有溢出缓冲（老调用方）。
+        self._overflow = overflow
+        self.overflow_delivered = 0
         self._backlog = list(backlog)
         self._backlog_next = 0
         # backlog 里每个 id 的位置：重取结果若先于对应存量条目回来，就地替换
@@ -185,7 +195,24 @@ class QueueEntrySource:
             self.delivered += 1
             return "item", item
 
-        # ③ 队列空档（或已关闭）：发一条断点续跑存量。
+        # ③ 溢出缓冲：本轮取到、当时队列满没挤进来的片。哨兵是取流主任务结束后
+        # 才放的，而溢出只发生在主任务里，故队列关闭时缓冲里的片都已到齐。
+        while self._overflow is not None:
+            try:
+                item = self._overflow.get_nowait()
+            except queue.Empty:
+                break
+            key = self._key(item)
+            if key is not None and key in self._seen:
+                self.skipped_duplicates += 1
+                continue
+            if key is not None:
+                self._seen.add(key)
+            self.delivered += 1
+            self.overflow_delivered += 1
+            return "item", item
+
+        # ④ 队列空档（或已关闭）：发一条断点续跑存量。
         while self._backlog_next < len(self._backlog):
             entry = self._backlog[self._backlog_next]
             self._backlog_next += 1
@@ -200,7 +227,7 @@ class QueueEntrySource:
             self.delivered += 1
             return "item", entry
 
-        # ④ 三处都没货。取流没收工 → wait；收工了再看重取：
+        # ⑤ 四处都没货。取流没收工 → wait；收工了再看重取：
         #    有在途 / 有压在缓冲里等下载槽位腾出的 → wait，本轮把它们等回来下掉；
         #    否则再收一次尾（worker 是先 put 结果再减在途计数，故在途归零时
         #    结果必已入队，这一收不会漏）→ 有就发，没有才 done。
@@ -247,6 +274,9 @@ class FetchWorker:
         self.error = None
         self.enqueued = 0
         self.dropped = 0
+        # 溢出缓冲：入队等满 ENQUEUE_TIMEOUT 仍放不进去的结果。无界，本轮由
+        # QueueEntrySource 在实时队列之后接着发（见其文档「溢出片当轮下完」）。
+        self.overflow = queue.Queue()
 
     def _on_result(self, result):
         """取流侧每拿到一条 ok 结果就回调这里（在其写盘锁**之外**）。
@@ -261,12 +291,13 @@ class FetchWorker:
             self._q.put(result, timeout=ENQUEUE_TIMEOUT)
             self.enqueued += 1
         except queue.Full:
-            # 结果已落盘 results.jsonl，走不了快车道也不算丢：
-            # 下次运行会从文件里读到它。只是本次跑不到而已。
+            # 反压已经给过了（这一条等了 ENQUEUE_TIMEOUT）：放进溢出缓冲，本轮稍后
+            # 照样下载。结果本来也已落盘 results.jsonl，中断时下次运行仍能读到。
+            self.overflow.put(result)
             self.dropped += 1
             print(
                 f"⚠️ [pipeline] 队列满 {ENQUEUE_TIMEOUT}s，"
-                f"{result.get('tmdbId')} 改由 results.jsonl 落盘承接（不丢片）",
+                f"{result.get('tmdbId')} 转入溢出缓冲，本轮稍后下载（已落盘，不丢片）",
                 flush=True,
             )
 
@@ -476,6 +507,8 @@ class AsyncRefetcher:
         new_entry = dict(entry)
         new_entry["urls"] = result["urls"]
         new_entry["fetched_at"] = result.get("fetched_at")
+        # 派发闸门剪掉的失效节点记录随旧链接一起作废：新结果是整组新节点。
+        new_entry.pop("_dead_nodes", None)
         # 字幕列表同步：旧 captions 指向旧节点的字幕地址，跟旧 urls 一起作废；
         # 取流侧没给就置空，别让下载侧拿着过期地址去拉字幕。
         new_entry["captions"] = result.get("captions") or []
@@ -554,7 +587,8 @@ def main():
             # 但投递顺序是 重取结果 > 实时队列 > 存量：实时队列里的直链最新鲜，
             # 且队列满会让取流侧 120s 后丢条目，不能让大存量把它们挤掉（R-A）。
             holder["source"] = QueueEntrySource(
-                q, backlog=entries, refetcher=refetcher, is_busy=_is_busy
+                q, backlog=entries, refetcher=refetcher, is_busy=_is_busy,
+                overflow=worker.overflow,
             )
             if holder["source"].backlog_total:
                 print(
@@ -591,9 +625,11 @@ def _print_summary(worker, source, refetcher, started, interrupted=False):
     delivered = source.delivered if source else 0
     elapsed = time.time() - started
     print("\n" + "=" * 70)
+    overflow_done = getattr(source, "overflow_delivered", 0) if source else 0
     print(f"[pipeline] {'已中断' if interrupted else '结束'}："
           f"取流入队 {worker.enqueued} 部"
-          + (f"（{worker.dropped} 部改走文件承接）" if worker.dropped else "")
+          + (f"（另有 {worker.dropped} 部队列满转入溢出缓冲，本轮已发出 {overflow_done} 部）"
+             if worker.dropped else "")
           + f"，下载侧消费 {delivered} 部，总耗时 {elapsed / 60:.1f} 分钟")
     if refetcher is not None and refetcher.dispatched:
         stranded = refetcher.dispatched - refetcher.revived

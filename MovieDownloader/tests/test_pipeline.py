@@ -879,3 +879,105 @@ def test_main_passes_cli_providers_to_refetcher(monkeypatch):
     captured.clear()
     p.main()
     assert captured["hook"]._providers is None
+
+
+# ------------------------------------------------- 溢出片当轮下完（2026-10-26）
+
+def test_full_queue_moves_result_into_overflow_instead_of_losing_it(monkeypatch):
+    """队列满等满 ENQUEUE_TIMEOUT 后，结果进溢出缓冲（本轮稍后下），不再只落盘。"""
+    monkeypatch.setattr(p, "ENQUEUE_TIMEOUT", 0.05)
+    q = queue.Queue(maxsize=1)
+    q.put({"tmdbId": "occupied"})
+    worker = p.FetchWorker(q)
+
+    worker._on_result({"tmdbId": "late"})
+
+    assert worker.dropped == 1 and worker.enqueued == 0
+    assert worker.overflow.get_nowait()["tmdbId"] == "late"
+
+
+def test_overflow_is_delivered_after_queue_and_before_backlog():
+    q, overflow = queue.Queue(), queue.Queue()
+    source = p.QueueEntrySource(q, backlog=[{"tmdbId": "b"}], overflow=overflow)
+    overflow.put({"tmdbId": "o"})
+    q.put({"tmdbId": "q"})
+
+    assert [source.poll()[1]["tmdbId"] for _ in range(3)] == ["q", "o", "b"]
+    assert source.overflow_delivered == 1
+
+
+def test_overflow_is_drained_before_the_source_reports_done():
+    """🔴 关键：取流收工（哨兵）后溢出缓冲里还有片，必须发完再报 done，
+    否则这些片又只能等下次运行（06 号机第一轮 2126 部就是这么留下的）。"""
+    q, overflow = queue.Queue(), queue.Queue()
+    source = p.QueueEntrySource(q, overflow=overflow)
+    overflow.put({"tmdbId": "o1"})
+    overflow.put({"tmdbId": "o2"})
+    q.put(p._SENTINEL)
+
+    got = [source.poll() for _ in range(3)]
+    assert [(state, e and e["tmdbId"]) for state, e in got] == [
+        ("item", "o1"), ("item", "o2"), ("done", None)]
+
+
+def test_overflow_duplicates_are_skipped():
+    """同一部片已从队列或 backlog 发过（溢出前的那份），溢出缓冲里的就跳过。"""
+    q, overflow = queue.Queue(), queue.Queue()
+    source = p.QueueEntrySource(q, backlog=[{"tmdbId": "1"}], overflow=overflow)
+    q.put({"tmdbId": "2"})
+    overflow.put({"tmdbId": "2"})
+    overflow.put({"tmdbId": "3"})
+    q.put(p._SENTINEL)
+
+    ids = []
+    while True:
+        state, entry = source.poll()
+        if state != "item":
+            break
+        ids.append(entry["tmdbId"])
+    assert ids == ["2", "3", "1"]
+    assert source.skipped_duplicates == 1
+
+
+def test_worker_overflow_reaches_the_first_round_source(monkeypatch):
+    """端到端：队列很小、下载侧先不消费 → 溢出；之后这些片照样从来源发出来。"""
+    monkeypatch.setattr(p, "ENQUEUE_TIMEOUT", 0.05)
+
+    def produce(argv=None, on_result=None, stop_event=None):
+        for i in range(4):
+            on_result({"tmdbId": str(i)})
+
+    monkeypatch.setattr(p.fetcher, "main", produce)
+    q = queue.Queue(maxsize=1)
+    worker = p.FetchWorker(q)
+    source = p.QueueEntrySource(q, overflow=worker.overflow)
+    worker.start()
+    worker._main_done.wait(5)
+
+    ids, deadline = [], time.time() + 5
+    while time.time() < deadline:
+        state, entry = source.poll()
+        if state == "done":
+            break
+        if state == "item":
+            ids.append(entry["tmdbId"])
+    assert sorted(ids) == ["0", "1", "2", "3"]
+    assert worker.dropped >= 1 and source.overflow_delivered == worker.dropped
+    worker.shutdown(timeout=5)
+
+
+def test_refetched_entry_drops_stale_dead_node_record(monkeypatch, tmp_path):
+    """重取换回整组新节点：派发闸门记下的「已剪掉的失效节点」随旧链接作废。"""
+    outcomes = {"7": ("ok", {"tmdbId": "7", "urls": [{"url": "https://new/a.mp4"}],
+                            "fetched_at": 1})}
+    r, stop, written = _make_refetcher(monkeypatch, tmp_path, outcomes)
+    try:
+        r.dispatch([{"tmdbId": "7", "urls": [], "_dead_nodes": [{"url": "https://old"}]}])
+        deadline = time.time() + 5
+        got = []
+        while not got and time.time() < deadline:
+            got = r.collect()
+            time.sleep(0.05)
+        assert got and "_dead_nodes" not in got[0]
+    finally:
+        stop.set()

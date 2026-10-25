@@ -5,6 +5,7 @@ import difflib
 import json
 import functools
 import hashlib
+import heapq
 import importlib
 import os
 import math
@@ -363,6 +364,54 @@ def _parse_general_lane(raw):
     }
 
 
+def _parse_link_health(raw):
+    """link_health（2026-10-26）：派发前剪掉已知失效的节点、vidlink 缓存挂起重取。
+
+    整段不配 = 都不做（闸门照旧把所有节点派出去试）。
+      dead_after_minutes   provider → 节点年龄（按 fetched_at）超过即视为已失效；
+                           签名主机另按 general_lane.signed_link_max_age_hours 判。
+      vidlink_cache_roll_hours  vidlink 按片缓存链接，约在签名时刻 t= 之后这么久刷新。
+      park_retry_hours     算不出刷新时刻（或到点了还没刷新）时，隔多久再重取。
+      park_max_per_movie   每片每次运行最多挂起几次，用完就留给下次运行。
+      park_end_wait_minutes  其余活都干完时，最早一部挂起片再过多久就到点才等它。
+      broken_vidlink_hosts  长期坏掉的 vidlink 主机：片子只剩这些主机上的节点时也挂起，
+                           等缓存刷新换主机（不看 mp4 主机熔断——它 15 秒就复位，是给
+                           分钟级抖动用的，不能当成「到缓存刷新前都坏」的依据）。
+    """
+    raw = raw or {}
+
+    def _float(name, default):
+        try:
+            value = float(raw.get(name, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        return max(0.0, value)
+
+    dead = {}
+    for provider, minutes in (raw.get("dead_after_minutes") or {}).items():
+        try:
+            if float(minutes) > 0:
+                dead[str(provider)] = float(minutes) * 60
+        except (TypeError, ValueError):
+            continue
+    try:
+        park_max = max(0, int(raw.get("park_max_per_movie", 2) or 0))
+    except (TypeError, ValueError):
+        park_max = 2
+    return {
+        "enabled": bool(raw) and bool(raw.get("enabled", True)),
+        "dead_after_seconds": dead,
+        "vidlink_cache_roll_seconds": _float("vidlink_cache_roll_hours", 49) * 3600,
+        "park_retry_seconds": _float("park_retry_hours", 6) * 3600,
+        "park_max_per_movie": park_max,
+        "park_end_wait_seconds": _float("park_end_wait_minutes", 30) * 60,
+        "broken_vidlink_hosts": {
+            str(host).strip().lower() for host in (raw.get("broken_vidlink_hosts") or [])
+            if str(host).strip()
+        },
+    }
+
+
 def _parse_demote_patterns(raw):
     """demote_nodes：「主机/路径前缀」列表，统一成不带协议头的小写。"""
     patterns = []
@@ -383,6 +432,8 @@ HOST_LIMITS = _parse_host_limits(_CFG.get("host_limits"))
 GENERAL_LANE_CFG = _parse_general_lane(_CFG.get("general_lane"))
 # 长期不可用的节点路径：派发和下载时挪到节点列表最后（不删，仍作最后一试）。
 DEMOTE_NODE_PATTERNS = _parse_demote_patterns(_CFG.get("demote_nodes"))
+# 派发前剪掉已知失效的节点、vidlink 缓存挂起重取（2026-10-26，见 HostCapGate._screen）。
+LINK_HEALTH_CFG = _parse_link_health(_CFG.get("link_health"))
 
 # 流式来源（§12）下"在途任务已排空、生产者仍未产出新片"时的轮询间隔（秒）。
 # 只在这一种情况下才会 sleep：此刻 pending 为空，wait() 会立即返回、退化成
@@ -1843,6 +1894,47 @@ def dead_record_passes_now(record):
     return current * DEAD_REVIVE_MARGIN <= float(bitrate)
 
 
+def dead_node_failures(entry):
+    """派发闸门剪掉的失效节点（entry["_dead_nodes"]）→ 逐节点归因记录。
+
+    它们挂「需重新取流」、不可重试（同一条链接再下也是失效）：从没给出过画质结论，
+    剩下的节点再差也不能据此把整片判死（is_quality_dead 要求每个节点都是画质类目）。
+    """
+    failures = []
+    for dead in entry.get("_dead_nodes") or []:
+        error = (
+            f"直链已失效（派发前按年龄判定，未下载：{dead.get('reason')}），"
+            f"{_NEEDS_REFETCH_MARKER}: {dead.get('url')}"
+        )
+        failures.append({
+            "node_index": None,
+            "provider": dead.get("provider"),
+            "node_type": dead.get("type"),
+            "reason_class": classify_reject_reason(error),
+            "retriable": False,
+            "error": error,
+            "skipped_before_dispatch": True,
+        })
+    return failures
+
+
+def record_dispatch_skip(entry, message):
+    """派发闸门判定本次不下载的片（vidlink 等不到缓存刷新）：落 failed.jsonl。
+
+    error 挂「需重新取流」：下次运行重取后再试，--refetch-failed 也挑得到。
+    不进 download_dead：没下载过，谈不上画质结论。
+    """
+    write_log(FAILED_LOG, {
+        "tmdbId": entry.get("tmdbId"),
+        "title": entry.get("title") or "",
+        "urls": entry.get("urls", []),
+        "error": message,
+        "stage": "dispatch",
+        "retriable": False,
+        "node_failures": dead_node_failures(entry),
+    })
+
+
 def record_quality_dead(tmdb_id, title, error_msg, urls=None):
     """把一部画质判死片记进 DOWNLOAD_DEAD_LOG（纯追加）。
 
@@ -2113,6 +2205,8 @@ def refetch_entries(entries, refetch_counts):
                 new_entry = dict(entry)
                 new_entry["urls"] = result["urls"]
                 new_entry["fetched_at"] = result.get("fetched_at")
+                # 派发闸门剪掉的失效节点记录随旧链接一起作废：新结果是整组新节点。
+                new_entry.pop("_dead_nodes", None)
                 # captions 同属取流产物，必须跟着一起更新：重取那次可能比原先
                 # 多拿到（或少拿到）字幕，沿用旧值会让字幕与 urls 来自不同批次。
                 new_entry["captions"] = result.get("captions") or []
@@ -2534,6 +2628,56 @@ def _merge_missing_providers(new, old):
     return merged, True
 
 
+def node_dead_reason(entry, node, now, signed_max_age, dead_after):
+    """这个节点的链接是否已知失效：失效返回说明文字，否则 None。
+
+    只认实测过的两条（宁可漏判，不可误判——漏判只是多试一次，误判是少一个节点）：
+      - 签名主机（如 bcdn4）：url 里 t= 签名时刻起过了 max_age 必 403
+        （10-24 23 号机：24 小时内 24/24 成功、之后 394/394 失败）；
+      - 其余按 provider：节点年龄（node_link_age）过了 dead_after
+        （实测 videasy ~240 分钟、vidup ~181 分钟起失效，阈值留余量）。
+    没有 fetched_at / t= 的一律不判失效。
+    """
+    url = node["url"]
+    max_age = signed_max_age.get(_host_of(url))
+    signed_at = _signed_at(url) if max_age else None
+    if signed_at and now - signed_at >= max_age:
+        return f"签名已 {(now - signed_at) / 3600:.1f} 小时（{_host_of(url)} {max_age / 3600:.0f} 小时过期）"
+    limit = dead_after.get(node["provider"])
+    if limit:
+        age = node_link_age(entry, node, now)
+        if age is not None and age >= limit:
+            return f"{node['provider']} 链接已 {age / 60:.0f} 分钟（{limit / 60:.0f} 分钟即失效）"
+    return None
+
+
+def prune_dead_nodes(entry, now, signed_max_age, dead_after):
+    """去掉已知失效的节点：返回 (新条目, [(节点, 说明)])；没有失效节点时原样返回 entry。
+
+    被去掉的节点记进新条目的 `_dead_nodes`（累加），process_one_entry 会把它们当成
+    「直链已失效、需重新取流」的失败节点计入逐节点归因——少试的节点从没给出过画质
+    结论，不能让剩下的节点单独把整片判成画质不达标（判死红线，见 is_quality_dead）。
+    """
+    raw = list(entry.get("urls") or [])
+    keep, dead = [], []
+    for item in raw:
+        node = _normalize_url_entry(item)
+        reason = node_dead_reason(entry, node, now, signed_max_age, dead_after) if node else None
+        if reason is None:
+            keep.append(item)
+        else:
+            dead.append((node, reason))
+    if not dead:
+        return entry, []
+    pruned = dict(entry)
+    pruned["urls"] = keep
+    pruned["_dead_nodes"] = list(entry.get("_dead_nodes") or []) + [
+        {"provider": node["provider"], "type": node["type"], "url": node["url"], "reason": reason}
+        for node, reason in dead
+    ]
+    return pruned, dead
+
+
 # mp4 兜底画质评估结论为「测不出」时，隔多久再评估一次（秒）。
 FALLBACK_PROBE_RETRY_SECONDS = 1800
 # 同时在跑的 mp4 兜底画质评估上限（每次评估 = 1 次播放列表请求 + mp4 头部采样）。
@@ -2780,6 +2924,14 @@ class HostCapGate:
        的片，先在后台评估 mp4 实测分辨率是否不低于 HLS 声明的最高档
        （compare_fallback_quality）；不低才把 mp4 挪到最前派发。兜底的片占**普通**
        通道的名额（它下的是 mp4），普通通道满时不评估也不兜底。
+    5. **派发前筛查**（link_health，2026-10-26，见 _screen）：真正派发前剪掉已知
+       失效的节点（签名过期 / 年龄超过实测有效期），不拿死链接去占下载槽位。
+       一个能用的节点都不剩时：有 vidup / videasy 这类一取就新的节点，照常派出去、
+       由 process_one_entry 当场按「需重新取流」失败，走既有的过期重取闭环；只剩
+       过期的 vidlink 链接（或只在 broken_vidlink_hosts 上）的，挂起到 vidlink 缓存
+       刷新（签名时刻 + vidlink_cache_roll_hours）再重取——缓存刷新前重取只会拿回
+       同一条死链接（10-25 实测：48 小时后 8/8 换到新签名）；挂起次数用完、或本轮
+       等不到的，本次不下载，记一条「需重新取流」留给下次运行。
 
     🔴 本轮收尾：来源取空后，只要还有排队 / 等重取的片，就报 wait 而不是 done。
     排队只在内存里：中断时这些片本就在 results.jsonl 里，下次运行是存量。
@@ -2791,8 +2943,17 @@ class HostCapGate:
     STATUS_INTERVAL_SECONDS = 600
 
     def __init__(self, limits, refetcher=None, extra_active=None, clock=None,
-                 probe_submit=None, general=None, segment_stats=None):
+                 probe_submit=None, general=None, segment_stats=None,
+                 health=None, on_skip=None):
         self._limits = limits
+        # 派发前筛查设置（_parse_link_health 的结果）；None / 没启用 = 不筛查。
+        self._health = health or _parse_link_health(None)
+        # on_skip(entry, 说明)：一部片本次不下载时调（落 failed.jsonl）。None = 只打日志。
+        self._on_skip = on_skip
+        # 挂起等 vidlink 缓存刷新的片：(到点时刻, 序号, tmdbId, 条目) 的小根堆。
+        self._parked = []
+        self._park_seq = 0
+        self._park_counts = {}        # tmdbId -> 本次运行已挂起次数
         # 判断「重取是否还有下文」要靠 is_pending；没有它就无法安全地等结果。
         self._refetcher = refetcher if hasattr(refetcher, "is_pending") else None
         self._extra_active = extra_active or (lambda host: 0)
@@ -2833,6 +2994,8 @@ class HostCapGate:
             "deferred": 0, "general_deferred": 0, "mp4_fallback": 0, "fallback_lower": 0,
             "jit_refetch": 0, "jit_partial": 0, "jit_no_result": 0, "jit_budget_out": 0,
             "general_jit_refetch": 0, "jit_same_link": 0, "demoted": 0,
+            "dead_nodes_pruned": 0, "dead_link_failed": 0, "dead_link_skipped": 0, "parked": 0,
+            "park_refetch": 0, "park_flushed": 0,
         }
 
     # ---- 主循环接口 ----
@@ -2868,6 +3031,7 @@ class HostCapGate:
         for ramp in self._ramps.values():
             ramp.tick(now)
         self.print_status(now)
+        self._release_due_parked(now)
         while True:
             entry = self._next_from_queues(now)
             if entry is not None:
@@ -2896,6 +3060,11 @@ class HostCapGate:
             lane for queues in self._queues.values() for lane in queues.values()
         ):
             return "wait", None
+        if self._parked:
+            # 其余活都干完了，只剩挂起片：快到点的等一等，远的不拖住本轮收尾。
+            if self._parked[0][0] <= now + self._health["park_end_wait_seconds"]:
+                return "wait", None
+            self._flush_parked(now)
         return "done", None
 
     def print_status(self, now=None, force=False):
@@ -2929,6 +3098,15 @@ class HostCapGate:
             f"节点降级的片 {s['demoted']} 部；重取换回同一条链接 {s['jit_same_link']} 部",
             flush=True,
         )
+        if self._health["enabled"]:
+            print(
+                f"[派发前筛查] 剪掉已知失效节点 {s['dead_nodes_pruned']} 个；节点全失效、"
+                f"不下载直接转重取 {s['dead_link_failed']} 部，只剩 vidlink 死链接 / 故障主机、本次不下 "
+                f"{s['dead_link_skipped']} 部；"
+                f"等 vidlink 缓存刷新挂起 {s['parked']} 次（在挂 {len(self._parked)} 部，"
+                f"到点重取 {s['park_refetch']} 次，收尾时没等到 {s['park_flushed']} 部）",
+                flush=True,
+            )
 
     # ---- 内部 ----
     @staticmethod
@@ -2968,6 +3146,8 @@ class HostCapGate:
         for host, queues in self._queues.items():
             if self._room(GENERAL_LANE):
                 entry = self._pop_mp4_fallback(host, queues, now)
+                if entry is not None:
+                    entry = self._screen(entry, None, self._key(entry), now)
                 if entry is not None:
                     self._reserve(entry, GENERAL_LANE)
                     return entry
@@ -3137,12 +3317,132 @@ class HostCapGate:
                   flush=True)
 
     def _deliver(self, entry, host, key, now):
-        """派发前的最后一关：链接太旧就先送去重取（返回 None），否则占名额放行。"""
+        """派发前的最后一关：链接太旧就先送去重取（返回 None）；再筛掉已知失效的节点
+        （_screen，可能挂起 / 跳过 / 换通道，都返回 None）；否则占名额放行。"""
         if self._send_to_refetch(entry, key, now):
+            return None
+        entry = self._screen(entry, host, key, now)
+        if entry is None:
             return None
         self._reserve(entry, host or GENERAL_LANE)
         self._first_deferred_at.pop(key, None)
         return entry
+
+    # ---- 派发前筛查（link_health）----
+    def _screen(self, entry, host, key, now):
+        """剪掉已知失效的节点。返回能在 host 通道派发的条目；挂起 / 跳过 / 剪完换了
+        通道（放回 _held 重新分）时返回 None。没启用 link_health 时原样返回。"""
+        if not self._health["enabled"] or key is None:
+            return entry
+        entry, dead = prune_dead_nodes(
+            entry, now, self._general["signed_link_max_age_seconds"],
+            self._health["dead_after_seconds"],
+        )
+        if dead:
+            self.stats["dead_nodes_pruned"] += len(dead)
+        live = _entry_nodes(entry)
+        broken = [n for n in live if n["provider"] == "vidlink"
+                  and _host_of(n["url"]) in self._health["broken_vidlink_hosts"]]
+        if len(broken) < len(live):
+            if dead and capped_host_of(entry) != host:
+                # 剪掉节点后第一个节点换了主机：回闸门按新的第一个节点重新分通道。
+                self._held.appendleft(entry)
+                return None
+            return entry
+        # 没有能下的节点了。看这一代链接累计剪掉的（重取无果收回的条目这次剪不出新的），
+        # 本来就没有节点的照旧交给 process_one_entry 判。
+        dead_nodes = entry.get("_dead_nodes") or []
+        if not dead_nodes and not broken:
+            return entry
+        if any(n.get("provider") != "vidlink" for n in dead_nodes):
+            # 有一取就是新签名的节点（vidup / videasy）：照常派出去——process_one_entry
+            # 不下剪掉的节点、当场按「需重新取流」失败，走既有的过期重取闭环换新链接
+            # （config：派发前重取额度用完后「真过期会 401/500，走既有的过期重取闭环」）。
+            self.stats["dead_link_failed"] += 1
+            return entry
+        # 只剩 vidlink：缓存刷新前重取只会拿回同一条，挂起到刷新再重取；挂不了的留给下次运行。
+        reasons = [n.get("reason") for n in dead_nodes] + [
+            f"{_host_of(n['url'])} 长期故障" for n in broken
+        ]
+        due = self._park_due(key, dead_nodes + broken, now)
+        if due is not None:
+            self._park(entry, key, due, now, "；".join(reasons))
+            return None
+        self._skip(entry, key, f"没有可用的节点（{'；'.join(reasons)}），本次不下载")
+        return None
+
+    def _park_due(self, key, stuck, now):
+        """挂起到什么时候：vidlink 缓存预计在签名时刻 + cache_roll 刷新。返回 None 表示不挂起
+        （本轮收不到重取结果、或这部片本次运行的挂起次数已用完）。"""
+        if not self._jit_enabled:
+            return None
+        if self._park_counts.get(key, 0) >= self._health["park_max_per_movie"]:
+            return None
+        retry = self._health["park_retry_seconds"]
+        signed = [_signed_at(n["url"]) for n in stuck]
+        rolls = [t + self._health["vidlink_cache_roll_seconds"] for t in signed if t]
+        due = min(rolls) if rolls else now + retry
+        if due <= now:
+            # 按签名时刻早该刷新了：本次运行还没为它挂起重取过就马上重取，重取过还是
+            # 这条（缓存比预计的久）就隔 park_retry 再试。
+            due = now if not self._park_counts.get(key) else now + retry
+        return due
+
+    def _park(self, entry, key, due, now, reason):
+        self._park_counts[key] = self._park_counts.get(key, 0) + 1
+        self._park_seq += 1
+        heapq.heappush(self._parked, (due, self._park_seq, key, entry))
+        self._first_deferred_at.pop(key, None)
+        self.stats["parked"] += 1
+        when = time.strftime("%m-%d %H:%M", time.gmtime(due))
+        print(
+            f"  [挂起待重取] {key}: {reason}；vidlink 缓存预计 {when} UTC 刷新，届时重取"
+            f"（第 {self._park_counts[key]}/{self._health['park_max_per_movie']} 次）",
+            flush=True,
+        )
+
+    def _release_due_parked(self, now):
+        """到点的挂起片送去重取。新结果照常经来源回到 _admit（同一条链接、补节点那套）。"""
+        while self._parked and self._parked[0][0] <= now:
+            _due, _seq, key, entry = heapq.heappop(self._parked)
+            if not self._jit_enabled:
+                # 本轮来源收不回重取结果（只有首轮能）：等不到新链接，留给下次运行。
+                self._skip(entry, key, "挂起到点，但本轮收不到重取结果，本次不下载", count=False)
+                continue
+            try:
+                self._refetcher.dispatch([entry])
+            except Exception as exc:  # noqa: BLE001
+                self._skip(entry, key, f"挂起到点后重取投递失败（{exc}），本次不下载")
+                continue
+            self._refetching[key] = entry
+            # 换回的是新一代链接：上一次留下的「不再派发前重取」作废。这次重取本身就是
+            # 派发前重取，结果回来后的那次派发不再查年龄——缓存还没刷新、换回同一条死链接
+            # 的话，再重取一次也只会是同一条（_screen 会剪掉它、按次数再挂起或跳过）。
+            self._no_jit.discard(key)
+            self._skip_jit.add(key)
+            self.stats["park_refetch"] += 1
+            print(f"  [挂起到点] {key}: vidlink 缓存应已刷新，重新取流", flush=True)
+
+    def _flush_parked(self, now):
+        """本轮其余活都干完、挂起片又一时等不到：记「需重新取流」留给下次运行。"""
+        while self._parked:
+            due, _seq, key, entry = heapq.heappop(self._parked)
+            self.stats["park_flushed"] += 1
+            when = time.strftime("%m-%d %H:%M", time.gmtime(due))
+            self._skip(entry, key, f"vidlink 缓存预计 {when} UTC 刷新，本轮等不到，本次不下载",
+                       count=False)
+
+    def _skip(self, entry, key, reason, count=True):
+        if count:
+            self.stats["dead_link_skipped"] += 1
+        self._first_deferred_at.pop(key, None)
+        message = f"{reason}，{_NEEDS_REFETCH_MARKER}"
+        print(f"  [未下载] {key}: {message}", flush=True)
+        if self._on_skip is not None:
+            try:
+                self._on_skip(entry, message)
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ 记录未下载的片失败 {key}: {exc}", flush=True)
 
     def _send_to_refetch(self, entry, key, now, reserve=0):
         """链接太旧就送去重取，返回是否送了。
@@ -3189,6 +3489,8 @@ class HostCapGate:
         （node_link_age：补回的旧节点按它自己的时刻）；普通片按 general_lane
         （general_stale_reason）。
         """
+        if self._awaiting_cache_roll(entry, now):
+            return None
         host = capped_host_of(entry)
         if host is None:
             reason = general_stale_reason(entry, self._general, now)
@@ -3204,6 +3506,23 @@ class HostCapGate:
         if age is None or age <= limit:
             return None
         return f"链接已 {age / 60:.0f} 分钟（阈值 {limit / 60:.0f}）", jit_max, host
+
+    def _awaiting_cache_roll(self, entry, now):
+        """第一个节点是已失效、vidlink 缓存还没到刷新时刻的链接：此刻重取只会换回同一条
+        （10-24 实测 371/394 原样返回），不重取，交给 _screen 剪掉它或挂起到刷新。"""
+        if not self._health["enabled"]:
+            return False
+        nodes = _entry_nodes(entry)
+        if not nodes or nodes[0]["provider"] != "vidlink":
+            return False
+        first = nodes[0]
+        signed_at = _signed_at(first["url"])
+        if signed_at is None or now >= signed_at + self._health["vidlink_cache_roll_seconds"]:
+            return False
+        return node_dead_reason(
+            entry, first, now, self._general["signed_link_max_age_seconds"],
+            self._health["dead_after_seconds"],
+        ) is not None
 
     def _reclaim_unanswered_refetches(self):
         """重取已有结论却没有新链接回来的片：取回原条目，沿用原链接。
@@ -5414,6 +5733,18 @@ def process_one_entry(entry, processed_ids):
     # 故随 conversion_job 一起传递。
     captions = entry.get("captions") or []
 
+    if normalized_id and not urls and entry.get("_dead_nodes"):
+        # 派发闸门把节点全剪掉了（链接都已知失效）：不下载，当场按「需重新取流」失败，
+        # 走主循环既有的过期重取闭环（auto_refetch）换新链接——与以前拿死链接去下、
+        # 下到 401/403/500 再重取是同一条路，只是不白占槽位、不白等超时。
+        dead_count = len(entry["_dead_nodes"])
+        return tmdb_id, False, {
+            "error": f"{dead_count} 个节点直链均已失效（派发前按年龄判定，未下载），"
+                     f"{_NEEDS_REFETCH_MARKER}",
+            "retriable": False,
+            "needs_refetch": True,
+            "node_failures": dead_node_failures(entry),
+        }
     if not normalized_id or not urls:
         return tmdb_id, False, {"error": "缺少 tmdbId 或 urls", "retriable": False}
 
@@ -5445,8 +5776,14 @@ def process_one_entry(entry, processed_ids):
     # reason_class, retriable, error}。它是「判死必须全部节点都给出画质结论」
     # 这条业务红线的**数据基础**——error 只留末节点文案，没有它就无法区分
     # 「三个节点都画质不达标」与「一个画质不达标 + 两个 502」。
-    # 节点循环之外抛出的异常会让它保持为空列表（那时本就没有节点上下文）。
-    node_failures = []
+    # 节点循环之外抛出的异常会让它只含下面这几条（那时本就没有节点上下文）。
+    # 开头先放派发闸门因链接已知失效而没派的节点（HostCapGate._screen /
+    # prune_dead_nodes）：照样算失败节点、挂「需重新取流」——它们从没给出过画质
+    # 结论，剩下的节点再差也不能据此把整片判死；重取后它们还要再试。
+    node_failures = dead_node_failures(entry)
+    skipped_dead = len(node_failures)
+    if skipped_dead:
+        any_needs_refetch = True
     cleanup_paths = set()
     final_ts = os.path.join(TEMP_DIR, f"temp_{safe_file_token(tmdb_id)}.ts")
     temp_mp4 = os.path.join(TEMP_DIR, f"temp_{safe_file_token(tmdb_id)}.mp4")
@@ -5989,17 +6326,19 @@ def process_one_entry(entry, processed_ids):
         #
         # 只在"无一节点成功"的失败路径上生效（本就在 except 里），且要求
         # quality_rejected_nodes > 0，避免 urls 为空等边界被 0/0 蒙混。
+        # 分母连派发前剪掉的失效节点一起算：它们没给出画质结论，不能被"过半"的口径吞掉。
+        total_nodes = len(urls) + skipped_dead
         if (
             urls
             and quality_rejected_nodes > 0
-            and quality_rejected_nodes / len(urls) >= QUALITY_KILL_RATIO
+            and quality_rejected_nodes / total_nodes >= QUALITY_KILL_RATIO
         ):
             retriable = False
             # 换成汇总文案：改动前这里留的是**最后一个**节点的错误，会写出
             # 「retriable=False 却写着 502」这类自相矛盾、且会让收尾统计归错类
             # 的记录（§12.11 D 现场就是「retriable=True | 480p 低于红线」）。
             msg = (
-                f"{len(urls)} 个节点中 {quality_rejected_nodes} 个因画质不达标被"
+                f"{total_nodes} 个节点中 {quality_rejected_nodes} 个因画质不达标被"
                 f"确定性淘汰（≥ 阈值 {QUALITY_KILL_RATIO:.2f}），判定整片画质不达标；"
                 f"末节点错误：{msg}"
             )
@@ -8004,6 +8343,7 @@ def _run_pipeline(run_volume=None):
             gate = HostCapGate(
                 lane_limits, refetcher=async_refetch_hook,
                 extra_active=host_extra_active, general=GENERAL_LANE_CFG,
+                health=LINK_HEALTH_CFG, on_skip=record_dispatch_skip,
             )
             for host, cfg in lane_limits.items():
                 ages = "、".join(

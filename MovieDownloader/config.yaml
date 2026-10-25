@@ -632,6 +632,37 @@ download_movies:
   demote_nodes:
     - "moon.zenoak.top/r2/"
     - "moon.goldenkite.top/r2/"
+  # ---- 派发前筛查：不拿已知失效的链接去下，vidlink 等缓存刷新再重取（2026-10-26）----
+  # 派发闸门在真正派发前剪掉已知失效的节点（不占下载槽位去撞死链接）：
+  #   - 签名主机按 general_lane.signed_link_max_age_hours（bcdn4：t= 起 24 小时必 403）；
+  #   - 其余按下面 dead_after_minutes 看节点年龄。实测 videasy 链接 ~240 分钟、vidup
+  #     （finalsignal，原 paleoak）~181 分钟起失效；goldenkite /vd/ 没单独测过，按 vidup 算。
+  #     阈值都留了余量：宁可漏判多试一次，不可误判少一个节点。vidlink 的非签名主机不判。
+  # 被剪的节点仍算「需重新取流」的失败节点：它们没给出过画质结论，剩下的节点再差也
+  # 不会因此把整片判死（判死红线不变）。
+  # 一个能用的节点都不剩时：
+  #   - 有 vidup / videasy 节点（一取就是新签名）：照常派出去，下载侧不下剪掉的节点、
+  #     当场按「需重新取流」失败，走既有的过期重取闭环（auto_refetch）换新链接；
+  #   - 只剩过期的 vidlink 链接、或全落在 broken_vidlink_hosts 上：vidlink
+  #     按片缓存链接，缓存刷新前重取只会拿回同一条死链接（这段时间也不做派发前重取）；
+  #     10-25 在 06 号机实测，签名已 48–52 小时的过期片重取 8/8 换到新签名、bcdnxw 上的
+  #     片 8/10 换到别的主机。故挂起到「签名时刻 + vidlink_cache_roll_hours」再重取，
+  #     每片最多挂起 park_max_per_movie 次；用完还是死链接的，本次不下载，记进
+  #     failed.jsonl（挂需重新取流）留给下次运行。
+  # 其余活都干完时，最早的挂起片超过 park_end_wait_minutes 才到点的不再等，同样记进
+  # failed.jsonl 留给下次运行。
+  # 整段删掉 = 不筛查（行为同改动之前）。
+  link_health:
+    dead_after_minutes: {videasy: 300, vidup: 300}
+    vidlink_cache_roll_hours: 49
+    park_retry_hours: 6
+    park_max_per_movie: 2
+    park_end_wait_minutes: 30
+    # 长期坏掉的 vidlink 主机：片子只剩这些主机上的节点时挂起到缓存刷新、换主机再下。
+    # bcdnxw：10-25 全舰队 2840 部下载失败都是它的 429，缓存刷新后重取 8/10 换到 bcdn/hcdn3。
+    # 不看 mp4 主机熔断：它 15 秒就复位重试（给分钟级抖动用），不能当成长期故障的依据。
+    broken_vidlink_hosts:
+      - bcdnxw.hakunaymatata.com
   # 主循环同时持有的「下载 future」上限（分批投递深度）。必须 > max_workers，
   # 否则下载池喂不满。一次性把整轮几十万部全投进 pending 会让 wait() 每次对全部
   # 未完成 future 挂/摘 waiter，主循环退化成 O(N²)；分批后 wait 规模恒定。
