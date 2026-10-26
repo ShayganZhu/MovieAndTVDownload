@@ -258,6 +258,62 @@ def test_momentary_mp4_breaker_trip_does_not_park():
     assert ids(got) == ["f1"] and gate.stats["parked"] == 0
 
 
+def _variant(node, quality):
+    """同一部片 vidlink 的另一个清晰度版本：同主机、同签名时刻，url 不同。"""
+    return dict(node, url=node["url"] + f"&q={quality}")
+
+
+def test_stuck_bcdnxw_film_is_parked_without_a_futile_refetch(capsys):
+    """🔴 只剩 bcdnxw、缓存还没刷新：派发前重取只会换回同一条，直接挂起到刷新时刻。
+    （10-26 24 号机：4498 次派发前重取里 882 次是这种。）说明里同一个原因只写一次。"""
+    r = Refetcher()
+    node = vlink("f1", host=BCDNXW, signed_ago_h=10)
+    entry = film("f1", _variant(node, 720), _variant(node, 480), fetched_ago_min=13 * 60)
+    gate = gate_with(Src([entry], closed=False, refetcher=r), r)
+    assert drain(gate) == ([], "wait")
+    assert r.dispatched == [] and gate.stats["general_jit_refetch"] == 0
+    assert gate.stats["parked"] == 1 and gate._parked[0][0] == NOW + 39 * 3600
+    park_line = next(l for l in capsys.readouterr().out.splitlines() if "[挂起待重取]" in l)
+    assert park_line.count("长期故障") == 1
+
+
+def test_stuck_film_waits_for_its_earliest_cache_roll():
+    """bcdnxw + 签名已过期的 bcdn4：两条都卡住，按更早的那次刷新挂起，期间不重取。"""
+    r = Refetcher()
+    entry = film("f1", vlink("f1", host=BCDNXW, signed_ago_h=10), vlink("f1", signed_ago_h=30),
+                 fetched_ago_min=13 * 60)
+    gate = gate_with(Src([entry], closed=False, refetcher=r), r)
+    assert drain(gate) == ([], "wait")
+    assert r.dispatched == [] and gate._parked[0][0] == NOW + 19 * 3600
+
+
+@pytest.mark.parametrize("nodes,why", [
+    ([vlink("f1", host=BCDNXW, signed_ago_h=50)], "缓存已经刷新，重取能换到新主机"),
+    ([vlink("f1", host=BCDNXW, signed_ago_h=10), vlink("f1", host=HCDN3, signed_ago_h=10)],
+     "还有能下的节点，按 vidlink 12 小时的老规则换新"),
+    ([vlink("f1", host=BCDNXW)], "没有签名时刻，算不出刷新时间"),
+])
+def test_refetch_still_happens_when_it_can_help(nodes, why):
+    r = Refetcher()
+    entry = film("f1", *nodes, fetched_ago_min=13 * 60)
+    gate = gate_with(Src([entry], closed=False, refetcher=r), r)
+    drain(gate)
+    assert r.dispatched == ["f1"], why
+
+
+def test_film_with_a_pruned_vidup_node_is_still_refetched():
+    """之前剪掉过 vidup 节点（一取就新）的片，剩下只有 bcdnxw 也要照常重取。"""
+    r = Refetcher()
+    entry = film("f1", vlink("f1", host=BCDNXW, signed_ago_h=10), fetched_ago_min=13 * 60)
+    # 带上 t=：免得「算不出刷新时刻」那条顺带把它放过去，测不到这里要锁的判断。
+    entry["_dead_nodes"] = [{"provider": "vidup", "type": "m3u8",
+                             "url": hls("f1")["url"] + f"?t={NOW - 10 * 3600}",
+                             "reason": "vidup 链接已 400 分钟（300 分钟即失效）"}]
+    gate = gate_with(Src([entry], closed=False, refetcher=r), r)
+    drain(gate)
+    assert r.dispatched == ["f1"]
+
+
 @pytest.mark.parametrize("health,delivers", [
     (dict(HEALTH, park_max_per_movie=0), True),
     (HEALTH, False),                       # 本轮来源收不回重取结果

@@ -3334,15 +3334,9 @@ class HostCapGate:
         通道（放回 _held 重新分）时返回 None。没启用 link_health 时原样返回。"""
         if not self._health["enabled"] or key is None:
             return entry
-        entry, dead = prune_dead_nodes(
-            entry, now, self._general["signed_link_max_age_seconds"],
-            self._health["dead_after_seconds"],
-        )
+        entry, dead, live, broken = self._triage(entry, now)
         if dead:
             self.stats["dead_nodes_pruned"] += len(dead)
-        live = _entry_nodes(entry)
-        broken = [n for n in live if n["provider"] == "vidlink"
-                  and _host_of(n["url"]) in self._health["broken_vidlink_hosts"]]
         if len(broken) < len(live):
             if dead and capped_host_of(entry) != host:
                 # 剪掉节点后第一个节点换了主机：回闸门按新的第一个节点重新分通道。
@@ -3361,15 +3355,30 @@ class HostCapGate:
             self.stats["dead_link_failed"] += 1
             return entry
         # 只剩 vidlink：缓存刷新前重取只会拿回同一条，挂起到刷新再重取；挂不了的留给下次运行。
-        reasons = [n.get("reason") for n in dead_nodes] + [
+        # 同一部片的几个清晰度版本常常同主机、同签名时刻，说明去重后再拼。
+        reasons = list(dict.fromkeys([n.get("reason") for n in dead_nodes] + [
             f"{_host_of(n['url'])} 长期故障" for n in broken
-        ]
+        ]))
         due = self._park_due(key, dead_nodes + broken, now)
         if due is not None:
             self._park(entry, key, due, now, "；".join(reasons))
             return None
         self._skip(entry, key, f"没有可用的节点（{'；'.join(reasons)}），本次不下载")
         return None
+
+    def _triage(self, entry, now):
+        """剪掉已知失效的节点并归类，不改闸门的任何状态。
+
+        返回 (剪后条目, 本次剪掉的 [(节点, 说明)], 剩下的节点, 其中在长期故障 vidlink 主机上的)。
+        """
+        entry, dead = prune_dead_nodes(
+            entry, now, self._general["signed_link_max_age_seconds"],
+            self._health["dead_after_seconds"],
+        )
+        live = _entry_nodes(entry)
+        broken = [n for n in live if n["provider"] == "vidlink"
+                  and _host_of(n["url"]) in self._health["broken_vidlink_hosts"]]
+        return entry, dead, live, broken
 
     def _park_due(self, key, stuck, now):
         """挂起到什么时候：vidlink 缓存预计在签名时刻 + cache_roll 刷新。返回 None 表示不挂起
@@ -3508,21 +3517,39 @@ class HostCapGate:
         return f"链接已 {age / 60:.0f} 分钟（阈值 {limit / 60:.0f}）", jit_max, host
 
     def _awaiting_cache_roll(self, entry, now):
-        """第一个节点是已失效、vidlink 缓存还没到刷新时刻的链接：此刻重取只会换回同一条
-        （10-24 实测 371/394 原样返回），不重取，交给 _screen 剪掉它或挂起到刷新。"""
+        """此刻重取只会换回同一批 vidlink 链接（缓存刷新前 10-24 实测 371/394 原样返回），
+        不做派发前重取，交给 _screen 剪掉 / 挂起：
+
+          - 第一个节点是已失效、缓存还没到刷新时刻的 vidlink 链接（剪掉它，用剩下的节点）；
+          - 或者整部片只剩 vidlink 的死链接 / 长期故障主机上的链接（_screen 必然挂起它），
+            且最早的刷新时刻还没到——挂起到点后的那次重取才有用。10-26 24 号机：重启后
+            送去重取的 4498 部里 882 部是这种只剩 bcdnxw 的片，白占重取队列约 40 分钟。
+        """
         if not self._health["enabled"]:
             return False
         nodes = _entry_nodes(entry)
-        if not nodes or nodes[0]["provider"] != "vidlink":
+        if not nodes:
             return False
+        roll = self._health["vidlink_cache_roll_seconds"]
         first = nodes[0]
-        signed_at = _signed_at(first["url"])
-        if signed_at is None or now >= signed_at + self._health["vidlink_cache_roll_seconds"]:
+        if first["provider"] == "vidlink":
+            signed_at = _signed_at(first["url"])
+            if signed_at is not None and now < signed_at + roll and node_dead_reason(
+                entry, first, now, self._general["signed_link_max_age_seconds"],
+                self._health["dead_after_seconds"],
+            ) is not None:
+                return True
+        # 与 _screen 同一套判断：还有能下的节点、或有一取就新的非 vidlink 节点，都照常重取。
+        pruned, _dead, live, broken = self._triage(entry, now)
+        dead_nodes = pruned.get("_dead_nodes") or []
+        if len(broken) < len(live) or not (dead_nodes or broken):
             return False
-        return node_dead_reason(
-            entry, first, now, self._general["signed_link_max_age_seconds"],
-            self._health["dead_after_seconds"],
-        ) is not None
+        if any(n.get("provider") != "vidlink" for n in dead_nodes):
+            return False
+        signed = [_signed_at(n["url"]) for n in dead_nodes + broken]
+        if any(t is None for t in signed):
+            return False  # 算不出刷新时刻：照常重取，万一缓存已经换了
+        return now < min(signed) + roll
 
     def _reclaim_unanswered_refetches(self):
         """重取已有结论却没有新链接回来的片：取回原条目，沿用原链接。
