@@ -471,6 +471,15 @@ _SEG_403_RETRY_DELAY_MAX = 30.0
 # 本片最近一次分片成功距今不超过这么久，才算"别的分片还在正常下"。
 # 比单分片的 403 退避总长（1+2+4+8+16+30+30+30 ≈ 2 分钟）短：token 中途过期时，最多白等这么久就转重取。
 _SEG_403_RECENT_OK_SECONDS = 60.0
+# HLS 分片返回 HTML 页面的"临时拦截"重试（2026-10-27，06/08 号机 videasy /r6/ 实测）：
+# sun.finalsignal.top/r6/ 除了随机 403，还会零星把单个分片换成 HTML 页面（HTTP 200），同片别的分片照常
+# 是视频数据。原先一律按"无效源"第 1 次就丢片：06 号机 4d48ba9 一轮丢的 183 个分片里 155 个是它（全在
+# /r6/），206 部上传的片有 40 部带缺片。现在与 403 共用本片的 _Segment403Tracker：同片别的分片还在
+# 正常下时，按 seg_html_retry_delay 起指数退避（封顶 _SEG_403_RETRY_DELAY_MAX）重试至多
+# seg_html_retry_max 次（与 403 各算各的）；整片都回 HTML（真无效源）时仍快速放弃、换节点。
+# 返回 m3u8 的不在此列：那是链接本身指错了，重试必然复现。seg_html_retry_max 设 0 即回到旧行为。
+SEG_HTML_RETRY_MAX = max(0, int(_CFG.get("seg_html_retry_max", 8)))
+SEG_HTML_RETRY_DELAY = float(_CFG.get("seg_html_retry_delay", 1))
 # 采样阶段的单分片重试上限，**刻意远小于** seg_retry_max。
 #
 # 采样只是为了"测个码率决定这条流要不要下"，探不到就该立刻换下一条流/节点；
@@ -4898,25 +4907,61 @@ def bitrate_reject_message(resolution, codec_label, bitrate, min_bitrate):
 
 
 # ---------- 分片下载 ----------
+class SegmentNotMediaError(RuntimeError):
+    """分片下回来的不是视频数据：kind 为 "html"（HTML 页面）或 "m3u8"（播放列表）。
+
+    文案仍以"服务器返回的不是视频分片"开头：_PERMANENT_FAILURE_MARKERS、
+    _MP4_CHUNK_NO_RETRY_MARKERS 与收尾统计都靠它归类（落盘后只剩字符串）。
+    summary 是 HTML 页面的一句话摘要，供日志说明源站回的到底是什么页。
+    """
+
+    def __init__(self, message, kind, summary=""):
+        super().__init__(message)
+        self.kind = kind
+        self.summary = summary
+
+
+_HTML_TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title", re.IGNORECASE | re.DOTALL)
+_HTML_SUMMARY_MAX_CHARS = 60
+
+
+def _html_page_summary(content):
+    """HTML 页面的一句话摘要：有标题取标题，没有就取去掉标签后的正文开头，附页面字节数。"""
+    head = content[:4096]
+    match = _HTML_TITLE_RE.search(head)
+    raw = match.group(1) if match else re.sub(rb"<[^>]*>", b" ", head)
+    text = " ".join(raw.decode("utf-8", errors="replace").split())
+    text = "".join(ch for ch in text if ch.isprintable())
+    if len(text) > _HTML_SUMMARY_MAX_CHARS:
+        text = text[:_HTML_SUMMARY_MAX_CHARS] + "…"
+    return f"{'标题' if match else '开头'}: {text or '（空）'}，{len(content)} 字节"
+
+
 def validate_segment_content(content, url):
     if not content:
         raise RuntimeError(f"服务器返回空分片: {url}")
 
     prefix = content[:256].lstrip().lower()
-    if prefix.startswith((b"<!doctype html", b"<html", b"#extm3u")):
-        raise RuntimeError(f"服务器返回的不是视频分片: {url}")
+    if prefix.startswith((b"<!doctype html", b"<html")):
+        summary = _html_page_summary(content)
+        raise SegmentNotMediaError(
+            f"服务器返回的不是视频分片（HTML 页面，{summary}）: {url}", "html", summary
+        )
+    if prefix.startswith(b"#extm3u"):
+        raise SegmentNotMediaError(f"服务器返回的不是视频分片（m3u8 播放列表）: {url}", "m3u8")
 
 
 class _Segment403Tracker:
-    """一部片（一次 download_segments）内分片 403 的判别：临时风控，还是签名过期。
+    """一部片（一次 download_segments）内分片被拒的判别：临时风控，还是链接 / 源失效。
 
-    签名过期时整片的分片都 403、一个也下不来；临时风控（如 finalsignal /r6/ 的
-    Cloudflare 403）只零散打掉一部分请求，同片别的分片照常成功。所以：
+    "被拒"指 403，或 HTTP 200 却回了 HTML 页面（两者共用一个计数）。签名过期 /
+    无效源时整片的分片都被拒、一个也下不来；临时风控（如 finalsignal /r6/ 的
+    Cloudflare 403 与零星 HTML 页）只零散打掉一部分请求，同片别的分片照常成功。所以：
       - 最近 _SEG_403_RECENT_OK_SECONDS 秒内本片有分片成功 → 临时风控，值得退避重试；
-      - 自上次成功以来 403 还不到 SEG_403_EXPIRED_AFTER 次 → 还判断不了，先重试；
-      - 否则（一直没成功、403 已攒够）→ 按签名过期快速放弃，交给重取流闭环。
+      - 自上次成功以来被拒还不到 SEG_403_EXPIRED_AFTER 次 → 还判断不了，先重试；
+      - 否则（一直没成功、被拒已攒够）→ 快速放弃：403 交给重取流闭环，HTML 换节点。
     中途 token 过期时，最近一次成功会在 _SEG_403_RECENT_OK_SECONDS 后变旧，
-    之后的 403 随即改判过期，最多白等这么久。线程安全：本片所有分片线程共用一个实例。
+    之后的被拒随即改判失效，最多白等这么久。线程安全：本片所有分片线程共用一个实例。
     """
 
     def __init__(self, expired_after=None, recent_ok_seconds=None, clock=time.monotonic):
@@ -4934,8 +4979,8 @@ class _Segment403Tracker:
             self._last_ok = self._clock()
             self._forbidden_since_ok = 0
 
-    def record_403(self):
-        """记一次分片 403，返回这次是否按临时风控重试（False = 判签名过期）。"""
+    def record_rejected(self):
+        """记一次分片被拒（403 / HTML 页），返回这次是否按临时风控重试（False = 判失效）。"""
         with self._lock:
             self._forbidden_since_ok += 1
             if self._forbidden_since_ok < self._expired_after:
@@ -4954,9 +4999,11 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
     上抛、不再退避重试：这类结果重下必然复现，白等十几分钟只会占死下载窗口、
     延误换下一个取流节点。与 mp4 直链块层（_download_mp4_chunk）语义对齐。
 
-    例外是 403：传了 forbidden_tracker（本片共用的 _Segment403Tracker）且它判为
-    临时风控时，按 SEG_403_RETRY_DELAY 起指数退避重试至多 SEG_403_RETRY_MAX 次
-    （同样占用 retry_max 的次数）；判为签名过期则照旧立即上抛。
+    例外是 403 和 HTML 页面：传了 forbidden_tracker（本片共用的 _Segment403Tracker）
+    且它判为临时风控时，403 按 SEG_403_RETRY_DELAY 起指数退避重试至多
+    SEG_403_RETRY_MAX 次，HTML 页面按 SEG_HTML_RETRY_DELAY 起至多
+    SEG_HTML_RETRY_MAX 次（两者各算各的，都占用 retry_max 的次数）；判为失效则照旧
+    立即上抛。返回 m3u8 一律立即上抛。
 
     abort_event（可选）：本部片的放弃信号，与全局 `interrupted` 一起决定是否
     提前收手。⚠️ 退避必须用 wait() 而不是 sleep()——sleep 期间信号叫不醒它，
@@ -4965,7 +5012,7 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
     """
     last_error = None
     troubled = False
-    forbidden_retries = 0
+    rejected_retries = {"403": 0, "html": 0}
     for attempt in range(1, retry_max + 1):
         # 开跑之前先看一眼：中断后连第一次请求都不该再发。
         if interrupted.is_set() or (abort_event is not None
@@ -5008,24 +5055,32 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
                     f"{_HLS_HOST_BLOCKED_MARKER}（{_host_of(url)}，HTTP {status}），"
                     f"分片 {index + 1} 不再重试: {url}"
                 ) from exc
-            # 403 先交给本片的判别器：临时风控就退避重试，签名过期才落到下面的确定性短路。
-            # 判别器每次 403 都要记，所以放在次数检查之前。
+            # 被拒（403 / HTML 页）先交给本片的判别器：临时风控就退避重试，失效才落到
+            # 下面的确定性短路。判别器每次被拒都要记，所以放在次数检查之前。
+            if status == 403:
+                rejected = ("403", SEG_403_RETRY_MAX, SEG_403_RETRY_DELAY, "HTTP 403")
+            elif isinstance(exc, SegmentNotMediaError) and exc.kind == "html":
+                rejected = ("html", SEG_HTML_RETRY_MAX, SEG_HTML_RETRY_DELAY,
+                            f"返回 HTML 页面（{exc.summary}）")
+            else:
+                rejected = None
             if (
-                status == 403
+                rejected is not None
                 and forbidden_tracker is not None
-                and forbidden_tracker.record_403()
-                and forbidden_retries < SEG_403_RETRY_MAX
+                and forbidden_tracker.record_rejected()
+                and rejected_retries[rejected[0]] < rejected[1]
                 and attempt < retry_max
             ):
-                forbidden_retries += 1
+                kind, kind_retry_max, kind_delay, what = rejected
+                rejected_retries[kind] += 1
                 wait = min(
-                    SEG_403_RETRY_DELAY * (2 ** (forbidden_retries - 1)),
+                    kind_delay * (2 ** (rejected_retries[kind] - 1)),
                     _SEG_403_RETRY_DELAY_MAX,
                 )
                 wait += random.uniform(0, min(1.0, wait * 0.2))
                 print(
-                    f"    分片 {index + 1} HTTP 403，同片其他分片正常，按临时风控重试 "
-                    f"({forbidden_retries}/{SEG_403_RETRY_MAX})，{wait:.1f}s 后重试"
+                    f"    分片 {index + 1} {what}，同片其他分片正常，按临时风控重试 "
+                    f"({rejected_retries[kind]}/{kind_retry_max})，{wait:.1f}s 后重试"
                 )
                 if interrupted.wait(wait):
                     raise RuntimeError(f"分片 {index + 1} 已取消") from exc
@@ -5035,7 +5090,7 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
             if (
                 attempt == retry_max
                 or is_permanent_http_failure(exc)
-                # 源站返回 HTML/m3u8：通常是无效源，重试无意义。
+                # 源站返回 m3u8，或整片都回 HTML（无效源）/ HTML 重试用完：重试无意义。
                 or "服务器返回的不是视频分片" in message
             ):
                 break
@@ -5101,7 +5156,7 @@ def download_segments(
 
     if retry_max is None:
         retry_max = SEG_RETRY_MAX
-    # 本片所有分片共用：据此区分 403 是临时风控（退避重试）还是签名过期（快速放弃）。
+    # 本片所有分片共用：据此区分 403 / HTML 页是临时风控（退避重试）还是失效（快速放弃）。
     forbidden_tracker = _Segment403Tracker()
 
     indices = list(range(start_idx, min(end_idx, len(segment_urls))))

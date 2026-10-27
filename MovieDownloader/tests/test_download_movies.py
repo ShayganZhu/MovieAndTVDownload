@@ -3585,16 +3585,16 @@ def test_segment_403_tracker_verdicts():
     """判别器：攒够阈值前先重试；攒够后有近期成功算临时风控，没有（或成功已旧）算签名过期。"""
     now = [100.0]
     t = d._Segment403Tracker(expired_after=3, recent_ok_seconds=60, clock=lambda: now[0])
-    assert t.record_403() is True and t.record_403() is True, "阈值前还判断不了，先重试"
-    assert t.record_403() is False, "一直没有成功、403 攒够 → 签名过期"
+    assert t.record_rejected() is True and t.record_rejected() is True, "阈值前还判断不了，先重试"
+    assert t.record_rejected() is False, "一直没有成功、403 攒够 → 签名过期"
 
     t.record_ok()
-    assert [t.record_403() for _ in range(5)] == [True] * 5, "近期有成功 → 临时风控，一直重试"
+    assert [t.record_rejected() for _ in range(5)] == [True] * 5, "近期有成功 → 临时风控，一直重试"
 
     now[0] += 61
-    assert t.record_403() is False, "最近一次成功已超过 60s（token 中途过期）→ 改判过期"
+    assert t.record_rejected() is False, "最近一次成功已超过 60s（token 中途过期）→ 改判过期"
     t.record_ok()
-    assert t.record_403() is True, "又有分片成功 → 自我纠正回临时风控"
+    assert t.record_rejected() is True, "又有分片成功 → 自我纠正回临时风控"
 
 
 def test_segment_403_retried_when_other_segments_ok(monkeypatch, seg_403_env):
@@ -3779,6 +3779,154 @@ def test_download_segments_whole_film_403_fails_fast(monkeypatch, seg_403_env, t
     assert failed == [0, 1, 2, 3]
     # 第 1 片：第 1 次 403 未到阈值重试 1 次，第 2 次攒够阈值判过期；其余分片都只请求 1 次。
     assert [seen[u] for u in urls] == [2, 1, 1, 1]
+
+
+# --------------------------------- 分片返回 HTML 页面：临时拦截 vs 无效源（2026-10-27）
+
+_HTML_PAGE = b"<!DOCTYPE html><html><head><title>\n  Just a moment...\n</title></head><body>x</body></html>"
+_TS = b"\x47" * 100
+
+
+@pytest.fixture
+def seg_html_env(monkeypatch, hls_circuit_env):
+    """与 seg_403_env 不同：保留真的 validate_segment_content，HTML 要靠它识别出来。"""
+    monkeypatch.setattr(d, "SEG_HTML_RETRY_DELAY", 0.001)
+    monkeypatch.setattr(d, "SEG_HTML_RETRY_MAX", 5)
+    monkeypatch.setattr(d, "SEG_403_RETRY_DELAY", 0.001)
+    monkeypatch.setattr(d, "SEG_403_EXPIRED_AFTER", 8)
+
+
+def _scripted(monkeypatch, replies):
+    """request_with_retry 按次序吐 replies（异常就抛），返回调用计数列表。"""
+    calls = []
+
+    def fake(method, u, **kw):
+        calls.append(u)
+        reply = replies[min(len(calls), len(replies)) - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(d, "request_with_retry", fake)
+    return calls
+
+
+def test_html_page_summary():
+    """摘要：有标题取标题（压掉换行空白），没有标题取正文开头，过长截断，附字节数。"""
+    assert d._html_page_summary(_HTML_PAGE) == f"标题: Just a moment...，{len(_HTML_PAGE)} 字节"
+    body = b"<html><body><h1>Access  denied</h1>\n<p>Ray ID</p></body></html>"
+    assert d._html_page_summary(body) == f"开头: Access denied Ray ID，{len(body)} 字节"
+    long_title = b"<html><title>" + b"a" * 100 + b"</title></html>"
+    assert d._html_page_summary(long_title).startswith("标题: " + "a" * 60 + "…，")
+    assert d._html_page_summary(b"<html></html>") == "开头: （空），13 字节"
+
+
+def test_validate_segment_content_tells_html_from_m3u8():
+    """HTML 与 m3u8 分成两类；文案仍带原 marker，落盘后的归类不变。"""
+    with pytest.raises(d.SegmentNotMediaError) as ei:
+        d.validate_segment_content(_HTML_PAGE, "https://x/r6/s.ts")
+    assert ei.value.kind == "html" and ei.value.summary.startswith("标题: Just a moment...")
+    assert "服务器返回的不是视频分片" in str(ei.value)
+    assert d._classify_failure(str(ei.value)) == d._classify_failure("服务器返回的不是视频分片: u")
+
+    with pytest.raises(d.SegmentNotMediaError) as ei:
+        d.validate_segment_content(b"#EXTM3U\n#EXTINF:4,\nseg.ts\n", "https://x/s.ts")
+    assert ei.value.kind == "m3u8" and "服务器返回的不是视频分片" in str(ei.value)
+    d.validate_segment_content(_TS, "https://x/s.ts")  # 视频数据照常通过
+
+
+def test_segment_html_retried_when_other_segments_ok(monkeypatch, seg_html_env, capsys):
+    """🔴 同片别的分片正常时，零星的 HTML 页必须退避重试直到拿到视频数据，而不是第 1 次就丢片。"""
+    calls = _scripted(monkeypatch, [_HTML_PAGE, _HTML_PAGE, _TS])
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()  # 同片别的分片刚成功过
+    assert d.download_single_segment(
+        "https://sun.finalsignal.top/r6/x/s.ts", 0, 20, 1, forbidden_tracker=tracker
+    ) == _TS
+    assert len(calls) == 3
+    out = capsys.readouterr().out
+    assert "分片 1 返回 HTML 页面（标题: Just a moment...，" in out
+    assert "按临时风控重试 (2/5)" in out
+
+
+def test_segment_html_without_tracker_keeps_fast_fail(monkeypatch, seg_html_env):
+    """不传判别器（旧调用方）时行为不变：HTML 第 1 次就放弃。"""
+    calls = _scripted(monkeypatch, [_HTML_PAGE])
+    with pytest.raises(RuntimeError, match="重试 1 次后仍失败: 服务器返回的不是视频分片"):
+        d.download_single_segment("https://x/r6/s.ts", 0, 20, 1)
+    assert len(calls) == 1
+
+
+def test_segment_m3u8_reply_not_retried(monkeypatch, seg_html_env):
+    """回的是 m3u8：链接本身指错了，即使同片别的分片正常也不重试。"""
+    calls = _scripted(monkeypatch, [b"#EXTM3U\n"])
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()
+    with pytest.raises(RuntimeError, match="m3u8 播放列表"):
+        d.download_single_segment("https://x/r6/s.ts", 0, 20, 1, forbidden_tracker=tracker)
+    assert len(calls) == 1
+
+
+def test_segment_html_retry_is_capped(monkeypatch, seg_html_env):
+    """HTML 重试有独立上限：一直回 HTML 时 1 + SEG_HTML_RETRY_MAX 次后放弃，不走满 retry_max。"""
+    monkeypatch.setattr(d, "SEG_HTML_RETRY_MAX", 2)
+    calls = _scripted(monkeypatch, [_HTML_PAGE])
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()
+    with pytest.raises(RuntimeError, match="重试 3 次后仍失败: 服务器返回的不是视频分片"):
+        d.download_single_segment("https://x/r6/s.ts", 0, 20, 1, forbidden_tracker=tracker)
+    assert len(calls) == 3
+
+
+def test_segment_html_and_403_budgets_are_separate(monkeypatch, seg_html_env):
+    """403 和 HTML 各算各的：403 的次数用完了，HTML 照样还能重试。"""
+    monkeypatch.setattr(d, "SEG_403_RETRY_MAX", 1)
+    monkeypatch.setattr(d, "SEG_HTML_RETRY_MAX", 1)
+    url = "https://x/r6/s.ts"
+    calls = _scripted(monkeypatch, [_seg_403(url), _HTML_PAGE, _TS])
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()
+    assert d.download_single_segment(url, 0, 20, 1, forbidden_tracker=tracker) == _TS
+    assert len(calls) == 3
+
+
+def test_download_segments_retries_scattered_html(monkeypatch, seg_html_env, tmp_path):
+    """整片层：零散的 HTML 页重试后补齐，不再缺片。"""
+    seen = {}
+
+    def fake_request(method, u, **kw):
+        seen[u] = seen.get(u, 0) + 1
+        if u.endswith("s2.ts") and seen[u] == 1:
+            return _HTML_PAGE
+        return b"\x47" + u.encode()
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    urls = [f"https://sun.finalsignal.top/r6/x/s{i}.ts" for i in range(4)]
+    _, failed, _ = d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=1)
+    assert failed == []
+    assert seen[urls[2]] == 2
+    assert (tmp_path / "out.ts").read_bytes() == b"".join(b"\x47" + u.encode() for u in urls)
+
+
+def test_download_segments_whole_film_html_fails_fast(monkeypatch, seg_html_env, tmp_path):
+    """🔴 整片都回 HTML（真无效源）时仍快速放弃：攒够阈值后每个分片只请求 1 次，好去换节点。"""
+    monkeypatch.setattr(d, "SEG_403_EXPIRED_AFTER", 2)
+    seen = {}
+
+    def always_html(method, u, **kw):
+        seen[u] = seen.get(u, 0) + 1
+        return _HTML_PAGE
+
+    monkeypatch.setattr(d, "request_with_retry", always_html)
+    urls = [f"https://sun.finalsignal.top/r6/x/s{i}.ts" for i in range(4)]
+    _, failed, _ = d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=1)
+    assert failed == [0, 1, 2, 3]
+    assert [seen[u] for u in urls] == [2, 1, 1, 1]
+
+
+def test_shipped_segment_html_config():
+    """10-27 出厂值：与分片 403 一样 1s 起 8 次。"""
+    assert (d.SEG_HTML_RETRY_DELAY, d.SEG_HTML_RETRY_MAX) == (1.0, 8)
 
 
 def test_sample_retry_budget_raised_to_five():
