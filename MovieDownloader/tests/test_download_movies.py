@@ -3691,7 +3691,7 @@ class _ScriptedResp:
 
 @pytest.fixture
 def scripted_http(monkeypatch):
-    """按给定状态码序列应答的 Session；记下请求次数与每次 sleep 的秒数。"""
+    """按给定状态码序列应答的 Session；记下请求次数与每次退避等待的秒数。"""
     state = {"statuses": [], "calls": 0, "slept": []}
 
     class _Session:
@@ -3699,8 +3699,21 @@ def scripted_http(monkeypatch):
             state["calls"] += 1
             return _ScriptedResp(state["statuses"].pop(0))
 
+    class _RecordingInterrupt:
+        """退避等在全局中断信号上（可打断）：这里只记秒数、不真等，也从不中断。"""
+
+        def is_set(self):
+            return False
+
+        def clear(self):  # 模块级 autouse 的 _clear_interrupt 收尾时会调
+            pass
+
+        def wait(self, timeout=None):
+            state["slept"].append(timeout)
+            return False
+
     monkeypatch.setattr(d, "get_session", lambda: _Session())
-    monkeypatch.setattr(d.time, "sleep", lambda s: state["slept"].append(s))
+    monkeypatch.setattr(d, "interrupted", _RecordingInterrupt())
     return state
 
 
@@ -4365,6 +4378,221 @@ def test_abort_event_stops_one_movie_without_touching_others(monkeypatch):
     assert elapsed < 5, f"退避没有响应 abort_event，耗时 {elapsed:.1f}s"
     # 全局信号未被误置位
     assert not d.interrupted.is_set()
+
+
+# ---------------------------- 中断后下载线程整片收手（2026-10-27，08 号机停机 35 分钟）
+# 线程池收尾要等在跑的下载线程全部返回。只让退避可打断还不够：剩下的分片被逐个
+# 投出去再逐个判"已取消"，整片接着换下一个节点去请求播放列表 / 采样 / 预检 mp4，
+# mp4 直链分块下载更是根本不看中断。
+
+def test_download_segments_stops_feeding_segments_after_interrupt(monkeypatch, tmp_path, capsys):
+    """🔴 中断后撤掉没开跑的分片、整片按中断上抛：不把剩下的分片挨个走一遍
+    （一部 1095 片的片子磨了约 20 分钟），也不刷"耗尽重试次数"。"""
+    monkeypatch.setattr(d, "validate_segment_content", lambda c, u: None)
+    requests_made = []
+
+    def fake_request(method, url, **kw):
+        requests_made.append(url)
+        if len(requests_made) == 5:
+            d.interrupted.set()          # 信号处理器会做的事
+        return b"\x47" * 10
+
+    started = []
+    real_single = d.download_single_segment
+
+    def counting_single(*a, **kw):
+        started.append(a[1])
+        return real_single(*a, **kw)
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    monkeypatch.setattr(d, "download_single_segment", counting_single)
+    urls = [f"https://x/s{i}.ts" for i in range(500)]
+    with pytest.raises(d.DownloadInterrupted):
+        d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=4)
+    assert len(started) <= 5 + 2 * 4, f"中断后又投了 {len(started) - 5} 个分片"
+    assert "耗尽重试次数" not in capsys.readouterr().out
+
+
+def test_download_segments_never_returns_a_partial_film_after_interrupt(monkeypatch, tmp_path):
+    """🔴 末尾几片被"已取消"的片子不能当残片返回：缺得少就会过缺片阈值、被当成功片转封装上传。"""
+    monkeypatch.setattr(d, "validate_segment_content", lambda c, u: None)
+    urls = [f"https://x/s{i}.ts" for i in range(100)]
+
+    def fake_request(method, url, **kw):
+        if url == urls[-1]:
+            d.interrupted.set()
+            raise RuntimeError("Read timed out.")
+        return b"\x47" * 10
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    with pytest.raises(d.DownloadInterrupted):
+        d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=1)
+
+
+def test_download_segments_refuses_to_start_after_interrupt(monkeypatch, tmp_path):
+    """中断后不发请求、也不截断已有文件。"""
+    out = tmp_path / "out.ts"
+    out.write_bytes(b"old")
+    monkeypatch.setattr(d, "request_with_retry", lambda *a, **kw: pytest.fail("中断后不该再发请求"))
+    d.interrupted.set()
+    with pytest.raises(d.DownloadInterrupted):
+        d.download_segments(["https://x/s0.ts"], str(out))
+    assert out.read_bytes() == b"old"
+
+
+def test_playlist_backoff_wakes_on_interrupt(monkeypatch):
+    """播放列表的退避（最长 45s × 多次）必须可打断。"""
+    class _Down:
+        def request(self, *a, **kw):
+            raise ConnectionError("boom")
+
+    monkeypatch.setattr(d, "get_session", lambda: _Down())
+    threading.Timer(0.3, d.interrupted.set).start()
+    started = time.monotonic()
+    with pytest.raises(d.DownloadInterrupted):
+        d.request_with_retry("GET", "https://x/master.m3u8", retries=3, backoff=5, as_text=True)
+    assert time.monotonic() - started < 3
+
+
+def _interrupt_entry(tmp_path, monkeypatch, nodes=3):
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "DISK_GUARD_ENABLED", False)
+    return {"tmdbId": "9", "urls": [f"https://h{i}.example/master.m3u8" for i in range(nodes)]}
+
+
+def test_interrupt_inside_a_node_does_not_fall_through_to_next_nodes(tmp_path, monkeypatch, capsys):
+    """🔴 节点里收到中断：不记成节点失败、不换下一个节点，整片按中断收手。"""
+    entry = _interrupt_entry(tmp_path, monkeypatch)
+    calls = []
+
+    def master(url, **kw):
+        calls.append(url)
+        d.interrupted.set()
+        raise d.DownloadInterrupted(f"分片下载{d._INTERRUPTED_ERROR}")
+
+    monkeypatch.setattr(d, "parse_master_playlist", master)
+    tid, ok, info = d.process_one_entry(entry, set())
+    assert (tid, ok) == ("9", False)
+    assert info == {"error": d._INTERRUPTED_ERROR, "retriable": True}
+    assert len(calls) == 1
+    assert "尝试下一个" not in capsys.readouterr().out
+    assert "9" not in d.processing_ids
+
+
+def test_no_node_switch_once_interrupted(tmp_path, monkeypatch):
+    """🔴 节点普通失败时恰逢中断：不再切到下一个节点去请求播放列表。"""
+    entry = _interrupt_entry(tmp_path, monkeypatch)
+    calls = []
+
+    def master(url, **kw):
+        calls.append(url)
+        d.interrupted.set()
+        raise RuntimeError("502 Server Error: Bad Gateway")
+
+    monkeypatch.setattr(d, "parse_master_playlist", master)
+    tid, ok, info = d.process_one_entry(entry, set())
+    assert len(calls) == 1, f"中断后又试了 {len(calls) - 1} 个节点"
+    assert (ok, info) == (False, {"error": d._INTERRUPTED_ERROR, "retriable": True})
+
+
+def test_interrupt_during_sampling_skips_remaining_streams(tmp_path, monkeypatch):
+    """采样时收到中断：不再试其余流（每条都要先请求一次播放列表）。"""
+    entry = _interrupt_entry(tmp_path, monkeypatch, nodes=1)
+    monkeypatch.setattr(d, "parse_master_playlist", lambda url, **kw: [
+        ("1920x1080", "https://x/a.m3u8", 5000),
+        ("1280x720", "https://x/b.m3u8", 3000),
+        ("854x480", "https://x/c.m3u8", 1000),
+    ])
+    media_calls = []
+
+    def media(url, **kw):
+        media_calls.append(url)
+        return [f"https://seg.example/{i}.ts" for i in range(50)], [4.0] * 50, None
+
+    def sample(*a, **kw):
+        d.interrupted.set()
+        raise d.DownloadInterrupted(f"分片下载{d._INTERRUPTED_ERROR}")
+
+    monkeypatch.setattr(d, "parse_media_playlist", media)
+    monkeypatch.setattr(d, "download_segments", sample)
+    _, ok, info = d.process_one_entry(entry, set())
+    assert media_calls == ["https://x/a.m3u8"]
+    assert (ok, info) == (False, {"error": d._INTERRUPTED_ERROR, "retriable": True})
+
+
+def test_mp4_download_stops_after_interrupt(monkeypatch, tmp_path):
+    """🔴 mp4 直链分块下载原先不看中断，会把整部片（GB 级）下完才让线程池收尾。"""
+    monkeypatch.setattr(d, "MP4_CHUNK_SIZE", 1024)
+    monkeypatch.setattr(d, "MP4_CONCURRENCY", 2)
+    calls = []
+
+    def fake_chunk(url, headers, start, end, index, abort_event=None):
+        calls.append(index)
+        if len(calls) == 3:
+            d.interrupted.set()
+        return b"\0" * (end - start + 1)
+
+    monkeypatch.setattr(d, "_download_mp4_chunk", fake_chunk)
+    node = {"url": "https://cdn.example/a.mp4", "type": "mp4"}
+    with pytest.raises(d.DownloadInterrupted):
+        d._download_mp4_direct(node, str(tmp_path / "a.ts"), "9",
+                               preflight={"total_size": 1024 * 200, "probed": None})
+    assert len(calls) <= 3 + 2, f"中断后又下了 {len(calls) - 3} 块"
+
+
+def test_mp4_chunk_refuses_to_start_after_interrupt(monkeypatch):
+    monkeypatch.setattr(d, "get_session", lambda: pytest.fail("中断后不该再发请求"))
+    d.interrupted.set()
+    with pytest.raises(d.DownloadInterrupted):
+        d._download_mp4_chunk("https://cdn.example/a.mp4", {}, 0, 9, 0)
+
+
+def test_single_mp4_chunk_backoff_wakes_on_interrupt(monkeypatch):
+    """没有整片 abort_event 的单块调用（头部样本）退避也要认全局中断。"""
+    class _Down:
+        def request(self, *a, **kw):
+            raise ConnectionError("boom")
+
+    monkeypatch.setattr(d, "get_session", lambda: _Down())
+    monkeypatch.setattr(d, "SEG_RETRY_DELAY", 5)
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 2)
+    threading.Timer(0.3, d.interrupted.set).start()
+    started = time.monotonic()
+    with pytest.raises(d.DownloadInterrupted):
+        d._download_mp4_chunk("https://cdn.example/a.mp4", {}, 0, 9, 0)
+    assert time.monotonic() - started < 3
+
+
+def test_mp4_ranking_stops_on_interrupt(monkeypatch):
+    """跨节点择优逐个预检 mp4（每个下 8MB 样本），预检自己吞异常，中断得在循环里看。"""
+    monkeypatch.setattr(d, "_mp4_preflight", lambda *a, **kw: pytest.fail("中断后不该再预检"))
+    d.interrupted.set()
+    with pytest.raises(d.DownloadInterrupted):
+        d._rank_mp4_nodes([{"url": "a", "type": "mp4"}, {"url": "b", "type": "mp4"}], "9")
+
+
+def test_interrupt_during_playlist_500_backoff_is_not_rewritten_as_expired(monkeypatch):
+    """退避中途被中断时，DownloadInterrupted 的 __cause__ 就是那次 500：链接够老也不能
+    被改写成"签名过期、需重取"，否则整片不收手、还白耗重取额度。"""
+    class _Resp:
+        status_code = 500
+
+    cause = type("HTTPError", (Exception,), {"response": _Resp()})()
+    monkeypatch.setattr(d, "HOST_LIMITS", {"old.example": {"playlist_500_expired_after_seconds": 60}})
+    url = "https://old.example/master.m3u8"
+    plain = RuntimeError(f"请求失败: {url}")
+    plain.__cause__ = cause
+    assert d._playlist_500_as_expired(plain, url, 3600) is not None, "前提：普通 500 照旧判过期"
+    stopped = d.DownloadInterrupted(f"请求{d._INTERRUPTED_ERROR}: {url}")
+    stopped.__cause__ = cause
+    assert d._playlist_500_as_expired(stopped, url, 3600) is None
+
+
+def test_interrupted_error_is_retriable_and_not_a_refetch():
+    """中断不是片子的问题：可重试、不判死、不触发重取。"""
+    assert d._classify_failure(d._INTERRUPTED_ERROR) is True
+    assert not d.needs_refetch(d._INTERRUPTED_ERROR)
+    assert isinstance(d.DownloadInterrupted("x"), RuntimeError)
 
 
 def test_sample_retry_budget_is_far_smaller_than_full_download():
@@ -5836,6 +6064,73 @@ def test_sigint_while_disk_gate_closed_does_not_hang(tmp_path, monkeypatch):
     gate.set()
     t.join(3)
     assert not hung, "中断后 3 秒内必须退出，不能卡在 shutdown(wait=True) 上"
+
+
+def test_sigint_mid_film_download_does_not_try_the_other_nodes(tmp_path, monkeypatch):
+    """🔴 08 号机 2026-10-27 端到端：kill -INT 时正在下正片分片的片子，必须整片收手——
+    不把剩下的分片挨个判"已取消"，也不以"缺片率过高"失败后切到后面的节点重新请求
+    播放列表、采样；_run_pipeline 随即退出（with 收尾等的就是这个下载线程）。"""
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "async_refetch_hook", None)
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    monkeypatch.setattr(d, "DISK_GUARD_ENABLED", False)
+    monkeypatch.setattr(d, "interrupted", threading.Event())
+    nodes = [f"https://h{i}.example/master.m3u8" for i in range(3)]
+    inp = tmp_path / "in.jsonl"
+    inp.write_text(json.dumps({"tmdbId": "88", "urls": nodes}) + "\n")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(inp))
+
+    masters = []
+    monkeypatch.setattr(d, "parse_master_playlist", lambda url, **kw: masters.append(url) or [
+        ("1920x1080", url + "/a.m3u8", 5000)])
+    monkeypatch.setattr(d, "parse_media_playlist", lambda url, **kw: (
+        [f"{url}/{i}.ts" for i in range(3000)], [4.0] * 3000, None))
+    # 采样一关放行（不跑 ffprobe）。
+    monkeypatch.setattr(d, "probe_resolution", lambda path: (1920, 1080))
+    monkeypatch.setattr(d, "probe_codec", lambda path: "h264")
+    monkeypatch.setattr(d, "bitrate_threshold", lambda height, codec: 0)
+    monkeypatch.setattr(d, "validate_segment_content", lambda c, u: None)
+    segments_started = []
+    full_download_running = threading.Event()
+
+    def fake_request(method, url, **kw):
+        segments_started.append(url)
+        if len(segments_started) > 40:      # 采样 10 片之后，正片已经在下
+            full_download_running.set()
+        time.sleep(0.002)
+        return b"\x47" * 188
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    real_wait = d.wait
+
+    def wait_then_sigint(fs, **kw):
+        # 主循环在这里等整部片的下载 future：边等边看，正片一开下就模拟 Ctrl+C。
+        while True:
+            if full_download_running.is_set():
+                d.interrupted.set()          # 信号处理器会做的事
+                raise KeyboardInterrupt()
+            done, not_done = real_wait(fs, return_when=d.FIRST_COMPLETED, timeout=0.02)
+            if done:
+                return done, not_done
+
+    monkeypatch.setattr(d, "wait", wait_then_sigint)
+    outcome = {}
+
+    def run():
+        try:
+            d._run_pipeline()
+        except KeyboardInterrupt:
+            outcome["interrupted"] = True
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(10)
+    assert not t.is_alive(), "中断后 10 秒内必须退出"
+    assert outcome.get("interrupted"), "前提：中断发生在这部片下载途中"
+    assert 40 < len(segments_started) < 3000, "前提：中断时正片分片下到一半"
+    assert masters == nodes[:1], f"中断后又试了节点 {masters[1:]}"
 
 
 # ---------------------------------------------------------------------------

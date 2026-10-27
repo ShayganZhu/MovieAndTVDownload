@@ -881,6 +881,27 @@ class QualityRejectedError(RuntimeError):
 # mp4 直链层早有同款机制（_download_mp4_chunk 的 abort_event），但那是**每部片
 # 一个**的局部信号，只能在"这部片判失败"时打断自己；进程级中断需要这个全局的。
 interrupted = threading.Event()
+_INTERRUPTED_ERROR = "已取消（收到中断信号）"
+# 等在途任务时顺带看一眼中断信号的间隔（秒）：用于那些"在途任务自己不认中断"的等待。
+_INTERRUPT_POLL_SECONDS = 1.0
+
+
+class DownloadInterrupted(RuntimeError):
+    """收到中断信号后，下载线程主动收手时抛出：一路穿过"换下一条流 / 下一个节点"
+    的兜底，直接结束本片（按可重试处理，下次运行照常重下）。
+
+    为什么光让退避可打断还不够（2026-10-27，08 号机 kill -INT 后 35 分钟仍没退出）：
+    `with ThreadPoolExecutor` 收尾要等在跑的下载线程全部返回，而下载线程并不收手——
+    剩下的分片被逐个投出去再逐个判"已取消"（一部 1095 片的片子磨了约 20 分钟），
+    整片随即以"缺片率过高"失败、换下一个节点，接着请求播放列表、采样、预检 mp4；
+    mp4 直链分块下载则根本不看中断，会把整部片下完。
+    文案不在任何判死 / 需重取表里。
+    """
+
+
+def _raise_if_interrupted(what=""):
+    if interrupted.is_set():
+        raise DownloadInterrupted(f"{what}{_INTERRUPTED_ERROR}")
 
 
 # 并发开大后用于观察是否被源站风控：统计 403/429/503 的出现次数。
@@ -1371,7 +1392,8 @@ def request_with_retry(
                     f"  请求 HTTP 403，按临时风控重试 ({forbidden_retries}/{retry_403})，"
                     f"{wait:.1f}s 后重试: {url}"
                 )
-                time.sleep(wait)
+                if interrupted.wait(wait):
+                    raise DownloadInterrupted(f"请求{_INTERRUPTED_ERROR}: {url}") from exc
                 continue
             if status in _NO_RETRY_HTTP_STATUS:
                 # 签名过期型（401/403/410）额外挂重取 marker，让 m3u8 链路
@@ -1394,7 +1416,9 @@ def request_with_retry(
                 f"  请求重试 {attempt}/{retries - 1} ({status_hint})，"
                 f"{wait:.1f}s 后重试: {url}"
             )
-            time.sleep(wait)
+            # 可打断：播放列表退避最长 45s × 多次，中断后别让下载线程干等。
+            if interrupted.wait(wait):
+                raise DownloadInterrupted(f"请求{_INTERRUPTED_ERROR}: {url}") from exc
 
     raise RuntimeError(f"请求失败: {url}; {last_error}") from last_error
 
@@ -4602,7 +4626,11 @@ def _playlist_500_as_expired(exc, url, link_age):
     本可重试成功的片当轮就放弃了。年龄未知（无 fetched_at）一律按瞬时错误。
     只用于主/媒体播放列表（见 _attempt_download）；分片 500 仍是瞬时错误。
     不该算过期时返回 None。
+    退避中途收到中断时，DownloadInterrupted 的 __cause__ 正是那次 500：它不能被
+    改写成"需重取"，得原样抛出让整片收手。
     """
+    if isinstance(exc, DownloadInterrupted):
+        return None
     cfg = HOST_LIMITS.get(_host_of(url))
     after = cfg["playlist_500_expired_after_seconds"] if cfg else 0
     if (
@@ -5015,8 +5043,9 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
     rejected_retries = {"403": 0, "html": 0}
     for attempt in range(1, retry_max + 1):
         # 开跑之前先看一眼：中断后连第一次请求都不该再发。
-        if interrupted.is_set() or (abort_event is not None
-                                    and abort_event.is_set()):
+        if interrupted.is_set():
+            raise DownloadInterrupted(f"分片 {index + 1} 已取消")
+        if abort_event is not None and abort_event.is_set():
             raise RuntimeError(f"分片 {index + 1} 已取消")
         # 主机已熔断（本线程或别的线程刚触发）：不再发请求、不再退避，
         # 直接上抛让 download_segments 整片止损。
@@ -5083,7 +5112,7 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
                     f"({rejected_retries[kind]}/{kind_retry_max})，{wait:.1f}s 后重试"
                 )
                 if interrupted.wait(wait):
-                    raise RuntimeError(f"分片 {index + 1} 已取消") from exc
+                    raise DownloadInterrupted(f"分片 {index + 1} 已取消") from exc
                 if abort_event is not None and abort_event.is_set():
                     raise RuntimeError(f"分片 {index + 1} 已取消") from exc
                 continue
@@ -5103,7 +5132,7 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
             )
             # 可被打断的退避：任一信号置位就立刻醒来收手。
             if interrupted.wait(wait):
-                raise RuntimeError(f"分片 {index + 1} 已取消") from exc
+                raise DownloadInterrupted(f"分片 {index + 1} 已取消") from exc
             if abort_event is not None and abort_event.is_set():
                 raise RuntimeError(f"分片 {index + 1} 已取消") from exc
 
@@ -5156,6 +5185,8 @@ def download_segments(
 
     if retry_max is None:
         retry_max = SEG_RETRY_MAX
+    # 必须在 open(wb) 之前：中断后不该再截断、重写任何分片文件。
+    _raise_if_interrupted("分片下载")
     # 本片所有分片共用：据此区分 403 / HTML 页是临时风控（退避重试）还是失效（快速放弃）。
     forbidden_tracker = _Segment403Tracker()
 
@@ -5244,10 +5275,12 @@ def download_segments(
                     except Exception as exc:
                         done_buffer[index] = None
                         failed_indices.append(index)
-                        print(
-                            f"    警告: 分片 {index + 1} 耗尽重试次数，"
-                            f"将跳过并继续；{exc}"
-                        )
+                        # 中断后在途分片成批"已取消"，整片随后按中断上抛，逐条打出来只是刷屏。
+                        if not interrupted.is_set():
+                            print(
+                                f"    警告: 分片 {index + 1} 耗尽重试次数，"
+                                f"将跳过并继续；{exc}"
+                            )
 
                 # 按索引顺序把已就绪的分片落盘，保证输出严格有序。
                 while write_cursor < len(indices):
@@ -5260,10 +5293,18 @@ def download_segments(
                         total_bytes += len(data)
                     write_cursor += 1
 
+                # 收到中断：撤掉还没开跑的分片、不再补片，等在途的几个收尾后整片按中断上抛。
+                # 否则剩下的分片会被逐个投出去再逐个判"已取消"，线程池收尾一直等着它。
+                if interrupted.is_set():
+                    for pending in list(future_to_index):
+                        pending.cancel()
                 # 落盘后再补满窗口，保持 concurrency 个分片始终在途。
-                if circuit_exc is None:
+                elif circuit_exc is None:
                     refill()
 
+    # 中断优先于熔断：被撤掉 / 判"已取消"的分片不是缺片，绝不能当残片交给缺片判定
+    # （缺得少就会被当成功片转封装上传）。
+    _raise_if_interrupted("分片下载")
     if circuit_exc is not None:
         raise circuit_exc
 
@@ -5543,6 +5584,7 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
     request_headers["Range"] = f"bytes={start}-{end}"
     expected = end - start + 1
     for attempt in range(1, SEG_RETRY_MAX + 1):
+        _raise_if_interrupted(f"直链块 {index + 1} ")
         if abort_event is not None and abort_event.is_set():
             raise RuntimeError(f"直链块 {index + 1} 已随整片失败取消")
         try:
@@ -5604,11 +5646,15 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
                 f"({attempt}/{SEG_RETRY_MAX}): {exc}; {wait:.1f}s 后重试"
             )
             # 用 Event.wait 代替 sleep：整片一旦判失败可立刻醒来，不必空等完退避。
+            # 带 abort_event 的整片下载由外层循环在中断时置位它；单块调用（头部样本）
+            # 没有外层，直接等全局中断信号。
             if abort_event is not None:
                 if abort_event.wait(wait):
                     break
-            else:
-                time.sleep(wait)
+            elif interrupted.wait(wait):
+                raise DownloadInterrupted(
+                    f"直链块 {index + 1} {_INTERRUPTED_ERROR}"
+                ) from exc
     raise RuntimeError(
         f"直链块 {index + 1} 重试后仍失败: {last_error}"
     ) from last_error
@@ -5785,6 +5831,8 @@ def _rank_mp4_nodes(nodes, label, runtime_minutes=None):
 
     ranked = []
     for index, node in enumerate(nodes):
+        # 预检会吞掉自身的异常（失败只影响排序），中断得在这里看。
+        _raise_if_interrupted()
         info = _mp4_preflight(node, label, runtime_minutes)
         bitrate = info["bitrate"] if info else None
         # 排序键：① 有码率的排前面；② 实测的排在估算的前面（同为有码率时）；
@@ -5936,7 +5984,11 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None,
             refill()
             try:
                 while future_to_index:
-                    done, _ = wait(future_to_index.keys(), return_when=FIRST_COMPLETED)
+                    # 带超时：在途块都在退避里时只认 abort_event，靠这里定时看一眼中断。
+                    done, _ = wait(
+                        future_to_index.keys(), return_when=FIRST_COMPLETED,
+                        timeout=_INTERRUPT_POLL_SECONDS,
+                    )
                     for future in done:
                         index = future_to_index.pop(future)
                         try:
@@ -5947,6 +5999,9 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None,
                     while write_cursor < len(chunks) and write_cursor in done_buffer:
                         output_file.write(done_buffer.pop(write_cursor))
                         write_cursor += 1
+                    # 收到中断：走与"某块失败"同一条止损路径，不再把整部片下完。
+                    if failure is None and interrupted.is_set():
+                        failure = DownloadInterrupted(f"直链下载{_INTERRUPTED_ERROR}")
                     if failure is not None:
                         # 置位中止信号 + 取消未启动块：在跑的块会在下次重试点立即
                         # 退出，整片失败能在秒级归还下载槽位并换下一个取流节点。
@@ -6377,6 +6432,10 @@ def process_one_entry(entry, processed_ids):
                 remove_file(sample_path)
                 quality_rejected_streams += 1
                 print(f"  处理流 {resolution} 失败: {exc}")
+            except DownloadInterrupted:
+                # 收到中断：不再试其余流（每条都要先请求播放列表）。
+                remove_file(sample_path)
+                raise
             except Exception as exc:
                 remove_file(sample_path)
                 other_failed_streams += 1
@@ -6519,7 +6578,7 @@ def process_one_entry(entry, processed_ids):
         # （wait_for_disk_gate 收到中断会提前返回，故这一判必须在它之后。）
         if interrupted.is_set():
             return tmdb_id, False, {
-                "error": "已取消（收到中断信号）", "retriable": True,
+                "error": _INTERRUPTED_ERROR, "retriable": True,
             }
 
         print(f"\n开始处理: {tmdb_id} - {title}")
@@ -6555,6 +6614,8 @@ def process_one_entry(entry, processed_ids):
             ]
 
         for idx, node in enumerate(urls, start=1):
+            # 中断后不再换节点：下一个节点又要请求播放列表、采样、预检 mp4。
+            _raise_if_interrupted()
             is_last_node = idx == len(urls)
             node_host = _host_of(node["url"])
             extra_host = (
@@ -6575,6 +6636,10 @@ def process_one_entry(entry, processed_ids):
                     node, is_last_node, preflight_of.get(id(node))
                 )
                 break
+            except DownloadInterrupted:
+                # 中断不是本节点的失败：不记节点归因、不换下一个节点，整片按中断收手。
+                remove_file(final_ts)
+                raise
             except Exception as exc:
                 last_exc = exc
                 node_error = str(exc)
@@ -6612,6 +6677,9 @@ def process_one_entry(entry, processed_ids):
         handed_off_to_conversion = True
         return tmdb_id, True, conversion_job
 
+    except DownloadInterrupted:
+        # 与开头"中断后不再开新片"同一个结论：可重试，下次运行照常重下。
+        return tmdb_id, False, {"error": _INTERRUPTED_ERROR, "retriable": True}
     except Exception as exc:
         msg = str(exc)
         # 整片可否重试：全节点失败时以“任一节点可重试”为准（乐观，首要目标是下全）；
