@@ -102,8 +102,10 @@ VIDLINK_API_HEADERS = {"User-Agent": UA, "Origin": "https://vidlink.pro", "Refer
 # 只有 okhttp UA + 不带 Referer 才 206。随 url 一起写进 results.jsonl，供 download_movies.py 直接使用。
 VIDLINK_DOWNLOAD_HEADERS = {"User-Agent": "okhttp/4.9.3"}
 
-VIDEASY_API_HEADERS = {"Accept": "*/*", "Origin": "https://player.videasy.to",
-                       "Referer": "https://player.videasy.to/", "User-Agent": UA}
+# Origin/Referer：2026-10-25 起 api.wecollege.net 按 Origin 拦截，旧的 player.videasy.to 一律
+# Cloudflare 403，换成 vidy.st 才 200（上游 EncDecEndpoints f260cc8；2026-10-27 实测，机房 IP 直连可用）。
+VIDEASY_API_HEADERS = {"Accept": "*/*", "Origin": "https://vidy.st",
+                       "Referer": "https://vidy.st/", "User-Agent": UA}
 # videasy 接口域名：2026-10 由 api.speedracelight.com 迁到 api.wecollege.net
 # （旧域名恒 502，整批 0 成功），server 也从 cdn/m4uhd 换成按城市命名的十几个。
 VIDEASY_HOST = _CFG.get("videasy_host", "https://api.wecollege.net").rstrip("/")
@@ -903,7 +905,7 @@ def _fetch_vidlink(session, tmdb_id):
 
 
 def _fetch_videasy(session, tmdb_id):
-    """videasy（player.videasy.to）：seed → /{server}/sources → dec-videasy。
+    """videasy（vidy.st，原 player.videasy.to）：seed → /{server}/sources → dec-videasy。
     2026-09-08 电影版实测命中率最高（11.7%）、独占最多（11 部）。
     各 server 按 title/year 检索，缺元数据时只走第一个 server。
 

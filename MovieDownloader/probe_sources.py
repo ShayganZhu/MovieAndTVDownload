@@ -199,8 +199,8 @@ VIDEASY_SERVERS = ("cdn", "m4uhd")
 
 
 def probe_videasy(session, ep):
-    headers = {"Accept": "*/*", "Origin": "https://player.videasy.to",
-               "Referer": "https://player.videasy.to/", "User-Agent": UA}
+    headers = {"Accept": "*/*", "Origin": "https://vidy.st",
+               "Referer": "https://vidy.st/", "User-Agent": UA}
     tid = ep["tid"]
     title = ep.get("title") or ""
     year = ep.get("year") or ""
