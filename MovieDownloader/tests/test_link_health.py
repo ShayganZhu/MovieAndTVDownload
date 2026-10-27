@@ -248,14 +248,21 @@ def test_film_only_on_broken_vidlink_host_is_parked():
 
 
 def test_momentary_mp4_breaker_trip_does_not_park():
-    """🔴 mp4 主机熔断 15 秒就复位（给分钟级抖动用）：熔断那一刻到闸门的片照常派，
-    不能因此挂起几十个小时。"""
+    """🔴 mp4 主机熔断 15 秒就复位（给分钟级抖动用）：熔断那一刻到闸门的片不能因此
+    挂起几十个小时等 vidlink 缓存刷新——只等这次冷却（熔断等冷却，2026-10-27），
+    到点照常派。"""
+    clock = Clock()
     d._mp4_host_tripped[HCDN3] = time.monotonic() + 15
     entry = film("f1", vlink("f1", host=HCDN3, signed_ago_h=1))
     r = Refetcher()
-    gate = gate_with(Src([entry], closed=False, refetcher=r), r)
+    gate = gate_with(Src([entry], closed=False, refetcher=r), r, clock=clock)
+    assert drain(gate) == ([], "wait")
+    assert gate.stats["parked"] == 0 and gate.stats["circuit_held"] == 1
+    assert gate._cooling[0][0] <= NOW + 15, "只等这一次冷却，不是 vidlink 缓存刷新"
+    clock.advance(0.25)
+    del d._mp4_host_tripped[HCDN3]           # 冷却结束
     got, _ = drain(gate)
-    assert ids(got) == ["f1"] and gate.stats["parked"] == 0
+    assert ids(got) == ["f1"] and gate.stats["parked"] == 0 and r.dispatched == []
 
 
 def _variant(node, quality):

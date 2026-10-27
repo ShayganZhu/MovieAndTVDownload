@@ -1199,3 +1199,116 @@ def test_playlist_500_judged_by_the_nodes_own_age(tmp_path, monkeypatch):
     entry["urls"][0]["fetched_at"] = int(time.time()) - 160 * 60   # 这个节点是补回的旧节点
     _, ok, info = d.process_one_entry(entry, set())
     assert d.needs_refetch(info["node_failures"][0]["error"])
+
+
+# ------------------------------------------------------------ 熔断等冷却（2026-10-27）
+# 06 号机 10-27：finalsignal 连续 20 次 429 熔断 15 秒，闸门照常派片，process_one_entry
+# 当场按熔断失败、名额一空又派下一部，545 部片几秒内全被判失败。
+
+@pytest.fixture
+def tripped(monkeypatch):
+    """host -> 熔断剩余秒数；不在表里的主机没熔断。"""
+    table = {}
+    monkeypatch.setattr(d, "host_circuit_remaining",
+                        lambda node: table.get(d._host_of(node["url"])))
+    monkeypatch.setattr(d, "HOST_CIRCUIT_HOLD_MAX_PER_MOVIE", 20)
+    return table
+
+
+def test_films_on_tripped_host_wait_for_cooldown_instead_of_failing(tripped, capsys):
+    """🔴 节点全在熔断主机上的片不派出去、不占名额；冷却到点按原顺序派。"""
+    clock = Clock()
+    tripped[PALEO] = 15
+    src = Src([pal("p1"), pal("p2"), fast("f3")])
+    gate = make_gate(src, clock=clock)
+    got, state = drain(gate)
+    assert ids(got) == ["f3"], "别的主机的片照常派"
+    assert state == "wait", "还有片在等冷却，本轮不能收尾"
+    assert gate.in_flight(PALEO) == 0, "等冷却的片不占专用名额"
+    assert gate.stats["circuit_held"] == 2
+    gate.print_status(force=True)
+    assert "[熔断等冷却] 在等 2 部" in capsys.readouterr().out
+
+    clock.advance(0.1)                       # 6 秒：还没到点
+    assert drain(gate) == ([], "wait")
+    clock.advance(0.15)                      # 15 秒到点，主机也恢复了
+    tripped.clear()
+    got, state = drain(gate)
+    assert ids(got) == ["p1", "p2"] and state == "done"
+
+
+def test_film_with_a_live_backup_node_is_dispatched_during_trip(tripped):
+    """还有一个节点的主机没熔断就照常派：process_one_entry 跳过熔断节点、下 mp4。"""
+    tripped[PALEO] = 15
+    got, state = drain(make_gate(Src([pal("p1", mp4=True)])))
+    assert ids(got) == ["p1"] and state == "done"
+
+
+def test_hold_waits_for_the_earliest_cooldown(tripped):
+    """节点分在两台都熔断的主机上：等最早那台冷却完就回来派。"""
+    clock = Clock()
+    tripped.update({PALEO: 40, HAKUNA: 10})
+    gate = make_gate(Src([pal("p1", mp4=True)]), clock=clock)
+    assert drain(gate) == ([], "wait")
+    clock.advance(10 / 60)
+    del tripped[HAKUNA]
+    got, _ = drain(gate)
+    assert ids(got) == ["p1"]
+
+
+def test_hold_is_capped_per_film_then_dispatched(tripped, monkeypatch):
+    """主机一直不好：挂起次数用完照常派出去（按熔断失败进下一轮），不拖住本轮收尾。"""
+    monkeypatch.setattr(d, "HOST_CIRCUIT_HOLD_MAX_PER_MOVIE", 2)
+    clock = Clock()
+    tripped[PALEO] = 15
+    gate = make_gate(Src([pal("p1")]), clock=clock)
+    for _ in range(2):
+        assert drain(gate) == ([], "wait")
+        clock.advance(0.25)
+    got, state = drain(gate)
+    assert ids(got) == ["p1"]
+    assert gate.stats["circuit_held"] == 2 and gate.stats["circuit_hold_out"] == 1
+
+
+def test_hold_disabled_when_max_is_zero(tripped, monkeypatch):
+    monkeypatch.setattr(d, "HOST_CIRCUIT_HOLD_MAX_PER_MOVIE", 0)
+    tripped[PALEO] = 15
+    got, _ = drain(make_gate(Src([pal("p1")])))
+    assert ids(got) == ["p1"]
+
+
+def test_mp4_fallback_copy_is_held_when_its_hosts_are_tripped(tripped):
+    """mp4 兜底那条路同样要看熔断：mp4 主机也熔断时不派出去白失败。"""
+    clock = Clock()
+    src = Src([pal("p1"), pal("p2"), pal("p3", mp4=True)])
+    gate = make_gate(src, clock=clock)
+    got, _ = drain(gate)
+    assert ids(got) == ["p1", "p2"]
+    clock.advance(121)                       # p3 让行满 mp4_fallback_after_minutes
+    assert drain(gate) == ([], "wait")       # 这次只投后台画质评估
+    tripped.update({PALEO: 15, HAKUNA: 15})
+    assert drain(gate) == ([], "wait"), "评估通过，但 mp4 主机也在熔断：挂起，不派"
+    assert gate.stats["circuit_held"] == 1
+    clock.advance(0.25)
+    tripped.clear()
+    got, _ = drain(gate)
+    assert ids(got) == ["p3"]
+
+
+def test_host_circuit_remaining_reads_without_resetting(monkeypatch):
+    """按节点类型看对应的熔断表；只读，到点也不复位（复位留给下载线程的半开）。"""
+    host = "sun.finalsignal.top"
+    m3u8 = {"url": f"https://{host}/r6/x/master.m3u8", "type": "m3u8"}
+    mp4 = {"url": f"https://{host}/x.mp4", "type": "mp4"}
+    monkeypatch.setitem(d._hls_host_tripped, host, time.monotonic() + 10)
+    assert 9 < d.host_circuit_remaining(m3u8) <= 10
+    assert d.host_circuit_remaining(mp4) is None, "mp4 节点看直链熔断表"
+    monkeypatch.setitem(d._mp4_host_tripped, host, time.monotonic() - 1)
+    assert d.host_circuit_remaining(mp4) is None, "已到点算没熔断"
+    assert host in d._mp4_host_tripped, "只读，不复位"
+    assert d.host_circuit_remaining({"url": "not-a-url", "type": "m3u8"}) is None
+
+
+def test_shipped_host_circuit_hold_config():
+    assert d._CFG["host_circuit_hold_max_per_movie"] == 20
+    assert d.HOST_CIRCUIT_HOLD_MAX_PER_MOVIE == 20

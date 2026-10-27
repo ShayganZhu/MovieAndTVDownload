@@ -916,6 +916,13 @@ MP4_HOST_CIRCUIT_THRESHOLD = max(
 HOST_CIRCUIT_COOLDOWN_SEC = max(
     1.0, float(_CFG.get("host_circuit_cooldown_sec", 15))
 )
+# 派发闸门遇到「节点全在熔断中的主机上」的片：挂起到冷却结束再派，每片每次运行最多挂起
+# 这么多次（2026-10-27）。此前闸门不看熔断，照常派出去，process_one_entry 当场按熔断失败、
+# 名额一空闸门又派下一部——06 号机 finalsignal 一次 15 秒的熔断连锁判掉 545 部。
+# 次数用完（主机一直不好）就照常派出去、按熔断失败进下一轮，不拖住本轮收尾。0 = 不挂起。
+HOST_CIRCUIT_HOLD_MAX_PER_MOVIE = max(
+    0, int(_CFG.get("host_circuit_hold_max_per_movie", 20))
+)
 # 熔断文案。⚠️ 有意**不**加入 _PERMANENT_FAILURE_MARKERS（见上）。
 _MP4_HOST_BLOCKED_MARKER = "直链主机疑似故障已熔断"
 
@@ -1158,6 +1165,27 @@ def _raise_if_hls_host_tripped(url, what):
         raise HostCircuitOpenError(
             f"{_HLS_HOST_BLOCKED_MARKER}（{_host_of(url)}），跳过{what}: {url}"
         )
+
+
+def host_circuit_remaining(node):
+    """节点所在主机的熔断还要冷却多少秒；没熔断（或已到点）返回 None。
+
+    m3u8 节点看分片熔断，mp4 节点看直链熔断——与 process_one_entry 跳过节点的口径一致。
+    只读：到点也不在这里复位，复位留给下载线程第一次问到该主机时做（半开）。
+    """
+    host = _host_of(node.get("url"))
+    if not host:
+        return None
+    if node.get("type") == "mp4":
+        lock, tripped = _mp4_host_lock, _mp4_host_tripped
+    else:
+        lock, tripped = _hls_host_lock, _hls_host_tripped
+    with lock:
+        next_retry = tripped.get(host)
+    if next_retry is None:
+        return None
+    remaining = next_retry - time.monotonic()
+    return remaining if remaining > 0 else None
 
 
 # 确定性 HTTP 状态码：同一条 url 重试必然复现同样结果，重试纯属浪费时间与槽位。
@@ -2948,6 +2976,9 @@ class HostCapGate:
        刷新（签名时刻 + vidlink_cache_roll_hours）再重取——缓存刷新前重取只会拿回
        同一条死链接（10-25 实测：48 小时后 8/8 换到新签名）；挂起次数用完、或本轮
        等不到的，本次不下载，记一条「需重新取流」留给下次运行。
+    6. **熔断等冷却**（2026-10-27，见 _hold_if_host_tripped）：节点全在熔断中的主机上
+       的片不派出去，挂起到最早那台冷却结束、回闸门重新分通道；不占名额、不判失败、
+       不重取。还有任一节点的主机没熔断就照常派（process_one_entry 跳过熔断的节点）。
 
     🔴 本轮收尾：来源取空后，只要还有排队 / 等重取的片，就报 wait 而不是 done。
     排队只在内存里：中断时这些片本就在 results.jsonl 里，下次运行是存量。
@@ -2970,6 +3001,11 @@ class HostCapGate:
         self._parked = []
         self._park_seq = 0
         self._park_counts = {}        # tmdbId -> 本次运行已挂起次数
+        # 等主机熔断冷却的片：(到点时刻, 序号, tmdbId, 条目) 的小根堆；到点回 _held 重新分通道。
+        self._cooling = []
+        self._cool_seq = 0
+        self._cool_counts = {}        # tmdbId -> 本次运行已为熔断挂起的次数
+        self._cool_out = set()        # 熔断挂起次数已用完的 tmdbId（只为按片计数）
         # 判断「重取是否还有下文」要靠 is_pending；没有它就无法安全地等结果。
         self._refetcher = refetcher if hasattr(refetcher, "is_pending") else None
         self._extra_active = extra_active or (lambda host: 0)
@@ -3011,7 +3047,7 @@ class HostCapGate:
             "jit_refetch": 0, "jit_partial": 0, "jit_no_result": 0, "jit_budget_out": 0,
             "general_jit_refetch": 0, "jit_same_link": 0, "demoted": 0,
             "dead_nodes_pruned": 0, "dead_link_failed": 0, "dead_link_skipped": 0, "parked": 0,
-            "park_refetch": 0, "park_flushed": 0,
+            "park_refetch": 0, "park_flushed": 0, "circuit_held": 0, "circuit_hold_out": 0,
         }
 
     # ---- 主循环接口 ----
@@ -3048,6 +3084,7 @@ class HostCapGate:
             ramp.tick(now)
         self.print_status(now)
         self._release_due_parked(now)
+        self._release_cooled(now)
         while True:
             entry = self._next_from_queues(now)
             if entry is not None:
@@ -3072,9 +3109,10 @@ class HostCapGate:
             if result is not None:
                 return "item", result
             # 进了排队或送去重取：接着看下一条。
-        if self._held or self._refetching or self._general_queue or any(
+        if self._held or self._refetching or self._general_queue or self._cooling or any(
             lane for queues in self._queues.values() for lane in queues.values()
         ):
+            # 等熔断冷却的片最多等一个冷却期、且挂起次数有上限，照样算本轮的活。
             return "wait", None
         if self._parked:
             # 其余活都干完了，只剩挂起片：快到点的等一等，远的不拖住本轮收尾。
@@ -3123,6 +3161,12 @@ class HostCapGate:
                 f"到点重取 {s['park_refetch']} 次，收尾时没等到 {s['park_flushed']} 部）",
                 flush=True,
             )
+        if s["circuit_held"] or self._cooling:
+            print(
+                f"[熔断等冷却] 在等 {len(self._cooling)} 部；累计挂起 {s['circuit_held']} 次，"
+                f"挂起次数用完、照常派出 {s['circuit_hold_out']} 部",
+                flush=True,
+            )
 
     # ---- 内部 ----
     @staticmethod
@@ -3164,6 +3208,8 @@ class HostCapGate:
                 entry = self._pop_mp4_fallback(host, queues, now)
                 if entry is not None:
                     entry = self._screen(entry, None, self._key(entry), now)
+                if entry is not None and self._hold_if_host_tripped(entry, self._key(entry), now):
+                    entry = None
                 if entry is not None:
                     self._reserve(entry, GENERAL_LANE)
                     return entry
@@ -3334,11 +3380,14 @@ class HostCapGate:
 
     def _deliver(self, entry, host, key, now):
         """派发前的最后一关：链接太旧就先送去重取（返回 None）；再筛掉已知失效的节点
-        （_screen，可能挂起 / 跳过 / 换通道，都返回 None）；否则占名额放行。"""
+        （_screen，可能挂起 / 跳过 / 换通道，都返回 None）；节点全在熔断中的主机上就
+        挂起等冷却（返回 None）；否则占名额放行。"""
         if self._send_to_refetch(entry, key, now):
             return None
         entry = self._screen(entry, host, key, now)
         if entry is None:
+            return None
+        if self._hold_if_host_tripped(entry, key, now):
             return None
         self._reserve(entry, host or GENERAL_LANE)
         self._first_deferred_at.pop(key, None)
@@ -3456,6 +3505,48 @@ class HostCapGate:
             when = time.strftime("%m-%d %H:%M", time.gmtime(due))
             self._skip(entry, key, f"vidlink 缓存预计 {when} UTC 刷新，本轮等不到，本次不下载",
                        count=False)
+
+    # ---- 熔断等冷却 ----
+    def _hold_if_host_tripped(self, entry, key, now):
+        """节点全在熔断中的主机上：挂起到最早那台冷却结束再派，返回是否挂起了。
+
+        派出去也只会在 process_one_entry 里当场按熔断失败、名额一空又派下一部，一次熔断
+        能连锁判掉整条排队（06 号机 10-27：一次 15 秒的 finalsignal 熔断判掉 545 部）。
+        还有任一节点的主机没熔断就照常派：process_one_entry 跳过熔断的节点、用其余节点下。
+        每片每次运行最多挂起 HOST_CIRCUIT_HOLD_MAX_PER_MOVIE 次，用完照常派出去。
+        """
+        if key is None or HOST_CIRCUIT_HOLD_MAX_PER_MOVIE <= 0:
+            return False
+        nodes = _entry_nodes(entry)
+        if not nodes:
+            return False
+        remaining = [host_circuit_remaining(node) for node in nodes]
+        if any(r is None for r in remaining):
+            return False
+        held = self._cool_counts.get(key, 0)
+        if held >= HOST_CIRCUIT_HOLD_MAX_PER_MOVIE:
+            if key not in self._cool_out:
+                self._cool_out.add(key)
+                self.stats["circuit_hold_out"] += 1
+            return False
+        wait = min(remaining)
+        self._cool_counts[key] = held + 1
+        self._cool_seq += 1
+        heapq.heappush(self._cooling, (now + wait, self._cool_seq, key, entry))
+        self.stats["circuit_held"] += 1
+        hosts = "、".join(dict.fromkeys(_host_of(node["url"]) for node in nodes))
+        print(
+            f"  [熔断等冷却] {key}: 节点所在主机 {hosts} 熔断中，{wait:.0f}s 后再派发"
+            f"（第 {held + 1}/{HOST_CIRCUIT_HOLD_MAX_PER_MOVIE} 次）",
+            flush=True,
+        )
+        return True
+
+    def _release_cooled(self, now):
+        """冷却到点的片回闸门：经 _admit 重新分通道、按原排队位置排回去。"""
+        while self._cooling and self._cooling[0][0] <= now:
+            _due, _seq, _key, entry = heapq.heappop(self._cooling)
+            self._held.append(entry)
 
     def _skip(self, entry, key, reason, count=True):
         if count:
