@@ -461,12 +461,15 @@ SEG_RETRY_DELAY = float(_CFG.get("seg_retry_delay", 1))
 # 起指数退避（封顶 _SEG_403_RETRY_DELAY_MAX）重试至多 seg_403_retry_max 次；
 # 一直没有成功、403 攒够 seg_403_expired_after 次则仍按签名过期快速放弃、转重取。
 # seg_403_retry_max 设 0 即回到旧行为。
-SEG_403_RETRY_MAX = max(0, int(_CFG.get("seg_403_retry_max", 5)))
-SEG_403_RETRY_DELAY = float(_CFG.get("seg_403_retry_delay", 4))
+# 4s 起 5 次 → 1s 起 8 次（2026-10-27，06 号机 bb5382a 4 小时实测）：等 4/8/16/30 秒后仍 403 的
+# 比例是 37%/45%/48%/47%——等得再久也只救回一半，长退避只是让分片槽空等（平均约 50 个），
+# 5 次用完还丢了 1470 个分片（31 部上传的片缺 5 片以上）。短起步省空等，多几次补回缺片。
+SEG_403_RETRY_MAX = max(0, int(_CFG.get("seg_403_retry_max", 8)))
+SEG_403_RETRY_DELAY = float(_CFG.get("seg_403_retry_delay", 1))
 SEG_403_EXPIRED_AFTER = max(1, int(_CFG.get("seg_403_expired_after", 8)))
 _SEG_403_RETRY_DELAY_MAX = 30.0
 # 本片最近一次分片成功距今不超过这么久，才算"别的分片还在正常下"。
-# 比单分片的 403 退避总长（4+8+16+30+30 秒）短：token 中途过期时，最多白等这么久就转重取。
+# 比单分片的 403 退避总长（1+2+4+8+16+30+30+30 ≈ 2 分钟）短：token 中途过期时，最多白等这么久就转重取。
 _SEG_403_RECENT_OK_SECONDS = 60.0
 # 采样阶段的单分片重试上限，**刻意远小于** seg_retry_max。
 #
@@ -540,6 +543,13 @@ PLAYLIST_RETRY_BACKOFF_MAX = float(_CFG.get("playlist_retry_backoff_max", 60.0))
 # 方案C 分阶重试：多节点 fallback 时，非末节点用更小的 playlist 重试次数，
 # 坏节点快速判定并换下一个备用节点；末节点/单节点仍用 PLAYLIST_RETRY_MAX 死磕。
 PLAYLIST_RETRY_FALLBACK = int(_CFG.get("playlist_retry_fallback", 3))
+# playlist 的 403 先按临时风控短间隔重试（2026-10-27）：finalsignal /r6/ 的 master / media
+# playlist 与分片一样随机回 Cloudflare 403（06 号机 bb5382a 跑 4 小时：347 部片因此整片失败、
+# 158 条流在采样阶段出局，全被当成签名过期转重取）。从 playlist_403_retry_delay 秒起
+# 指数退避重试至多 playlist_403_retry_max 次（1+2+4 ≈ 7 秒），不占 playlist_retry_max；
+# 还是 403 才按签名过期转重取——真过期的片只多花这几秒。设 0 回到旧行为。
+PLAYLIST_403_RETRY_MAX = max(0, int(_CFG.get("playlist_403_retry_max", 3)))
+PLAYLIST_403_RETRY_DELAY = float(_CFG.get("playlist_403_retry_delay", 1.0))
 # mp4 直链（vidlink 等）按 Range 分块并发下载：每块字节数与并发块数。
 # 块太小会放大请求次数（CDN 限速/风控），太大则单块失败重传代价高；8MB 是折中。
 MP4_CHUNK_SIZE = int(_CFG.get("mp4_chunk_size", 8 * 1024 * 1024))
@@ -1280,9 +1290,15 @@ def get_session():
 
 def request_with_retry(
     method, url, retries=3, backoff=0.5, backoff_max=45.0, as_text=False,
-    on_attempt=None, **kwargs
+    on_attempt=None, retry_403=0, retry_403_delay=1.0, **kwargs
 ):
     """发起 HTTP 请求；成功时返回 str 或 bytes。
+
+    retry_403 / retry_403_delay（2026-10-27，播放列表用）：403 先按临时风控以
+    retry_403_delay 起指数退避重试至多 retry_403 次，不占 retries 的名额；还是 403
+    才照下面的确定性失败处理。finalsignal /r6/ 的播放列表与分片一样随机回 Cloudflare
+    403（06 号机 4 小时 347 部片因此整片失败、转重取）。默认 0 = 不重试（分片层
+    retries=1 调用本函数，403 由 download_single_segment 自己按整片判别）。
 
     on_attempt(url, exc)：每次请求结束后回调一次（成功时 exc 为 None），供按主机
     统计请求结果；回调自身出错不影响请求。
@@ -1315,7 +1331,9 @@ def request_with_retry(
     request_headers.update(kwargs.pop("headers", {}) or {})
 
     last_error = None
-    for attempt in range(retries):
+    forbidden_retries = 0
+    attempt = 0
+    while attempt < retries:
         try:
             with session.request(
                 method, url, headers=request_headers, **kwargs
@@ -1336,6 +1354,16 @@ def request_with_retry(
             status = _status_of(exc)
             if status in (403, 429, 503):
                 record_block_status(status)
+            if status == 403 and forbidden_retries < retry_403:
+                forbidden_retries += 1
+                wait = retry_403_delay * (2 ** (forbidden_retries - 1))
+                wait += random.uniform(0, min(1.0, wait * 0.2))
+                print(
+                    f"  请求 HTTP 403，按临时风控重试 ({forbidden_retries}/{retry_403})，"
+                    f"{wait:.1f}s 后重试: {url}"
+                )
+                time.sleep(wait)
+                continue
             if status in _NO_RETRY_HTTP_STATUS:
                 # 签名过期型（401/403/410）额外挂重取 marker，让 m3u8 链路
                 # 也能进重取流闭环（见本函数文档）。404/416 有意不挂。
@@ -1347,13 +1375,14 @@ def request_with_retry(
                     f"请求失败({_HTTP_PERMANENT_MARKER} HTTP {status})"
                     f"{suffix}: {url}; {exc}"
                 ) from exc
-            if attempt == retries - 1:
+            attempt += 1
+            if attempt >= retries:
                 break
-            wait = min(backoff * (2**attempt), backoff_max)
+            wait = min(backoff * (2 ** (attempt - 1)), backoff_max)
             wait += random.uniform(0, min(1.0, wait * 0.2))
             status_hint = f"HTTP {status}" if status else type(exc).__name__
             print(
-                f"  请求重试 {attempt + 1}/{retries - 1} ({status_hint})，"
+                f"  请求重试 {attempt}/{retries - 1} ({status_hint})，"
                 f"{wait:.1f}s 后重试: {url}"
             )
             time.sleep(wait)
@@ -4595,6 +4624,8 @@ def parse_master_playlist(master_url, retries=None, headers=None):
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
         headers=headers,
         on_attempt=_count_playlist_attempt,
+        retry_403=PLAYLIST_403_RETRY_MAX,
+        retry_403_delay=PLAYLIST_403_RETRY_DELAY,
     )
     _assert_playlist_body(text, master_url)
     lines = [line.strip() for line in text.splitlines()]
@@ -4654,6 +4685,8 @@ def parse_media_playlist(playlist_url, headers=None):
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
         headers=headers,
         on_attempt=_count_playlist_attempt,
+        retry_403=PLAYLIST_403_RETRY_MAX,
+        retry_403_delay=PLAYLIST_403_RETRY_DELAY,
     )
     _assert_playlist_body(text, playlist_url)
     lines = [line.strip() for line in text.splitlines()]

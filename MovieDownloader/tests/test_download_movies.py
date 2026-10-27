@@ -3665,6 +3665,105 @@ def test_download_segments_retries_scattered_403(monkeypatch, seg_403_env, tmp_p
     assert (tmp_path / "out.ts").read_bytes() == b"".join(b"\x47" + u.encode() for u in urls)
 
 
+def test_shipped_segment_and_playlist_403_config():
+    """10-27 按 06 号机实测调的值：分片 1s 起 8 次；播放列表 1s 起 3 次。"""
+    assert (d.SEG_403_RETRY_DELAY, d.SEG_403_RETRY_MAX) == (1.0, 8)
+    assert (d.PLAYLIST_403_RETRY_DELAY, d.PLAYLIST_403_RETRY_MAX) == (1.0, 3)
+
+
+class _ScriptedResp:
+    def __init__(self, status):
+        self.status_code = status
+        self.text = "#EXTM3U\n#EXTINF:4,\nseg-1.ts\n"
+        self.content = self.text.encode()
+        self.encoding = "utf-8"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} Client Error", response=self)
+
+
+@pytest.fixture
+def scripted_http(monkeypatch):
+    """按给定状态码序列应答的 Session；记下请求次数与每次 sleep 的秒数。"""
+    state = {"statuses": [], "calls": 0, "slept": []}
+
+    class _Session:
+        def request(self, method, url, headers=None, **kw):
+            state["calls"] += 1
+            return _ScriptedResp(state["statuses"].pop(0))
+
+    monkeypatch.setattr(d, "get_session", lambda: _Session())
+    monkeypatch.setattr(d.time, "sleep", lambda s: state["slept"].append(s))
+    return state
+
+
+def test_playlist_403_is_retried_then_succeeds(scripted_http):
+    """🔴 播放列表的随机 403：短间隔重试后拿到，不再整片失败、转重取。"""
+    scripted_http["statuses"] = [403, 403, 200]
+    text = d.request_with_retry("GET", "https://x/r6/master.m3u8", retries=4, as_text=True,
+                                retry_403=3, retry_403_delay=1.0)
+    assert text.startswith("#EXTM3U") and scripted_http["calls"] == 3
+    assert 1.0 <= scripted_http["slept"][0] <= 1.2 and 2.0 <= scripted_http["slept"][1] <= 2.4
+
+
+def test_playlist_persistent_403_still_goes_to_refetch(scripted_http):
+    """一直 403（签名真过期）：重试次数用完照旧按确定性失败抛出，带需重取标记。"""
+    scripted_http["statuses"] = [403] * 4
+    with pytest.raises(RuntimeError) as ei:
+        d.request_with_retry("GET", "https://x/r6/master.m3u8", retries=4, as_text=True,
+                             retry_403=3, retry_403_delay=1.0)
+    assert scripted_http["calls"] == 4
+    assert d._HTTP_PERMANENT_MARKER in str(ei.value)
+    assert d._NEEDS_REFETCH_MARKER in str(ei.value)
+
+
+def test_request_403_not_retried_by_default(scripted_http):
+    """默认不重试 403：分片层（retries=1）靠 download_single_segment 自己判别。"""
+    scripted_http["statuses"] = [403]
+    with pytest.raises(RuntimeError, match=d._HTTP_PERMANENT_MARKER):
+        d.request_with_retry("GET", "https://x/seg.ts", retries=1)
+    assert scripted_http["calls"] == 1
+
+
+def test_playlist_403_retries_do_not_use_up_normal_retries(scripted_http):
+    """403 的重试另计：前面一次 502 用掉的普通重试名额不影响 403 的两次。"""
+    scripted_http["statuses"] = [502, 403, 403, 200]
+    text = d.request_with_retry("GET", "https://x/r6/master.m3u8", retries=2, backoff=0.01,
+                                as_text=True, retry_403=2, retry_403_delay=0.01)
+    assert text.startswith("#EXTM3U") and scripted_http["calls"] == 4
+
+
+def test_normal_retry_backoff_unchanged(scripted_http):
+    """改写循环后普通重试的次数与退避节奏不变：retries=3 → 最多 3 次请求，退避 1s、2s。"""
+    scripted_http["statuses"] = [502, 502, 502]
+    with pytest.raises(RuntimeError, match="请求失败: "):
+        d.request_with_retry("GET", "https://x/master.m3u8", retries=3, backoff=1.0)
+    assert scripted_http["calls"] == 3
+    slept = scripted_http["slept"]
+    assert len(slept) == 2 and 1.0 <= slept[0] <= 1.2 and 2.0 <= slept[1] <= 2.4
+
+
+def test_playlist_parsers_turn_on_403_retry(monkeypatch):
+    """master / media playlist 两处都必须开 403 重试（分片层那处不开）。"""
+    seen = []
+
+    def fake_request(method, url, **kw):
+        seen.append((kw.get("retry_403"), kw.get("retry_403_delay")))
+        return "#EXTM3U\n#EXTINF:4,\nseg-1.ts\n"
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    d.parse_master_playlist("https://x/r6/master.m3u8")
+    d.parse_media_playlist("https://x/r6/index.m3u8")
+    assert seen == [(d.PLAYLIST_403_RETRY_MAX, d.PLAYLIST_403_RETRY_DELAY)] * 2
+
+
 def test_download_segments_whole_film_403_fails_fast(monkeypatch, seg_403_env, tmp_path):
     """🔴 整片都 403（签名过期）时仍快速放弃：攒够阈值后每个分片只请求 1 次，转重取。"""
     monkeypatch.setattr(d, "SEG_403_EXPIRED_AFTER", 2)

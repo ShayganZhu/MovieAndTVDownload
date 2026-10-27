@@ -740,11 +740,14 @@ download_movies:
   # 但 videasy 的 sun.finalsignal.top/r6/ 在负载下会随机回 Cloudflare 403（20–30 秒后恢复），
   # 06 号机实测每部片因此零散丢 7%–16% 分片、整片缺片失败。
   # 现在同一部片别的分片还在正常下时，403 从 seg_403_retry_delay 秒起指数退避（封顶 30s）
-  # 重试至多 seg_403_retry_max 次（4+8+16+30+30 ≈ 90s，次数也计入 seg_retry_max）；
+  # 重试至多 seg_403_retry_max 次（1+2+4+8+16+30+30+30 ≈ 2 分钟，次数也计入 seg_retry_max）；
   # 一直没有分片成功、403 攒够 seg_403_expired_after 次则按签名过期快速放弃、转重取。
   # seg_403_retry_max 设 0 回到旧行为。
-  seg_403_retry_max: 5
-  seg_403_retry_delay: 4
+  # 4s 起 5 次 → 1s 起 8 次（2026-10-27，06 号机 4 小时实测）：等 4/8/16/30 秒后仍 403 的比例
+  # 37%/45%/48%/47%，等得再久也只救回一半；长退避让分片槽空等（平均约 50 个），5 次用完还丢了
+  # 1470 个分片（31 部上传的片缺 5 片以上）。短起步省空等，多几次补回缺片。
+  seg_403_retry_max: 8
+  seg_403_retry_delay: 1
   seg_403_expired_after: 8
   # 采样阶段的单分片重试上限，**刻意远小于** seg_retry_max。
   # 采样只是为了"测个码率决定这条流要不要下"，探不到就该立刻换下一条流/节点；
@@ -825,6 +828,12 @@ download_movies:
   # 这是可接受的：那 4 次本身已经很短（≈7 秒），非末节点再快也省不下多少，
   # 而保留 3 能让"坏节点快速换下一个"的语义继续成立。
   playlist_retry_fallback: 3
+  # playlist 的 403 先按临时风控短间隔重试（2026-10-27）：finalsignal /r6/ 的 master / media
+  # playlist 与分片一样随机回 Cloudflare 403（06 号机 4 小时：347 部片整片失败、158 条流采样出局，
+  # 全被当成签名过期转重取）。从 playlist_403_retry_delay 秒起指数退避重试至多 playlist_403_retry_max
+  # 次（1+2+4 ≈ 7 秒），不占 playlist_retry_max；还是 403 才按签名过期转重取。0 = 旧行为。
+  playlist_403_retry_max: 3
+  playlist_403_retry_delay: 1
   # ---- mp4 直链下载（vidlink 等 type=mp4 的取流条目）----
   # 按 Range 分块并发下载，单块失败按 seg_retry_max/seg_retry_delay 重试；不做断点续传
   # （残留文件视为脏数据整段重下，启动时 temp_* 也会被清理）。
