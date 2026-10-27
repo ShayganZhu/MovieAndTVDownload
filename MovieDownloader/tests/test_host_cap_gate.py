@@ -748,17 +748,20 @@ def test_parse_host_limits_zero_cap_disables_whole_host():
 
 
 def test_shipped_config_values():
-    """config.yaml 里这次定下的取值（2026-10-24 与用户确认；2026-10-25 主机换名）。
+    """config.yaml 里这次定下的取值（2026-10-24 与用户确认；2026-10-25 主机换名；
+    2026-10-27 分片门槛 2% → 5%）。
 
     vidup 的慢主机 sun.paleoak.top 已改名 sun.finalsignal.top：专用通道必须跟着
-    新名走，否则通道空转、慢片全挤进普通槽位（24 号机 2026-10-25 实测）。"""
+    新名走，否则通道空转、慢片全挤进普通槽位（24 号机 2026-10-25 实测）。
+    /r6/ 平时就有 2%–3% 的 502 / 超时（06 号机 10-27 中位 2.66%）：门槛 2% 时通道
+    一直压在 16 档，5% 才让它能升上去。"""
     limits = d._parse_host_limits(d._CFG.get("host_limits"))
     assert set(limits) == {"sun.finalsignal.top"}
     shipped = limits["sun.finalsignal.top"]
     assert shipped["max_concurrent"] == 40
     assert shipped["ramp"] == {
         "steps": [16, 24, 32, 40], "step_seconds": 900.0,
-        "backoff_breaker_trips": 3, "backoff_segment_fail_ratio": 0.02,
+        "backoff_breaker_trips": 3, "backoff_segment_fail_ratio": 0.05,
         "min_segment_requests": 2000, "backoff_playlist_fail_ratio": 0.2,
         "min_playlist_requests": 20, "step_up_min_load": 0.9, "recover_after_windows": 4,
     }
