@@ -3557,6 +3557,131 @@ def test_l3_gives_up_after_retry_max(monkeypatch):
     assert len(calls) == 4
 
 
+# ------------------------------------------- 分片 403：临时风控 vs 签名过期（2026-10-27）
+
+def _seg_403(url):
+    """与 request_with_retry 抛出的 403 同形：带确定性 / 需重取标记，状态码在 __cause__ 上。"""
+
+    class _Resp:
+        status_code = 403
+
+    exc = RuntimeError(
+        f"请求失败({d._HTTP_PERMANENT_MARKER} HTTP 403)，{d._NEEDS_REFETCH_MARKER}: {url}; "
+        f"403 Client Error: Forbidden for url: {url}"
+    )
+    exc.__cause__ = type("HTTPError", (Exception,), {"response": _Resp()})()
+    return exc
+
+
+@pytest.fixture
+def seg_403_env(monkeypatch, hls_circuit_env):
+    monkeypatch.setattr(d, "SEG_403_RETRY_DELAY", 0.001)
+    monkeypatch.setattr(d, "SEG_403_RETRY_MAX", 5)
+    monkeypatch.setattr(d, "SEG_403_EXPIRED_AFTER", 8)
+    monkeypatch.setattr(d, "validate_segment_content", lambda c, u: None)
+
+
+def test_segment_403_tracker_verdicts():
+    """判别器：攒够阈值前先重试；攒够后有近期成功算临时风控，没有（或成功已旧）算签名过期。"""
+    now = [100.0]
+    t = d._Segment403Tracker(expired_after=3, recent_ok_seconds=60, clock=lambda: now[0])
+    assert t.record_403() is True and t.record_403() is True, "阈值前还判断不了，先重试"
+    assert t.record_403() is False, "一直没有成功、403 攒够 → 签名过期"
+
+    t.record_ok()
+    assert [t.record_403() for _ in range(5)] == [True] * 5, "近期有成功 → 临时风控，一直重试"
+
+    now[0] += 61
+    assert t.record_403() is False, "最近一次成功已超过 60s（token 中途过期）→ 改判过期"
+    t.record_ok()
+    assert t.record_403() is True, "又有分片成功 → 自我纠正回临时风控"
+
+
+def test_segment_403_retried_when_other_segments_ok(monkeypatch, seg_403_env):
+    """🔴 同片别的分片正常时，403 必须退避重试直到成功，而不是第 1 次就跳过。"""
+    url = "https://sun.finalsignal.top/r6/x/seg-1.ts"
+    calls = []
+
+    def flaky(method, u, **kw):
+        calls.append(1)
+        if len(calls) <= 2:
+            raise _seg_403(u)
+        return b"\x47" * 100
+
+    monkeypatch.setattr(d, "request_with_retry", flaky)
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()  # 同片别的分片刚成功过
+    assert d.download_single_segment(url, 0, 20, 1, forbidden_tracker=tracker) == b"\x47" * 100
+    assert len(calls) == 3
+
+
+def test_segment_403_without_tracker_keeps_fast_fail(monkeypatch, seg_403_env):
+    """不传判别器（旧调用方）时行为不变：403 第 1 次就放弃，错误仍带需重取标记。"""
+    calls = []
+
+    def always_403(method, u, **kw):
+        calls.append(1)
+        raise _seg_403(u)
+
+    monkeypatch.setattr(d, "request_with_retry", always_403)
+    with pytest.raises(RuntimeError, match="重试 1 次后仍失败") as ei:
+        d.download_single_segment("https://x/r6/seg.ts", 0, 20, 1)
+    assert len(calls) == 1
+    assert d._NEEDS_REFETCH_MARKER in str(ei.value)
+
+
+def test_segment_403_retry_is_capped(monkeypatch, seg_403_env):
+    """临时风控的重试有独立上限：一直 403 时 1 + SEG_403_RETRY_MAX 次后放弃，不走满 retry_max。"""
+    monkeypatch.setattr(d, "SEG_403_RETRY_MAX", 2)
+    calls = []
+
+    def always_403(method, u, **kw):
+        calls.append(1)
+        raise _seg_403(u)
+
+    monkeypatch.setattr(d, "request_with_retry", always_403)
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()
+    with pytest.raises(RuntimeError, match="重试 3 次后仍失败"):
+        d.download_single_segment("https://x/r6/seg.ts", 0, 20, 1, forbidden_tracker=tracker)
+    assert len(calls) == 3
+
+
+def test_download_segments_retries_scattered_403(monkeypatch, seg_403_env, tmp_path):
+    """整片层：零散的临时 403 重试后补齐，不再缺片。"""
+    seen = {}
+
+    def fake_request(method, u, **kw):
+        seen[u] = seen.get(u, 0) + 1
+        if u.endswith("s2.ts") and seen[u] == 1:
+            raise _seg_403(u)
+        return b"\x47" + u.encode()
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    urls = [f"https://sun.finalsignal.top/r6/x/s{i}.ts" for i in range(4)]
+    total, failed, _ = d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=1)
+    assert failed == []
+    assert seen[urls[2]] == 2
+    assert (tmp_path / "out.ts").read_bytes() == b"".join(b"\x47" + u.encode() for u in urls)
+
+
+def test_download_segments_whole_film_403_fails_fast(monkeypatch, seg_403_env, tmp_path):
+    """🔴 整片都 403（签名过期）时仍快速放弃：攒够阈值后每个分片只请求 1 次，转重取。"""
+    monkeypatch.setattr(d, "SEG_403_EXPIRED_AFTER", 2)
+    seen = {}
+
+    def always_403(method, u, **kw):
+        seen[u] = seen.get(u, 0) + 1
+        raise _seg_403(u)
+
+    monkeypatch.setattr(d, "request_with_retry", always_403)
+    urls = [f"https://sun.finalsignal.top/r6/x/s{i}.ts" for i in range(4)]
+    _, failed, _ = d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=1)
+    assert failed == [0, 1, 2, 3]
+    # 第 1 片：第 1 次 403 未到阈值重试 1 次，第 2 次攒够阈值判过期；其余分片都只请求 1 次。
+    assert [seen[u] for u in urls] == [2, 1, 1, 1]
+
+
 def test_sample_retry_budget_raised_to_five():
     """采样重试上限 3 → 5。
 
@@ -4019,7 +4144,8 @@ def test_download_segments_defaults_to_full_retry_budget(monkeypatch, tmp_path):
     """不传 retry_max 时必须沿用正片预算，保持既有行为不变。"""
     seen = []
 
-    def fake_seg(url, index, retry_max, delay, headers=None, abort_event=None):
+    def fake_seg(url, index, retry_max, delay, headers=None, abort_event=None,
+                 forbidden_tracker=None):
         seen.append(retry_max)
         return b"x" * 10
 
