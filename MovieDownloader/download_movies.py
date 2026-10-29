@@ -1935,13 +1935,16 @@ def load_dead_ids(threshold_fn=None):
 def dead_breakdown(dead_ids):
     """启动摘要用：把判死 ID 按原因拆开计数（取判死账本里该片的最后一条记录）。
 
-    判死账本里不止画质：下载后检出硬字幕/水印、临门槛人工 reject 的也在。
+    判死账本里不止画质：下载后检出硬字幕/水印、临门槛人工 reject 的也在，
+    人工复核确认时长不符（truncated）的也在。
     没有 reason_class 的老记录都是画质判死，归入画质。
     """
     latest = _latest_by_id(DOWNLOAD_DEAD_LOG)
     kinds = [(latest.get(tmdb_id) or {}).get("reason_class") for tmdb_id in dead_ids]
     hardsub, watermark = kinds.count("hardsub"), kinds.count("watermark")
-    return f"画质 {len(kinds) - hardsub - watermark} / 硬字幕 {hardsub} / 水印 {watermark}"
+    truncated = kinds.count("truncated")
+    return (f"画质 {len(kinds) - hardsub - watermark - truncated} / 硬字幕 {hardsub} / 水印 {watermark}"
+            + (f" / 时长不符 {truncated}" if truncated else ""))
 
 
 def dead_record_passes_now(record):
@@ -1969,9 +1972,9 @@ def dead_record_passes_now(record):
        这批记录会被无条件放回。而实跑中"未知分辨率"占比高达 44%（§12.18），
        量级不小。故 height 缺失时在模式 A 下**一律不放回**。
     """
-    # 硬字幕/水印判死与画质门槛无关，调门槛救不回来：永不放回。
+    # 硬字幕/水印/时长不符判死与画质门槛无关，调门槛救不回来：永不放回。
     # （它们也没有码率依据，不先拦下的话会落进下面"没有依据 → 放回"那条。）
-    if record.get("reason_class") in ("hardsub", "watermark"):
+    if record.get("reason_class") in ("hardsub", "watermark", "truncated"):
         return False
 
     evidence = record.get("evidence") or {}
@@ -7293,10 +7296,32 @@ def _overlay_summary(scan):
     return "；".join(parts)
 
 
+# reject 接受的理由与中文名。truncated / gaps 是人工复核确认成品不完整时用的（见 reject_films）。
+REJECT_REASON_LABELS = {"hardsub": "硬字幕", "watermark": "水印", "truncated": "时长不符", "gaps": "缺分片"}
+
+
+def _reasons_label(reasons):
+    """理由列表的中文写法，如 "硬字幕/水印"；没有理由时沿用旧文案 "硬字幕/水印"。"""
+    labels = [REJECT_REASON_LABELS.get(r, r) for r in reasons]
+    return "/".join(labels) if labels else "硬字幕/水印"
+
+
+def _overlay_reason_class(reasons):
+    """几条理由并存时记哪一条：硬字幕 > 水印 > 其它（人工复核的 truncated）。
+
+    没有任何理由时记 watermark（沿用旧口径）。
+    """
+    for reason in ("hardsub", "watermark"):
+        if reason in reasons:
+            return reason
+    return reasons[0] if reasons else "watermark"
+
+
 def record_overlay_dead(tmdb_id, title, scan, node_rejects=None):
     """把硬字幕/水印片记进 DOWNLOAD_DEAD_LOG（纯追加，读取端按 id 聚合）。
 
-    reason_class 为 hardsub 或 watermark（两者都有时记 hardsub，reasons 里列全）。
+    reason_class 为 hardsub 或 watermark（两者都有时记 hardsub，reasons 里列全）；
+    所有版本都是人工复核确认时长不符（reject --reason truncated）时记 truncated。
     关键在于它不是 quality：`--retry-dead` 复判只针对画质门槛，这两类永不放回
     （见 dead_record_passes_now）。
     node_rejects：换节点重下时各版本的检出结论 {版本标识: 原因}，reasons 取全部版本的并集。
@@ -7309,10 +7334,10 @@ def record_overlay_dead(tmdb_id, title, scan, node_rejects=None):
         "tmdbId": tmdb_id,
         "title": title or "",
         "dead_at": int(time.time()),
-        "reason_class": "hardsub" if "hardsub" in reasons else "watermark",
+        "reason_class": _overlay_reason_class(reasons),
         "reasons": reasons,
         "error": _overlay_summary(scan) or (
-            f"全部 {len(node_rejects)} 个版本都已检出硬字幕/水印" if node_rejects else ""
+            f"全部 {len(node_rejects)} 个版本都已检出{_reasons_label(reasons)}" if node_rejects else ""
         ),
         "evidence": {
             key: scan.get(key)
@@ -7388,9 +7413,10 @@ def overlay_node_rejects(tmdb_id):
 
 
 def record_overlay_node_reject(tmdb_id, title, node, scan, **extra):
-    """记一个检出硬字幕/水印的版本（追加台账 + 更新内存）。extra 原样并入记录。"""
+    """记一个检出硬字幕/水印（或人工复核确认时长不符）的版本（追加台账 + 更新内存）。
+    extra 原样并入记录。"""
     reasons = scan.get("reasons") or []
-    reason = "hardsub" if "hardsub" in reasons else "watermark"
+    reason = _overlay_reason_class(reasons)
     key = overlay_node_key(node)
     write_log(OVERLAY_NODE_REJECT_LOG, {
         "tmdbId": tmdb_id,
@@ -8302,22 +8328,24 @@ def _run_pipeline(run_volume=None):
     reject_retriable = {}
 
     def _all_versions_rejected(entry):
-        """来源里来了一部所有版本都已检出硬字幕/水印的片：整片判死，不再派发。"""
+        """来源里来了一部所有版本都已检出硬字幕/水印（或人工确认时长不符）的片：
+        整片判死，不再派发。"""
         tmdb_id = entry.get("tmdbId")
         rejects = overlay_node_rejects(tmdb_id)
         record_overlay_dead(tmdb_id, entry.get("title"), {"reasons": []},
                             node_rejects=rejects)
         with processing_lock:
             processed_ids.add(normalize_tmdb_id(tmdb_id))
-        stage = "hardsub" if "hardsub" in rejects.values() else "watermark"
+        reasons = list(dict.fromkeys(rejects.values()))
+        stage = _overlay_reason_class(reasons)
         write_log(FAILED_LOG, {
             "tmdbId": tmdb_id,
             "title": entry.get("title") or "",
             "urls": [],
-            "error": f"全部 {len(rejects)} 个版本都已检出硬字幕/水印，整片判死",
+            "error": f"全部 {len(rejects)} 个版本都已检出{_reasons_label(reasons)}，整片判死",
             "stage": stage,
         })
-        print(f"{'硬字幕' if stage == 'hardsub' else '水印'}判死: {tmdb_id}: "
+        print(f"{REJECT_REASON_LABELS.get(stage, stage)}判死: {tmdb_id}: "
               f"全部 {len(rejects)} 个版本都已检出", flush=True)
 
     # 硬字幕/水印换节点重下的重投入口（每轮套在来源外、HostCapGate 之下）。
@@ -9509,9 +9537,15 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
 
     reason 不给时取该片临门槛记录里的理由（两者都有时记 hardsub）；不在临门槛清单里
     的片必须显式给 reason。返回 (处置部数, 释放的 R2 字节数)。
+
+    人工复核成品不完整时用另外两个理由（2026-10-29）：
+      - truncated：成品时长远短于片长（片源给的是预告片/片段/残缺版）。同一版本重下还是
+        这个文件，所以和硬字幕/水印同样**只判这个版本**，换别的版本重下。
+      - gaps：缺分片过多（HLS 下载时瞬时失败跳过的分片）。片源本身没问题，只删 R2 与成品
+        记录，下次运行照常重下（不记版本、不判死）。
     """
-    if reason is not None and reason not in ("hardsub", "watermark"):
-        raise SystemExit(f"--reason 只能是 hardsub 或 watermark，收到 {reason!r}")
+    if reason is not None and reason not in REJECT_REASON_LABELS:
+        raise SystemExit(f"--reason 只能是 {' / '.join(REJECT_REASON_LABELS)}，收到 {reason!r}")
     if is_main_running():
         print("检测到主流程正在运行；处置会改写 success.jsonl，请在主流程结束后再执行。")
         return 0, 0
@@ -9530,7 +9564,8 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
         near = scan.get("near_miss") or []
         film_reason = reason or ("hardsub" if "hardsub" in near else (near[0] if near else None))
         if film_reason is None:
-            print(f"[{tmdb_id}] 不在临门槛清单里，需用 --reason hardsub|watermark 指明理由，跳过")
+            print(f"[{tmdb_id}] 不在临门槛清单里，需用 --reason {'|'.join(REJECT_REASON_LABELS)} "
+                  f"指明理由，跳过")
             continue
         year = record.get("year")
         prefix = asset_rel_path(tmdb_id, year) + "/"
@@ -9556,8 +9591,28 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
             print(f"[{tmdb_id}] ⚠️ R2 上仍有 {len(leftover)} 个对象未删掉，台账未改动，可重新执行")
             continue
 
+        label = REJECT_REASON_LABELS[film_reason]
+        if film_reason == "gaps":
+            # 片源没问题，只是这次下载丢了分片：移出成品、下次运行照常重下（不记版本、不判死）。
+            _remove_success_records(tmdb_id)
+            remove_pending_record(tmdb_id)
+            write_log(FAILED_LOG, {
+                "tmdbId": tmdb_id,
+                "title": record.get("title") or "",
+                "error": f"人工复核确认{label}（缺 {record.get('missing_segment_count')} 片），"
+                         f"已从 R2 移除，下次运行重下",
+                "stage": "gaps_retry",
+            })
+            folder = movie_dir(tmdb_id, year)
+            if os.path.isdir(folder):
+                shutil.rmtree(folder, ignore_errors=True)
+            done += 1
+            freed += size
+            print(f"[{tmdb_id}] 已处置：R2 删除 {len(keys)} 个对象，移出成品，下次运行重下")
+            continue
+        # 硬字幕/水印来自临门槛核对；时长不符来自人工复核成品。
+        source = "临门槛人工确认" if film_reason in ("hardsub", "watermark") else "人工复核确认"
         node = _uploaded_node(tmdb_id, record) if OVERLAY_RETRY_OTHER_NODES else None
-        label = "硬字幕" if film_reason == "hardsub" else "水印"
 
         # 截图先挪到判死目录（版本级处置挪到该版本的子目录），记录里记挪动后的实际
         # 位置——扫描记录里的 evidence_dir 还是 near_miss/ 下的旧路径，照抄会指向一个
@@ -9577,13 +9632,13 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
             version = f"{node['provider']}/{node['type']}"
             record_overlay_node_reject(
                 tmdb_id, record.get("title"), node, {"reasons": [film_reason]},
-                manual=True, summary=f"临门槛人工确认{label}，已从 R2 移除",
+                manual=True, summary=f"{source}{label}，已从 R2 移除",
                 removed_bytes=size, evidence_dir=evidence_dir,
             )
             write_log(FAILED_LOG, {
                 "tmdbId": tmdb_id,
                 "title": record.get("title") or "",
-                "error": f"临门槛人工确认{label}（{version}），已从 R2 移除，换其它版本重下",
+                "error": f"{source}{label}（{version}），已从 R2 移除，换其它版本重下",
                 "stage": f"{film_reason}_retry",
             })
             folder = movie_dir(tmdb_id, year)
@@ -9601,7 +9656,7 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
             "reason_class": film_reason,
             "reasons": [film_reason],
             "manual": True,
-            "error": f"临门槛人工确认{'硬字幕' if film_reason == 'hardsub' else '水印'}，已从 R2 移除",
+            "error": f"{source}{label}，已从 R2 移除",
             "removed_bytes": size,
             "evidence": {
                 **{key: scan.get(key)
@@ -9613,7 +9668,7 @@ def reject_films(tmdb_ids, reason=None, dry_run=False):
         write_log(FAILED_LOG, {
             "tmdbId": tmdb_id,
             "title": record.get("title") or "",
-            "error": f"临门槛人工确认{'硬字幕' if film_reason == 'hardsub' else '水印'}，已从 R2 移除并判死",
+            "error": f"{source}{label}，已从 R2 移除并判死",
             "stage": film_reason,
         })
         folder = movie_dir(tmdb_id, year)
@@ -9951,7 +10006,7 @@ def report_storage(since_days=None):
     print("注: 采用十进制单位，1 GB = 1000³ 字节（与云存储计费口径一致）")
     rejected = _manually_rejected_ids()
     if rejected:
-        print(f"注: 另有 {len(rejected)} 部经临门槛核对确认带硬字幕/水印，已从 R2 移除，未计入")
+        print(f"注: 另有 {len(rejected)} 部经人工核对确认带硬字幕/水印或时长不符，已从 R2 移除，未计入")
     if unsized:
         print(
             f"⚠️ {unsized} 部没有 file_size_bytes 字段（本功能上线前下载的），"
@@ -9972,14 +10027,14 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "near-miss":
         report_near_miss()
     elif len(sys.argv) > 1 and sys.argv[1] == "reject":
-        # reject <tmdbId> [<tmdbId> ...] [--reason hardsub|watermark] [--dry-run]
+        # reject <tmdbId> [<tmdbId> ...] [--reason hardsub|watermark|truncated|gaps] [--dry-run]
         _rest = sys.argv[2:]
         _dry = "--dry-run" in _rest
         _reason = None
         if "--reason" in _rest:
             _i = _rest.index("--reason")
             if _i + 1 >= len(_rest):
-                print("错误: --reason 后面要跟 hardsub 或 watermark")
+                print("错误: --reason 后面要跟 hardsub / watermark / truncated / gaps")
                 raise SystemExit(2)
             _reason = _rest[_i + 1]
             _rest = _rest[:_i] + _rest[_i + 2:]
@@ -9988,7 +10043,7 @@ if __name__ == "__main__":
         if not _ids or _bad:
             print(f"错误: 需要给出 tmdbId（纯数字）{'，无法识别 ' + ' '.join(_bad) if _bad else ''}")
             print("用法: python download_movies.py reject <tmdbId> [<tmdbId> ...] "
-                  "[--reason hardsub|watermark] [--dry-run]")
+                  "[--reason hardsub|watermark|truncated|gaps] [--dry-run]")
             raise SystemExit(2)
         reject_films(_ids, reason=_reason, dry_run=_dry)
     elif len(sys.argv) > 1 and sys.argv[1] == "migrate-overlay-dead":
@@ -10041,7 +10096,7 @@ if __name__ == "__main__":
             print("      python download_movies.py reupload")
             print("      python download_movies.py storage [天数]")
             print("      python download_movies.py near-miss")
-            print("      python download_movies.py reject <tmdbId> ... [--reason hardsub|watermark] [--dry-run]")
+            print("      python download_movies.py reject <tmdbId> ... [--reason hardsub|watermark|truncated|gaps] [--dry-run]")
             raise SystemExit(2)
         if RETRY_ONLY_MODE:
             print(

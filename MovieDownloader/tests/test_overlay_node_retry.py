@@ -488,3 +488,35 @@ def test_film_rescanned_after_manual_reject_is_listed_again(tmp_path, monkeypatc
     capsys.readouterr()
     d.report_near_miss()
     assert "66\tT66\t临门槛:hardsub" in capsys.readouterr().out
+
+
+def test_manual_truncated_reject_rejects_only_the_uploaded_version(tmp_path, monkeypatch):
+    """🔴 人工复核确认时长不符（片源给的是片段）：和硬字幕一样只判这个版本，换别的版本重下。"""
+    _reject_env(tmp_path, monkeypatch, {"url": mp4("66")["url"]}, [
+        {"tmdbId": "66", "urls": [mp4("66"), hls("66")]},
+    ])
+    assert d.reject_films(["66"], reason="truncated")[0] == 1
+
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == []
+    rejects = _read_jsonl(d.OVERLAY_NODE_REJECT_LOG)
+    assert [(r["node_key"], r["reason"], r["manual"]) for r in rejects] == [
+        ("vidlink|mp4", "truncated", True)]
+    assert "人工复核确认时长不符" in rejects[0]["summary"]
+    assert [(r["tmdbId"], r["stage"]) for r in _read_jsonl(d.FAILED_LOG)] == [("66", "truncated_retry")]
+    entry = {"tmdbId": "66", "urls": [mp4("66"), hls("66")]}
+    assert d.strip_rejected_nodes(entry)[0]["urls"] == [hls("66")]
+
+
+def test_film_whose_every_version_is_truncated_is_killed_as_truncated(tmp_path, monkeypatch):
+    """所有版本都是人工确认时长不符：整片判死，原因记 truncated，不能被错记成水印。"""
+    for node in (mp4("72"), hls("72")):
+        d.record_overlay_node_reject("72", "T", node_of(node), {"reasons": ["truncated"]})
+    entries = [{"tmdbId": "72", "title": "x", "year": 2010, "urls": [mp4("72"), hls("72")]}]
+    downloaded, uploads = _pipeline_env(tmp_path, monkeypatch, entries, lambda url: ())
+
+    d._run_pipeline()
+
+    assert downloaded == [] and uploads == []
+    dead = _read_jsonl(d.DOWNLOAD_DEAD_LOG)
+    assert [(r["tmdbId"], r["reason_class"]) for r in dead] == [("72", "truncated")]
+    assert d.dead_record_passes_now(dead[0]) is False

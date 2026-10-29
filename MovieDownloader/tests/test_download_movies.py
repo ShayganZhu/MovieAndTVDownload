@@ -7203,7 +7203,7 @@ def test_reject_removes_film_from_r2_and_from_upload_totals(tmp_path, monkeypatc
     d.report_storage()
     storage = capsys.readouterr().out
     assert "已上传 R2: 2 部，6.00 GB" in storage, "容量统计必须扣掉处置的片"
-    assert "另有 1 部经临门槛核对确认带硬字幕/水印，已从 R2 移除，未计入" in storage
+    assert "另有 1 部经人工核对确认带硬字幕/水印或时长不符，已从 R2 移除，未计入" in storage
     d.report_near_miss()
     near = capsys.readouterr().out
     assert "待核对 1 部" in near and "另有 1 部已处置" in near
@@ -7265,6 +7265,50 @@ def test_dead_breakdown_splits_quality_hardsub_and_watermark():
     # --retry-dead 下放回的片不在 dead_ids 里，也就不计入
     assert d.dead_breakdown({"3", "4"}) == "画质 0 / 硬字幕 1 / 水印 1"
     assert d.dead_breakdown(set()) == "画质 0 / 硬字幕 0 / 水印 0"
+    with open(d.DOWNLOAD_DEAD_LOG, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "6", "reason_class": "truncated"}) + "\n")
+    assert d.dead_breakdown({"3", "6"}) == "画质 0 / 硬字幕 1 / 水印 0 / 时长不符 1"
+
+
+def test_reject_gaps_removes_film_and_lets_next_run_redownload(tmp_path, monkeypatch, capsys):
+    """🔴 缺分片：R2 删干净、移出成品，但不判死、不记版本——片源没问题，下次运行照常重下。"""
+    r2 = _setup_reject(tmp_path, monkeypatch)
+
+    done, freed = d.reject_films(["77"], reason="gaps")
+
+    assert (done, freed) == (1, 4_000_000_000)
+    assert r2.deleted == ["test/movies/2011/77/77.mp4"]
+    assert sorted(r["tmdbId"] for r in _read_jsonl(d.SUCCESS_LOG)) == ["66", "666"]
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == [] and "77" not in d.load_dead_ids()
+    assert _read_jsonl(d.OVERLAY_NODE_REJECT_LOG) == []
+    assert [(r["tmdbId"], r["stage"]) for r in _read_jsonl(d.FAILED_LOG)] == [("77", "gaps_retry")]
+    assert "下次运行重下" in capsys.readouterr().out
+
+
+def test_reject_gaps_dry_run_and_r2_failure_change_nothing(tmp_path, monkeypatch, capsys):
+    r2 = _setup_reject(tmp_path, monkeypatch, fail_delete=True)
+    before = open(d.SUCCESS_LOG, encoding="utf-8").read()
+    d.reject_films(["77"], reason="gaps", dry_run=True)
+    assert "将删除 test/movies/2011/77/77.mp4" in capsys.readouterr().out
+    assert d.reject_films(["77"], reason="gaps") == (0, 0)
+    assert open(d.SUCCESS_LOG, encoding="utf-8").read() == before
+    assert _read_jsonl(d.FAILED_LOG) == [] and r2.deleted == []
+
+
+def test_reject_truncated_without_known_version_kills_as_truncated(tmp_path, monkeypatch):
+    """查不出版本时退回整片判死：原因记 truncated（不能被错记成水印），--retry-dead 永不放回。"""
+    _setup_reject(tmp_path, monkeypatch)
+    assert d.reject_films(["666"], reason="truncated")[0] == 1
+    dead = _read_jsonl(d.DOWNLOAD_DEAD_LOG)
+    assert [(r["tmdbId"], r["reason_class"], r["manual"]) for r in dead] == [("666", "truncated", True)]
+    assert "时长不符" in dead[0]["error"]
+    assert d.dead_record_passes_now(dead[0]) is False
+
+
+def test_reject_refuses_unknown_reason(tmp_path, monkeypatch):
+    _setup_reject(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit):
+        d.reject_films(["66"], reason="blurry")
 
 
 def test_reject_skips_unknown_films_and_refuses_while_main_runs(tmp_path, monkeypatch, capsys):
