@@ -512,8 +512,17 @@ def _install_fake_session(monkeypatch, page_html, streams, servers=None, stream_
                         if enc_resp is not None:
                             return enc_resp
                     base = site["base"]
-                    return _FakeResp(payload={"status": 200, "result": {
-                        "servers": f"{base}/servers", "stream": f"{base}/stream", "token": token}})
+                    # enc-dec 2026-10 改版后的两阶段 enc：stage=1 给站内地址，stage=2 用
+                    # POST 它拿回的密文（S1TEXT）换出 servers/stream；缺 stage 一律 400。
+                    if url.endswith("&stage=1"):
+                        return _FakeResp(payload={"status": 200, "result": {
+                            "stage1": f"{base}/stage1", "token": "tok1"}})
+                    if url.endswith("&stage=2"):
+                        assert "text=S1TEXT&" in url, "stage2 必须用 stage1 POST 拿回的密文"
+                        return _FakeResp(payload={"status": 200, "result": {
+                            "servers": f"{base}/servers", "stream": f"{base}/stream", "token": token}})
+                    return _FakeResp(status=400, payload={"status": 400,
+                                                          "error": "Expected query: text, stage"})
             if "/enc-vidlink" in url:
                 seen["order"].append("vidlink")
                 return _FakeResp(payload={"status": 200, "result": vidlink_enc})
@@ -533,6 +542,9 @@ def _install_fake_session(monkeypatch, page_html, streams, servers=None, stream_
                         return _FakeResp(payload={"status": 200, "result": site["servers"]})
                     return _FakeResp(payload={"status": 200, "result": next(site["streams"])}, status=dec_status)
             name, site = _site_by_base(url)
+            if url == f"{site['base']}/stage1":
+                seen.setdefault("stage1_headers", {})[name] = headers
+                return _FakeResp(text="S1TEXT")
             if url == f"{site['base']}/servers":
                 if name == "vidup":
                     seen["servers_headers"] = headers
@@ -707,7 +719,20 @@ def test_process_episode_encodes_enc_vidup_text(monkeypatch):
     seen = _install_fake_session(monkeypatch, page, [{"url": "u"}])
     status, _ = m.process_episode("1", 1, 1)
     assert status == "ok"
-    assert seen["enc_urls"] == [f"{m.API}/enc-vidup?text=a%2Bb%2Fc%3Dd%26e%20f"]
+    assert seen["enc_urls"] == [f"{m.API}/enc-vidup?text=a%2Bb%2Fc%3Dd%26e%20f&stage=1",
+                                f"{m.API}/enc-vidup?text=S1TEXT&stage=2"]
+
+
+def test_process_episode_uses_two_stage_enc(monkeypatch):
+    """🔴 enc-dec 2026-10 改版：一步式 enc-vidup?text= 一律 400。必须先 stage=1 拿站内地址
+    （带它给的 CSRF token POST 过去），再用拿回的密文请求 stage=2 换出 servers/stream。
+    2026-10-29 线上实测旧代码 vidup/vidfast 两集全是 HTTP 400 at enc。"""
+    seen = _install_fake_session(monkeypatch, PAGE, [{"url": "u1"}],
+                                 vidfast_page_status=200, vidfast_streams=[{"url": "v1"}])
+    status, result = m.process_episode("1", 1, 1, providers=["vidup", "vidfast"])
+    assert status == "ok" and set(_urls(result)) == {"u1", "v1"}
+    assert seen["stage1_headers"]["vidup"]["X-CSRF-Token"] == "tok1"
+    assert seen["stage1_headers"]["vidfast"]["X-CSRF-Token"] == "tok1"
 
 
 def test_process_episode_dead_on_page_404(monkeypatch):

@@ -763,7 +763,8 @@ def _parse_captions(items, where="", headers=None):
 
 def _fetch_vidup_like(session, site, api_name, tid, season, episode):
     """vidup.to / vidfast.vc 同构链路：
-    页面正则 → enc-{api} → servers POST → dec-{api} → 逐 server stream POST → dec-{api} 取 url。"""
+    页面正则 → enc-{api}(stage1) → stage1 POST → enc-{api}(stage2) → servers POST →
+    dec-{api} → 逐 server stream POST → dec-{api} 取 url。"""
     label = _ep_label(tid, season, episode)
     page_headers, api_headers = _site_headers(site)
 
@@ -783,10 +784,29 @@ def _fetch_vidup_like(session, site, api_name, tid, season, episode):
     else:
         raise Exception(f"Extract failed (retriable) for {label}")
 
-    # 2. 调用 enc-{api} 获取 parts（text 来自页面正则，可能含 +/= 等保留字符，必须编码）
-    enc_url = f"{API}/enc-{api_name}?text={quote(text, safe='')}"
-    resp = _check(session.get(enc_url, timeout=TIMEOUT, headers=api_headers), f"enc-{api_name}")
-    parts = validate(_json(resp, f"enc-{api_name}"), enc_url)
+    # 2. 两阶段 enc 换出 servers/stream（2026-10 enc-dec 接口改版，旧的一步式
+    #    `enc-{api}?text=` 起一律 400 "Expected query: text, stage"，vidup/vidfast 全挂；
+    #    与电影侧 bda5948 同一改动，2026-10-29 实测 TV 旧代码两集全是 400）：
+    #    stage=1 → 得到一个站内地址（+ 可能的 CSRF token），POST 它拿回一段密文；
+    #    stage=2 → 用这段密文换出 servers/stream/token，之后的流程与改版前相同。
+    #    text 来自页面正则/站点响应，可能含 +/= 等保留字符，必须编码。
+    stage1_url = f"{API}/enc-{api_name}?text={quote(text, safe='')}&stage=1"
+    resp = _check(session.get(stage1_url, timeout=TIMEOUT, headers=api_headers),
+                  f"enc-{api_name}(stage1)")
+    stage1 = validate(_json(resp, f"enc-{api_name}(stage1)"), stage1_url)
+    if not isinstance(stage1, dict) or not stage1.get("stage1"):
+        raise Exception(f"API Error at {stage1_url}: missing stage1 in result")
+    stage1_headers = dict(api_headers)
+    if stage1.get("token"):
+        stage1_headers["X-CSRF-Token"] = stage1["token"]
+    # 站内地址的状态码不参与判死（它不是"该集无源"的证据），出错一律按瞬时处理。
+    resp = _check(session.post(stage1["stage1"], headers=stage1_headers, timeout=TIMEOUT),
+                  "stage1")
+
+    enc_url = f"{API}/enc-{api_name}?text={quote(resp.text, safe='')}&stage=2"
+    resp = _check(session.get(enc_url, timeout=TIMEOUT, headers=api_headers),
+                  f"enc-{api_name}(stage2)")
+    parts = validate(_json(resp, f"enc-{api_name}(stage2)"), enc_url)
     if not isinstance(parts, dict):
         raise Exception(f"API Error at {enc_url}: result is not an object")
     servers = parts.get('servers')

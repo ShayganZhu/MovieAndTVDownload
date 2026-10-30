@@ -1,5 +1,8 @@
 # TVDownloader 流水线依赖（第三方，标准库不列）
 # 服务器部署：python -m venv .venv && .venv/bin/pip install -r requirements.txt
+# Linux 服务器另需系统库（opencv-python 依赖 libGL，最小化安装的系统常缺）：
+#     apt install -y libgl1 libglib2.0-0
+# 缺了的话启动预检会直接报错退出，不会带病运行。
 # 不锁版本，按最新兼容版安装。
 
 # 通用 HTTP / 配置
@@ -17,3 +20,10 @@ botocore
 # 元数据抓取阶段（fetch_tv_metadata.py / tv_ids_to_links.py 季集展开）
 pandas
 tmdbsimple
+
+# 硬字幕/水印检测（download_tv.py hardsub_check，与电影侧同一套）：CPU 版 OCR，wheel 自带
+# 中英文检测/识别模型，无需另行下载。代码依赖 1.4.x 的调用方式与返回格式，限定主版本。
+rapidocr_onnxruntime>=1.4,<2
+# 检测代码直接 import 的 cv2 与 numpy（rapidocr 也会连带安装，这里显式列出）
+opencv-python
+numpy

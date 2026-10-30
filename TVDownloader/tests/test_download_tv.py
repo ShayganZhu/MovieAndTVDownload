@@ -634,7 +634,7 @@ def test_download_segments_forwards_headers(sandbox, monkeypatch):
     """分片下载同样要带节点头，否则正片阶段会整片 403。"""
     seen = []
 
-    def fake_single(url, index, retry_max, delay, headers=None):
+    def fake_single(url, index, retry_max, delay, headers=None, *_rest, **_kw):
         seen.append(headers)
         return b"x"
 
@@ -1511,7 +1511,8 @@ def test_download_single_segment_skips_retry_on_permanent_status(sandbox, monkey
         raise d.requests.HTTPError("boom", response=_FakeResp(404))
 
     monkeypatch.setattr(d, "request_with_retry", fake_request)
-    with pytest.raises(RuntimeError, match="重试 20 次后仍失败"):
+    # 文案写实际请求次数：确定性失败第 1 次就放弃，不能误报"重试 20 次"。
+    with pytest.raises(RuntimeError, match="重试 1 次后仍失败"):
         d.download_single_segment("u", 0, 20, 1)
     assert len(calls) == 1 and sleeps == []
 
@@ -2309,7 +2310,8 @@ def test_download_mp4_chunk_backoff_wakes_up_on_interrupt(mp4_env, monkeypatch):
     session = _install_range_session(monkeypatch, b"", status=500)
     threading.Timer(0.05, d.interrupted.set).start()
     started = time.monotonic()
-    with pytest.raises(RuntimeError, match="重试后仍失败"):
+    # 中断按 DownloadInterrupted 收手（可重试、不记节点归因），不再报"重试后仍失败"。
+    with pytest.raises(d.DownloadInterrupted):
         d._download_mp4_chunk("u", {}, 0, 9, 0)
     # 裸 sleep 的旧实现这里要等满 30s。
     assert time.monotonic() - started < 5
@@ -5645,3 +5647,1145 @@ def test_finalize_one_entry_survives_subtitle_crash(sandbox, monkeypatch):
     assert ok is True and info["subtitle_files"] == []
     assert os.path.exists(info["final_path"])
     assert info["has_meta"] is True          # meta 照常生成
+
+
+# ---------------------------------------------------------------------------
+# 转封装剥除隐藏字幕（CEA-608/708，ATSC A/53）
+#   业务口径：成品不要任何字幕，但只剥不剔——去掉字幕照常交付，绝不因此丢集。
+# ---------------------------------------------------------------------------
+
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+
+
+def _ffmpeg_has_libx264():
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        return False
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, timeout=30).stdout
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return "libx264" in out
+
+
+_needs_ffmpeg = pytest.mark.skipif(
+    not _ffmpeg_has_libx264(), reason="需要本机 ffmpeg/ffprobe 且带 libx264"
+)
+
+
+def _inject_a53_sei(h264_bytes):
+    """在 Annex B H.264 码流的每个 slice 前插一条 A/53 隐藏字幕 SEI（GA94）。"""
+    payload = bytes([0xB5, 0x00, 0x31]) + b"GA94" + bytes(
+        [0x03, 0x42, 0xFF, 0xFC, 0x94, 0x2C, 0xFC, 0x80, 0x80, 0xFF]
+    )
+    sei = b"\x00\x00\x00\x01" + bytes([0x06, 0x04, len(payload)]) + payload + b"\x80"
+    starts = []
+    i = 0
+    while (j := h264_bytes.find(b"\x00\x00\x01", i)) >= 0:
+        starts.append(j)
+        i = j + 3
+    out = bytearray()
+    for k, s in enumerate(starts):
+        begin = s - 1 if s > 0 and h264_bytes[s - 1] == 0 else s
+        end = starts[k + 1] if k + 1 < len(starts) else len(h264_bytes)
+        if k + 1 < len(starts) and h264_bytes[end - 1] == 0:
+            end -= 1
+        if h264_bytes[s + 3] & 0x1F in (1, 5):
+            out += sei
+        out += h264_bytes[begin:end]
+    return bytes(out)
+
+
+def _make_ts(tmp_path, name, with_cc):
+    """造一段 2 秒的 H.264+AAC TS。带字幕时让 libx264 从帧 side data 写回 A/53 SEI，
+    得到与源站同构的"字幕藏在视频码流里"的样本。"""
+    raw = tmp_path / f"{name}.h264"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24", "-t", "2",
+         "-c:v", "libx264", "-bsf:v", "h264_mp4toannexb", "-f", "h264", str(raw)],
+        check=True, capture_output=True, timeout=60,
+    )
+    if with_cc:
+        raw.write_bytes(_inject_a53_sei(raw.read_bytes()))
+    ts = tmp_path / f"{name}.ts"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-framerate", "24", "-f", "h264", "-i", str(raw),
+         "-f", "lavfi", "-i", "sine=frequency=440", "-t", "2",
+         "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-a53cc", "1",
+         "-c:a", "aac", "-f", "mpegts", str(ts)],
+        check=True, capture_output=True, timeout=60,
+    )
+    return str(ts)
+
+
+def _count_cc_frames(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_frames",
+         "-of", "compact", path],
+        capture_output=True, text=True, timeout=60,
+    ).stdout
+    return out.count("Closed Captions")
+
+
+def _count_video_frames(path):
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+         "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", path],
+        capture_output=True, text=True, timeout=60,
+    ).stdout
+    # TS 输入会在节目段里再打印一遍同一条流，取第一行即可。
+    return int(out.split()[0])
+
+
+@_needs_ffmpeg
+def test_closed_captions_are_stripped_during_remux(tmp_path, monkeypatch):
+    """🔴 真 ffmpeg 端到端：带 A/53 字幕的 TS 转封装后，成品里一帧字幕都不剩，
+    且画面一帧不少。"""
+    monkeypatch.setattr(d, "STRIP_CLOSED_CAPTIONS", True)
+    src = _make_ts(tmp_path, "cc", with_cc=True)
+    assert d.has_closed_captions(src), "前提：样本确实带隐藏字幕"
+    assert _count_cc_frames(src) > 0
+
+    dst = str(tmp_path / "out.mp4")
+    assert d.convert_ts_to_mp4(src, dst) is True
+
+    assert _count_cc_frames(dst) == 0
+    assert not d.has_closed_captions(dst)
+    assert _count_video_frames(dst) == _count_video_frames(src) == 48
+
+
+@_needs_ffmpeg
+def test_plain_video_is_remuxed_without_caption_filter(tmp_path, monkeypatch):
+    """没有隐藏字幕的片走原来的纯拷贝路径，不挂任何码流过滤器。"""
+    monkeypatch.setattr(d, "STRIP_CLOSED_CAPTIONS", True)
+    src = _make_ts(tmp_path, "plain", with_cc=False)
+    assert not d.has_closed_captions(src)
+    calls = []
+    real = d._remux_to_mp4
+    monkeypatch.setattr(d, "_remux_to_mp4",
+                        lambda s, t, bsf=None: calls.append(bsf) or real(s, t, bsf))
+    dst = str(tmp_path / "out.mp4")
+    assert d.convert_ts_to_mp4(src, dst) is True
+    assert calls == [None]
+    assert _count_video_frames(dst) == 48
+
+
+def test_strip_failure_falls_back_to_plain_remux(tmp_path, monkeypatch):
+    """剥除失败时退回原样转封装：留着字幕也好过丢片。"""
+    monkeypatch.setattr(d, "STRIP_CLOSED_CAPTIONS", True)
+    monkeypatch.setattr(d, "has_closed_captions", lambda p: True)
+    monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
+    calls = []
+    monkeypatch.setattr(d, "_remux_to_mp4",
+                        lambda s, t, bsf=None: calls.append(bsf) or bsf is None)
+    assert d.convert_ts_to_mp4("in.ts", str(tmp_path / "out.mp4")) is True
+    assert calls == ["filter_units=remove_types=6", None]
+
+
+def test_unsupported_codec_keeps_captions_and_still_converts(tmp_path, monkeypatch, capsys):
+    """HEVC 等暂不支持剥除的编码：原样转封装、记日志，绝不因此放弃该集。"""
+    monkeypatch.setattr(d, "STRIP_CLOSED_CAPTIONS", True)
+    monkeypatch.setattr(d, "has_closed_captions", lambda p: True)
+    monkeypatch.setattr(d, "probe_codec", lambda p: "hevc")
+    calls = []
+    monkeypatch.setattr(d, "_remux_to_mp4",
+                        lambda s, t, bsf=None: calls.append(bsf) or True)
+    assert d.convert_ts_to_mp4("in.ts", str(tmp_path / "out.mp4")) is True
+    assert calls == [None]
+    assert "hevc 编码暂不支持剥除" in capsys.readouterr().out
+
+
+def test_caption_check_is_skipped_when_disabled(tmp_path, monkeypatch):
+    """开关关掉时连探测都不做，行为与改动前完全一致。"""
+    monkeypatch.setattr(d, "STRIP_CLOSED_CAPTIONS", False)
+
+    def boom(p):
+        raise AssertionError("关闭时不该探测")
+
+    monkeypatch.setattr(d, "has_closed_captions", boom)
+    calls = []
+    monkeypatch.setattr(d, "_remux_to_mp4",
+                        lambda s, t, bsf=None: calls.append(bsf) or True)
+    assert d.convert_ts_to_mp4("in.ts", str(tmp_path / "out.mp4")) is True
+    assert calls == [None]
+
+
+def test_caption_probe_failure_is_treated_as_no_captions(monkeypatch):
+    """ffprobe 缺失/超时只当作没有字幕，不能把探测问题变成转封装失败。"""
+    def raise_os_error(*a, **kw):
+        raise OSError("ffprobe not found")
+
+    monkeypatch.setattr(d.subprocess, "run", raise_os_error)
+    assert d.has_closed_captions("whatever.ts") is False
+
+
+@_needs_ffmpeg
+def test_probe_codec_reads_ts_input_as_a_single_codec_name(tmp_path):
+    """TS 输入 ffprobe 会把同一条流打印两遍（"h264\\nh264"）。probe_codec 必须
+    只取一个编码名，否则 normalize_codec 认不出：HLS 采样一律退回 H.264 基准，
+    隐藏字幕剥除也永远不会生效。"""
+    src = _make_ts(tmp_path, "plain", with_cc=False)
+    assert d.probe_codec(src) == "h264"
+    assert d.normalize_codec(d.probe_codec(src)) == "h264"
+
+
+def test_probe_codec_takes_first_line_of_duplicated_output(monkeypatch):
+    monkeypatch.setattr(
+        d.subprocess, "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout="HEVC\nhevc\n", stderr=""),
+    )
+    assert d.probe_codec("x.ts") == "hevc"
+
+
+
+# 以下移植自电影侧（717939f / 4d48ba9 / cf5755f），vidup/vidfast 的流同样落在 finalsignal。
+import requests  # noqa: E402
+
+
+def _seg_403(url):
+    """与 request_with_retry 抛出的 403 同形：带确定性 / 需重取标记，状态码在 __cause__ 上。"""
+
+    class _Resp:
+        status_code = 403
+
+    exc = RuntimeError(
+        f"请求失败({d._HTTP_PERMANENT_MARKER} HTTP 403)，{d._NEEDS_REFETCH_MARKER}: {url}; "
+        f"403 Client Error: Forbidden for url: {url}"
+    )
+    exc.__cause__ = type("HTTPError", (Exception,), {"response": _Resp()})()
+    return exc
+
+
+@pytest.fixture
+def seg_403_env(monkeypatch, hls_circuit_env):
+    monkeypatch.setattr(d, "SEG_403_RETRY_DELAY", 0.001)
+    monkeypatch.setattr(d, "SEG_403_RETRY_MAX", 5)
+    monkeypatch.setattr(d, "SEG_403_EXPIRED_AFTER", 8)
+    monkeypatch.setattr(d, "validate_segment_content", lambda c, u: None)
+
+
+def test_segment_403_tracker_verdicts():
+    """判别器：攒够阈值前先重试；攒够后有近期成功算临时风控，没有（或成功已旧）算签名过期。"""
+    now = [100.0]
+    t = d._Segment403Tracker(expired_after=3, recent_ok_seconds=60, clock=lambda: now[0])
+    assert t.record_rejected() is True and t.record_rejected() is True, "阈值前还判断不了，先重试"
+    assert t.record_rejected() is False, "一直没有成功、403 攒够 → 签名过期"
+
+    t.record_ok()
+    assert [t.record_rejected() for _ in range(5)] == [True] * 5, "近期有成功 → 临时风控，一直重试"
+
+    now[0] += 61
+    assert t.record_rejected() is False, "最近一次成功已超过 60s（token 中途过期）→ 改判过期"
+    t.record_ok()
+    assert t.record_rejected() is True, "又有分片成功 → 自我纠正回临时风控"
+
+
+def test_segment_403_retried_when_other_segments_ok(monkeypatch, seg_403_env):
+    """🔴 同片别的分片正常时，403 必须退避重试直到成功，而不是第 1 次就跳过。"""
+    url = "https://sun.finalsignal.top/r6/x/seg-1.ts"
+    calls = []
+
+    def flaky(method, u, **kw):
+        calls.append(1)
+        if len(calls) <= 2:
+            raise _seg_403(u)
+        return b"\x47" * 100
+
+    monkeypatch.setattr(d, "request_with_retry", flaky)
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()  # 同片别的分片刚成功过
+    assert d.download_single_segment(url, 0, 20, 1, forbidden_tracker=tracker) == b"\x47" * 100
+    assert len(calls) == 3
+
+
+def test_segment_403_without_tracker_keeps_fast_fail(monkeypatch, seg_403_env):
+    """不传判别器（旧调用方）时行为不变：403 第 1 次就放弃，错误仍带需重取标记。"""
+    calls = []
+
+    def always_403(method, u, **kw):
+        calls.append(1)
+        raise _seg_403(u)
+
+    monkeypatch.setattr(d, "request_with_retry", always_403)
+    with pytest.raises(RuntimeError, match="重试 1 次后仍失败") as ei:
+        d.download_single_segment("https://x/r6/seg.ts", 0, 20, 1)
+    assert len(calls) == 1
+    assert d._NEEDS_REFETCH_MARKER in str(ei.value)
+
+
+def test_segment_403_retry_is_capped(monkeypatch, seg_403_env):
+    """临时风控的重试有独立上限：一直 403 时 1 + SEG_403_RETRY_MAX 次后放弃，不走满 retry_max。"""
+    monkeypatch.setattr(d, "SEG_403_RETRY_MAX", 2)
+    calls = []
+
+    def always_403(method, u, **kw):
+        calls.append(1)
+        raise _seg_403(u)
+
+    monkeypatch.setattr(d, "request_with_retry", always_403)
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()
+    with pytest.raises(RuntimeError, match="重试 3 次后仍失败"):
+        d.download_single_segment("https://x/r6/seg.ts", 0, 20, 1, forbidden_tracker=tracker)
+    assert len(calls) == 3
+
+
+def test_download_segments_retries_scattered_403(monkeypatch, seg_403_env, tmp_path):
+    """整集层：零散的临时 403 重试后补齐，不再缺片。"""
+    seen = {}
+
+    def fake_request(method, u, **kw):
+        seen[u] = seen.get(u, 0) + 1
+        if u.endswith("s2.ts") and seen[u] == 1:
+            raise _seg_403(u)
+        return b"\x47" + u.encode()
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    urls = [f"https://sun.finalsignal.top/r6/x/s{i}.ts" for i in range(4)]
+    total, failed, _ = d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=1)
+    assert failed == []
+    assert seen[urls[2]] == 2
+    assert (tmp_path / "out.ts").read_bytes() == b"".join(b"\x47" + u.encode() for u in urls)
+
+
+def test_shipped_segment_and_playlist_403_config():
+    """10-27 按 06 号机实测调的值：分片 1s 起 8 次；播放列表 1s 起 3 次。"""
+    assert (d.SEG_403_RETRY_DELAY, d.SEG_403_RETRY_MAX) == (1.0, 8)
+    assert (d.PLAYLIST_403_RETRY_DELAY, d.PLAYLIST_403_RETRY_MAX) == (1.0, 3)
+
+
+class _ScriptedResp:
+    def __init__(self, status):
+        self.status_code = status
+        self.text = "#EXTM3U\n#EXTINF:4,\nseg-1.ts\n"
+        self.content = self.text.encode()
+        self.encoding = "utf-8"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} Client Error", response=self)
+
+
+@pytest.fixture
+def scripted_http(monkeypatch):
+    """按给定状态码序列应答的 Session；记下请求次数与每次退避等待的秒数。"""
+    state = {"statuses": [], "calls": 0, "slept": []}
+
+    class _Session:
+        def request(self, method, url, headers=None, **kw):
+            state["calls"] += 1
+            return _ScriptedResp(state["statuses"].pop(0))
+
+    class _RecordingInterrupt:
+        """退避等在全局中断信号上（可打断）：这里只记秒数、不真等，也从不中断。"""
+
+        def is_set(self):
+            return False
+
+        def clear(self):  # 模块级 autouse 的 _clear_interrupt 收尾时会调
+            pass
+
+        def wait(self, timeout=None):
+            state["slept"].append(timeout)
+            return False
+
+    monkeypatch.setattr(d, "get_session", lambda: _Session())
+    monkeypatch.setattr(d, "interrupted", _RecordingInterrupt())
+    return state
+
+
+def test_playlist_403_is_retried_then_succeeds(scripted_http):
+    """🔴 播放列表的随机 403：短间隔重试后拿到，不再整集失败、转重取。"""
+    scripted_http["statuses"] = [403, 403, 200]
+    text = d.request_with_retry("GET", "https://x/r6/master.m3u8", retries=4, as_text=True,
+                                retry_403=3, retry_403_delay=1.0)
+    assert text.startswith("#EXTM3U") and scripted_http["calls"] == 3
+    assert 1.0 <= scripted_http["slept"][0] <= 1.2 and 2.0 <= scripted_http["slept"][1] <= 2.4
+
+
+def test_playlist_persistent_403_still_goes_to_refetch(scripted_http):
+    """一直 403（签名真过期）：重试次数用完照旧按确定性失败抛出，带需重取标记。"""
+    scripted_http["statuses"] = [403] * 4
+    with pytest.raises(RuntimeError) as ei:
+        d.request_with_retry("GET", "https://x/r6/master.m3u8", retries=4, as_text=True,
+                             retry_403=3, retry_403_delay=1.0)
+    assert scripted_http["calls"] == 4
+    assert d._HTTP_PERMANENT_MARKER in str(ei.value)
+    assert d._NEEDS_REFETCH_MARKER in str(ei.value)
+
+
+def test_request_403_not_retried_by_default(scripted_http):
+    """默认不重试 403：分片层（retries=1）靠 download_single_segment 自己判别。"""
+    scripted_http["statuses"] = [403]
+    with pytest.raises(RuntimeError, match=d._HTTP_PERMANENT_MARKER):
+        d.request_with_retry("GET", "https://x/seg.ts", retries=1)
+    assert scripted_http["calls"] == 1
+
+
+def test_playlist_403_retries_do_not_use_up_normal_retries(scripted_http):
+    """403 的重试另计：前面一次 502 用掉的普通重试名额不影响 403 的两次。"""
+    scripted_http["statuses"] = [502, 403, 403, 200]
+    text = d.request_with_retry("GET", "https://x/r6/master.m3u8", retries=2, backoff=0.01,
+                                as_text=True, retry_403=2, retry_403_delay=0.01)
+    assert text.startswith("#EXTM3U") and scripted_http["calls"] == 4
+
+
+def test_normal_retry_backoff_unchanged(scripted_http):
+    """改写循环后普通重试的次数与退避节奏不变：retries=3 → 最多 3 次请求，退避 1s、2s。"""
+    scripted_http["statuses"] = [502, 502, 502]
+    with pytest.raises(RuntimeError, match="请求失败: "):
+        d.request_with_retry("GET", "https://x/master.m3u8", retries=3, backoff=1.0)
+    assert scripted_http["calls"] == 3
+    slept = scripted_http["slept"]
+    assert len(slept) == 2 and 1.0 <= slept[0] <= 1.2 and 2.0 <= slept[1] <= 2.4
+
+
+def test_playlist_parsers_turn_on_403_retry(monkeypatch):
+    """master / media playlist 两处都必须开 403 重试（分片层那处不开）。"""
+    seen = []
+
+    def fake_request(method, url, **kw):
+        seen.append((kw.get("retry_403"), kw.get("retry_403_delay")))
+        return "#EXTM3U\n#EXTINF:4,\nseg-1.ts\n"
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    d.parse_master_playlist("https://x/r6/master.m3u8")
+    d.parse_media_playlist("https://x/r6/index.m3u8")
+    assert seen == [(d.PLAYLIST_403_RETRY_MAX, d.PLAYLIST_403_RETRY_DELAY)] * 2
+
+
+def test_download_segments_whole_episode_403_fails_fast(monkeypatch, seg_403_env, tmp_path):
+    """🔴 整集都 403（签名过期）时仍快速放弃：攒够阈值后每个分片只请求 1 次，转重取。"""
+    monkeypatch.setattr(d, "SEG_403_EXPIRED_AFTER", 2)
+    seen = {}
+
+    def always_403(method, u, **kw):
+        seen[u] = seen.get(u, 0) + 1
+        raise _seg_403(u)
+
+    monkeypatch.setattr(d, "request_with_retry", always_403)
+    urls = [f"https://sun.finalsignal.top/r6/x/s{i}.ts" for i in range(4)]
+    _, failed, _ = d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=1)
+    assert failed == [0, 1, 2, 3]
+    # 第 1 片：第 1 次 403 未到阈值重试 1 次，第 2 次攒够阈值判过期；其余分片都只请求 1 次。
+    assert [seen[u] for u in urls] == [2, 1, 1, 1]
+
+
+# --------------------------------- 分片返回 HTML 页面：临时拦截 vs 无效源（2026-10-27）
+
+_HTML_PAGE = b"<!DOCTYPE html><html><head><title>\n  Just a moment...\n</title></head><body>x</body></html>"
+_TS = b"\x47" * 100
+
+
+@pytest.fixture
+def seg_html_env(monkeypatch, hls_circuit_env):
+    """与 seg_403_env 不同：保留真的 validate_segment_content，HTML 要靠它识别出来。"""
+    monkeypatch.setattr(d, "SEG_HTML_RETRY_DELAY", 0.001)
+    monkeypatch.setattr(d, "SEG_HTML_RETRY_MAX", 5)
+    monkeypatch.setattr(d, "SEG_403_RETRY_DELAY", 0.001)
+    monkeypatch.setattr(d, "SEG_403_EXPIRED_AFTER", 8)
+
+
+def _scripted(monkeypatch, replies):
+    """request_with_retry 按次序吐 replies（异常就抛），返回调用计数列表。"""
+    calls = []
+
+    def fake(method, u, **kw):
+        calls.append(u)
+        reply = replies[min(len(calls), len(replies)) - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(d, "request_with_retry", fake)
+    return calls
+
+
+def test_html_page_summary():
+    """摘要：有标题取标题（压掉换行空白），没有标题取正文开头，过长截断，附字节数。"""
+    assert d._html_page_summary(_HTML_PAGE) == f"标题: Just a moment...，{len(_HTML_PAGE)} 字节"
+    body = b"<html><body><h1>Access  denied</h1>\n<p>Ray ID</p></body></html>"
+    assert d._html_page_summary(body) == f"开头: Access denied Ray ID，{len(body)} 字节"
+    long_title = b"<html><title>" + b"a" * 100 + b"</title></html>"
+    assert d._html_page_summary(long_title).startswith("标题: " + "a" * 60 + "…，")
+    assert d._html_page_summary(b"<html></html>") == "开头: （空），13 字节"
+
+
+def test_validate_segment_content_tells_html_from_m3u8():
+    """HTML 与 m3u8 分成两类；文案仍带原 marker，落盘后的归类不变。"""
+    with pytest.raises(d.SegmentNotMediaError) as ei:
+        d.validate_segment_content(_HTML_PAGE, "https://x/r6/s.ts")
+    assert ei.value.kind == "html" and ei.value.summary.startswith("标题: Just a moment...")
+    assert "服务器返回的不是视频分片" in str(ei.value)
+    assert d._classify_failure(str(ei.value)) == d._classify_failure("服务器返回的不是视频分片: u")
+
+    with pytest.raises(d.SegmentNotMediaError) as ei:
+        d.validate_segment_content(b"#EXTM3U\n#EXTINF:4,\nseg.ts\n", "https://x/s.ts")
+    assert ei.value.kind == "m3u8" and "服务器返回的不是视频分片" in str(ei.value)
+    d.validate_segment_content(_TS, "https://x/s.ts")  # 视频数据照常通过
+
+
+def test_segment_html_retried_when_other_segments_ok(monkeypatch, seg_html_env, capsys):
+    """🔴 同片别的分片正常时，零星的 HTML 页必须退避重试直到拿到视频数据，而不是第 1 次就丢片。"""
+    calls = _scripted(monkeypatch, [_HTML_PAGE, _HTML_PAGE, _TS])
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()  # 同片别的分片刚成功过
+    assert d.download_single_segment(
+        "https://sun.finalsignal.top/r6/x/s.ts", 0, 20, 1, forbidden_tracker=tracker
+    ) == _TS
+    assert len(calls) == 3
+    out = capsys.readouterr().out
+    assert "分片 1 返回 HTML 页面（标题: Just a moment...，" in out
+    assert "按临时风控重试 (2/5)" in out
+
+
+def test_segment_html_without_tracker_keeps_fast_fail(monkeypatch, seg_html_env):
+    """不传判别器（旧调用方）时行为不变：HTML 第 1 次就放弃。"""
+    calls = _scripted(monkeypatch, [_HTML_PAGE])
+    with pytest.raises(RuntimeError, match="重试 1 次后仍失败: 服务器返回的不是视频分片"):
+        d.download_single_segment("https://x/r6/s.ts", 0, 20, 1)
+    assert len(calls) == 1
+
+
+def test_segment_m3u8_reply_not_retried(monkeypatch, seg_html_env):
+    """回的是 m3u8：链接本身指错了，即使同片别的分片正常也不重试。"""
+    calls = _scripted(monkeypatch, [b"#EXTM3U\n"])
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()
+    with pytest.raises(RuntimeError, match="m3u8 播放列表"):
+        d.download_single_segment("https://x/r6/s.ts", 0, 20, 1, forbidden_tracker=tracker)
+    assert len(calls) == 1
+
+
+def test_segment_html_retry_is_capped(monkeypatch, seg_html_env):
+    """HTML 重试有独立上限：一直回 HTML 时 1 + SEG_HTML_RETRY_MAX 次后放弃，不走满 retry_max。"""
+    monkeypatch.setattr(d, "SEG_HTML_RETRY_MAX", 2)
+    calls = _scripted(monkeypatch, [_HTML_PAGE])
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()
+    with pytest.raises(RuntimeError, match="重试 3 次后仍失败: 服务器返回的不是视频分片"):
+        d.download_single_segment("https://x/r6/s.ts", 0, 20, 1, forbidden_tracker=tracker)
+    assert len(calls) == 3
+
+
+def test_segment_html_and_403_budgets_are_separate(monkeypatch, seg_html_env):
+    """403 和 HTML 各算各的：403 的次数用完了，HTML 照样还能重试。"""
+    monkeypatch.setattr(d, "SEG_403_RETRY_MAX", 1)
+    monkeypatch.setattr(d, "SEG_HTML_RETRY_MAX", 1)
+    url = "https://x/r6/s.ts"
+    calls = _scripted(monkeypatch, [_seg_403(url), _HTML_PAGE, _TS])
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()
+    assert d.download_single_segment(url, 0, 20, 1, forbidden_tracker=tracker) == _TS
+    assert len(calls) == 3
+
+
+def test_download_segments_retries_scattered_html(monkeypatch, seg_html_env, tmp_path):
+    """整集层：零散的 HTML 页重试后补齐，不再缺片。"""
+    seen = {}
+
+    def fake_request(method, u, **kw):
+        seen[u] = seen.get(u, 0) + 1
+        if u.endswith("s2.ts") and seen[u] == 1:
+            return _HTML_PAGE
+        return b"\x47" + u.encode()
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    urls = [f"https://sun.finalsignal.top/r6/x/s{i}.ts" for i in range(4)]
+    _, failed, _ = d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=1)
+    assert failed == []
+    assert seen[urls[2]] == 2
+    assert (tmp_path / "out.ts").read_bytes() == b"".join(b"\x47" + u.encode() for u in urls)
+
+
+def test_download_segments_whole_episode_html_fails_fast(monkeypatch, seg_html_env, tmp_path):
+    """🔴 整集都回 HTML（真无效源）时仍快速放弃：攒够阈值后每个分片只请求 1 次，好去换节点。"""
+    monkeypatch.setattr(d, "SEG_403_EXPIRED_AFTER", 2)
+    seen = {}
+
+    def always_html(method, u, **kw):
+        seen[u] = seen.get(u, 0) + 1
+        return _HTML_PAGE
+
+    monkeypatch.setattr(d, "request_with_retry", always_html)
+    urls = [f"https://sun.finalsignal.top/r6/x/s{i}.ts" for i in range(4)]
+    _, failed, _ = d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=1)
+    assert failed == [0, 1, 2, 3]
+    assert [seen[u] for u in urls] == [2, 1, 1, 1]
+
+
+def test_shipped_segment_html_config():
+    """10-27 出厂值：与分片 403 一样 1s 起 8 次。"""
+    assert (d.SEG_HTML_RETRY_DELAY, d.SEG_HTML_RETRY_MAX) == (1.0, 8)
+
+
+
+# ---------------------------------------------------------------------------
+# 中断后整集收手（电影侧 88290a6 移植）
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _clear_interrupt():
+    """每个用例前后都清掉全局中断信号，避免相互污染。
+    个别用例把 interrupted 换成没有 clear 的替身（只测退避秒数），收尾时跳过它。"""
+    d.interrupted.clear()
+    yield
+    clear = getattr(d.interrupted, "clear", None)
+    if clear is not None:
+        clear()
+
+
+def test_download_segments_stops_feeding_segments_after_interrupt(monkeypatch, tmp_path, capsys):
+    """🔴 中断后撤掉没开跑的分片、整集按中断上抛：不把剩下的分片挨个走一遍
+    （电影侧一部 1095 片的片子磨了约 20 分钟），也不刷"耗尽重试次数"。"""
+    monkeypatch.setattr(d, "validate_segment_content", lambda c, u: None)
+    requests_made = []
+
+    def fake_request(method, url, **kw):
+        requests_made.append(url)
+        if len(requests_made) == 5:
+            d.interrupted.set()          # 信号处理器会做的事
+        return b"\x47" * 10
+
+    started = []
+    real_single = d.download_single_segment
+
+    def counting_single(*a, **kw):
+        started.append(a[1])
+        return real_single(*a, **kw)
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    monkeypatch.setattr(d, "download_single_segment", counting_single)
+    urls = [f"https://x/s{i}.ts" for i in range(500)]
+    with pytest.raises(d.DownloadInterrupted):
+        d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=4)
+    assert len(started) <= 5 + 2 * 4, f"中断后又投了 {len(started) - 5} 个分片"
+    assert "耗尽重试次数" not in capsys.readouterr().out
+
+
+def test_download_segments_never_returns_a_partial_episode_after_interrupt(monkeypatch, tmp_path):
+    """🔴 末尾几片被"已取消"的集不能当残片返回：缺得少就会过缺片阈值、被当成功集转封装上传。"""
+    monkeypatch.setattr(d, "validate_segment_content", lambda c, u: None)
+    urls = [f"https://x/s{i}.ts" for i in range(100)]
+
+    def fake_request(method, url, **kw):
+        if url == urls[-1]:
+            d.interrupted.set()
+            raise RuntimeError("Read timed out.")
+        return b"\x47" * 10
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    with pytest.raises(d.DownloadInterrupted):
+        d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=1)
+
+
+def test_download_segments_refuses_to_start_after_interrupt(monkeypatch, tmp_path):
+    """中断后不发请求、也不截断已有文件。"""
+    out = tmp_path / "out.ts"
+    out.write_bytes(b"old")
+    monkeypatch.setattr(d, "request_with_retry", lambda *a, **kw: pytest.fail("中断后不该再发请求"))
+    d.interrupted.set()
+    with pytest.raises(d.DownloadInterrupted):
+        d.download_segments(["https://x/s0.ts"], str(out))
+    assert out.read_bytes() == b"old"
+
+
+def test_playlist_backoff_wakes_on_interrupt(monkeypatch):
+    """播放列表的退避（最长 45s × 多次）必须可打断。"""
+    class _Down:
+        def request(self, *a, **kw):
+            raise ConnectionError("boom")
+
+    monkeypatch.setattr(d, "get_session", lambda: _Down())
+    threading.Timer(0.3, d.interrupted.set).start()
+    started = time.monotonic()
+    with pytest.raises(d.DownloadInterrupted):
+        d.request_with_retry("GET", "https://x/master.m3u8", retries=3, backoff=5, as_text=True)
+    assert time.monotonic() - started < 3
+
+
+def test_mp4_chunk_refuses_to_start_after_interrupt(monkeypatch):
+    monkeypatch.setattr(d, "get_session", lambda: pytest.fail("中断后不该再发请求"))
+    d.interrupted.set()
+    with pytest.raises(d.DownloadInterrupted):
+        d._download_mp4_chunk("https://cdn.example/a.mp4", {}, 0, 9, 0)
+
+
+def test_interrupted_error_is_retriable_and_not_a_refetch():
+    """中断不是这一集的问题：可重试、不判死、不触发重取。"""
+    assert d._classify_failure(d._INTERRUPTED_ERROR) is True
+    assert not d.needs_refetch(d._INTERRUPTED_ERROR)
+    assert isinstance(d.DownloadInterrupted("x"), RuntimeError)
+
+
+
+
+# 以下为纯检测逻辑的用例，原样移植自电影侧（检测代码两侧一致）。需要 cv2 + rapidocr，缺依赖时跳过。
+# ---------------------------------------------------------------------------
+# 画面叠加物检测：硬字幕 + 水印（下载后、移入成品目录前）
+#   这里只测检测本身（抽帧 + OCR + 三路判定）；检出后的处理（换节点重下 / 整集判死、
+#   只处理这一集）见 tests/test_overlay_tv.py。
+# ---------------------------------------------------------------------------
+
+def _ocr_available():
+    try:
+        import cv2  # noqa: F401
+        import rapidocr_onnxruntime  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return _ffmpeg_has_libx264()
+
+
+_needs_ocr = pytest.mark.skipif(
+    not _ocr_available(), reason="需要 rapidocr_onnxruntime、opencv 与带 libx264 的 ffmpeg"
+)
+
+_SUB_LINES = [
+    "Where are you going tonight?", "I told you to stay here.", "We need to talk.",
+    "Nobody knows the truth.", "Get in the car, now!", "It was never about money.",
+    "Do you remember that day?", "Let's go home.", "He is not coming back.",
+]
+
+
+def _make_overlay_video(tmp_path, kind, seconds=60, w=640, h=360):
+    """合成测试片（1 帧/秒编码，够抽帧用）。背景是逐帧随机的模糊纹理——与真实影片
+    一样画面不断切换；static_scene 例外，模拟固定机位。
+
+      sub          底部居中、每 2 秒换一句的字幕（一半时间在屏）
+      semi_wm      半透明的居中网址水印（OCR 会认出多种变体）
+      logo_graphic 右上角的纯图形台标（没有文字，OCR 认不出）
+      letterbox    宽银幕黑边、无任何叠加物（黑边分界线横贯全宽，不能当台标）
+      static_scene 固定机位：带 "HOTEL" 招牌与门框的静止背景 + 一个走动的人
+    """
+    import cv2
+    import numpy as np
+
+    rng = np.random.default_rng(11)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    frames = tmp_path / f"{kind}_frames"
+    frames.mkdir()
+
+    def texture():
+        base = rng.integers(0, 255, (h // 16, w // 16, 3), dtype=np.uint8)
+        return cv2.GaussianBlur(cv2.resize(base, (w, h), interpolation=cv2.INTER_CUBIC), (0, 0), 4)
+
+    static_bg = None
+    if kind == "static_scene":
+        static_bg = texture()
+        cv2.rectangle(static_bg, (30, 20), (160, 60), (40, 40, 160), -1)
+        cv2.putText(static_bg, "HOTEL", (42, 52), font, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.rectangle(static_bg, (520, 280), (620, 350), (90, 90, 90), 4)
+
+    for s in range(seconds):
+        if kind == "static_scene":
+            img = static_bg.copy()
+            cv2.circle(img, (w // 2 + int(60 * np.sin(s / 5)), h // 2), 30, (0, 200, 255), -1)
+        else:
+            img = texture()
+        if kind == "sub" and (s // 2) % 2 == 0:
+            text = _SUB_LINES[(s // 4) % len(_SUB_LINES)]
+            (tw, _), _ = cv2.getTextSize(text, font, 0.8, 2)
+            org = ((w - tw) // 2, int(h * 0.92))
+            cv2.putText(img, text, org, font, 0.8, (0, 0, 0), 6, cv2.LINE_AA)
+            cv2.putText(img, text, org, font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        if kind == "semi_wm":
+            overlay = img.copy()
+            text = "WWW.FREEMOVIES-HD.COM"
+            (tw, _), _ = cv2.getTextSize(text, font, 0.8, 2)
+            cv2.putText(overlay, text, ((w - tw) // 2, int(h * 0.88)), font, 0.8,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+            img = cv2.addWeighted(overlay, 0.45, img, 0.55, 0)
+        if kind == "logo_graphic":
+            x, y = int(w * 0.85), int(h * 0.06)
+            cv2.circle(img, (x + 18, y + 18), 15, (240, 240, 240), 3)
+            cv2.rectangle(img, (x + 8, y + 10), (x + 28, y + 26), (240, 240, 240), 2)
+            cv2.line(img, (x + 40, y + 4), (x + 40, y + 32), (240, 240, 240), 2)
+        if kind == "letterbox":
+            bar = int(h * 0.12)
+            img[:bar] = 0
+            img[-bar:] = 0
+        cv2.imwrite(str(frames / f"{s:04d}.png"), img)
+    out = tmp_path / f"{kind}.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-framerate", "1",
+         "-i", str(frames / "%04d.png"), "-c:v", "libx264", "-r", "24",
+         "-pix_fmt", "yuv420p", str(out)],
+        check=True, capture_output=True, timeout=120,
+    )
+    return str(out)
+
+
+@pytest.fixture
+def _fast_overlay(monkeypatch):
+    monkeypatch.setattr(d, "HARDSUB_SAMPLE_FRAMES", 20)
+    monkeypatch.setattr(d, "WATERMARK_CHECK_ENABLED", True)
+
+
+@_needs_ocr
+def test_overlay_detector_flags_changing_bottom_subtitles(tmp_path, _fast_overlay):
+    """🔴 真 OCR 端到端：底部居中、内容不断变化的字幕 → 硬字幕（不是水印），带证据截图。"""
+    scan, evidence = d.detect_overlays(_make_overlay_video(tmp_path, "sub"))
+    assert scan["reasons"] == ["hardsub"], scan
+    assert scan["hit_ratio"] >= d.HARDSUB_MIN_HIT_RATIO
+    assert scan["distinct_texts"] >= d.HARDSUB_MIN_DISTINCT_TEXTS
+    assert 0 < len(evidence) <= 4
+
+
+@_needs_ocr
+def test_overlay_detector_flags_semi_transparent_text_watermark(tmp_path, _fast_overlay):
+    """🔴 复审实测过的场景：半透明网址水印被 OCR 认成多种变体。必须归成同一类、
+    判为水印，且不能被当成"不断变化的字幕"算进硬字幕。"""
+    scan, _ = d.detect_overlays(_make_overlay_video(tmp_path, "semi_wm"))
+    assert scan["reasons"] == ["watermark"], scan
+    assert len(scan["watermark_texts"]) == 1
+    assert "freemovies" in scan["watermark_texts"][0]["text"]
+    assert scan["distinct_texts"] == 0, "常驻文字必须从硬字幕统计里剔除"
+
+
+@_needs_ocr
+def test_overlay_detector_flags_graphic_corner_logo(tmp_path, _fast_overlay):
+    """没有文字的角落台标 OCR 认不出，靠静止边缘分析抓。"""
+    scan, evidence = d.detect_overlays(_make_overlay_video(tmp_path, "logo_graphic"))
+    assert scan["reasons"] == ["watermark"], scan
+    x, y, _, _ = scan["watermark_logo"]["bbox"]
+    assert x > 0.75 and y < 0.22, "应定位在右上角"
+    assert evidence, "纯图形台标也要留证据截图"
+
+
+@_needs_ocr
+def test_overlay_detector_keeps_letterbox_and_fixed_camera_films(tmp_path, _fast_overlay):
+    """防误杀：宽银幕黑边分界线横贯全宽、固定机位里的招牌与门框也常驻不动，
+    但都不是叠加物，必须判 clean。"""
+    letterbox, _ = d.detect_overlays(_make_overlay_video(tmp_path, "letterbox"))
+    assert letterbox["verdict"] == "clean", letterbox
+    static, _ = d.detect_overlays(_make_overlay_video(tmp_path, "static_scene"))
+    assert static["verdict"] == "clean", static
+    assert static["watermark_logo"] is None
+
+
+def _fake_scene(monkeypatch, frame_boxes, duration=1000.0):
+    """让检测器"看到"给定的逐帧 OCR 结果（None 表示抽帧失败）。帧本身是逐帧随机的
+    噪声图（周边画面在变），保证不会抽出图形台标。"""
+    import numpy as np
+
+    rng = np.random.default_rng(5)
+    monkeypatch.setattr(d, "_probe_duration", lambda p: duration)
+    frames = iter(frame_boxes)
+    current = {}
+
+    def grab(path, ts):
+        # 采样阶段逐帧给出；之后的调用是证据截图重抽，返回带时间点的标记，
+        # 便于断言"证据确实取自触发判定的帧"。
+        current["boxes"] = next(frames, "EVIDENCE")
+        if current["boxes"] == "EVIDENCE":
+            return ("evidence", round(ts, 1))
+        if current["boxes"] is None:
+            return None
+        # 每帧一个随机灰度的纯色画面：周边像素随时间在变，但没有任何边缘，
+        # 不会凭空抽出台标或台标候选。
+        return np.full((180, 320, 3), int(rng.integers(0, 255)), np.uint8)
+
+    monkeypatch.setattr(d, "_grab_frame", grab)
+    monkeypatch.setattr(
+        d, "_ocr_text_boxes", lambda frame: [dict(b) for b in current["boxes"]]
+    )
+    monkeypatch.setattr(d, "HARDSUB_SAMPLE_FRAMES", len(frame_boxes))
+    monkeypatch.setattr(d, "WATERMARK_CHECK_ENABLED", True)
+
+
+def _sub_box(text):
+    """底部居中、字号正常的文字框（像字幕）。"""
+    return {"text": text, "x0": 0.35, "x1": 0.65, "y0": 0.88, "y1": 0.93}
+
+
+def _corner_box(text):
+    return {"text": text, "x0": 0.85, "x1": 0.95, "y0": 0.03, "y1": 0.07}
+
+
+_needs_cv2 = pytest.mark.skipif(not _ocr_available(), reason="需要 opencv / numpy")
+
+
+@_needs_cv2
+def test_hardsub_needs_both_hit_ratio_and_distinct_texts(monkeypatch):
+    """两条门槛缺一不可：文本多变但只零星出现（外语强制字幕）→ clean；
+    两者都满足 → hardsub。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_HIT_RATIO", 0.2)
+    monkeypatch.setattr(d, "HARDSUB_MIN_DISTINCT_TEXTS", 5)
+
+    _fake_scene(monkeypatch, [[_sub_box(f"line{i}abc")] for i in range(3)] + [[]] * 17)
+    assert d.detect_overlays("x.mp4")[0]["verdict"] == "clean"
+
+    _fake_scene(monkeypatch, [[_sub_box(t)] for t in
+                              ("alpha", "bravo", "charlie", "delta", "echoes", "foxtrot")]
+                + [[]] * 14)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["reasons"] == ["hardsub"]
+    assert scan["hit_ratio"] == 0.3 and scan["distinct_texts"] == 6
+
+
+@_needs_cv2
+def test_ocr_variants_of_one_watermark_collapse_into_one(monkeypatch):
+    """🔴 同一串水印字的 OCR 变体必须归为一类：判水印，且不计入硬字幕的不同文本数。"""
+    variants = ["wwwfreemovieshdcom", "wwfreemovieshdcom", "vwwfreemovieshdco",
+                "wfreemovieshdcom", "wwwfreemovieshdcon"]
+    _fake_scene(monkeypatch, [[_sub_box(variants[i % 5])] for i in range(20)])
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["reasons"] == ["watermark"], scan
+    assert len(scan["watermark_texts"]) == 1
+    assert scan["distinct_texts"] == 0 and scan["hits"] == 0
+
+
+@_needs_cv2
+def test_subtitles_under_a_corner_watermark_are_both_reported(monkeypatch):
+    """水印与真字幕同时存在：两项都要判出来（reasons 列全，判死记 hardsub）。"""
+    lines = ["alpha", "bravo", "charlie", "delta", "echoes", "foxtrot", "golfer", "hotels"]
+    boxes = [[_corner_box("piratesite")] + ([_sub_box(lines[i // 2])] if i < 16 else [])
+             for i in range(20)]
+    _fake_scene(monkeypatch, boxes)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["reasons"] == ["hardsub", "watermark"]
+    assert scan["verdict"] == "hardsub+watermark"
+
+
+@_needs_cv2
+def test_recurring_scene_sign_at_varying_positions_is_not_a_watermark(monkeypatch):
+    """🔴 防误杀：剧情里反复出现的招牌（四成镜头都拍得到，但每个镜头位置不同）不是
+    水印——水印钉在固定位置。复审实测：不看位置时它会被判成水印、整片删除。"""
+    import random
+
+    random.seed(1)
+    boxes = []
+    for i in range(20):
+        if i % 5 in (0, 2):
+            x, y = random.uniform(0.05, 0.7), random.uniform(0.1, 0.6)
+            boxes.append([{"text": "joesdiner", "x0": x, "x1": x + 0.2,
+                           "y0": y, "y1": y + 0.05}])
+        else:
+            boxes.append([])
+    _fake_scene(monkeypatch, boxes)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["verdict"] == "clean", scan
+    assert scan["roaming_texts"][0]["text"] == "joesdiner", "记进台账供校准"
+    assert scan["near_miss"] == ["watermark"], "常驻文字没判成水印 → 临门槛，存截图人工核对"
+
+
+@_needs_cv2
+def test_fixed_watermark_with_occasional_ocr_misses_is_still_caught(monkeypatch):
+    """固定位置的水印，即便部分帧 OCR 没认出（或框略有抖动），只要在同一处的帧
+    仍够门槛就判水印。"""
+    boxes = []
+    for i in range(20):
+        if i % 4 == 3:
+            boxes.append([])  # OCR 漏认
+        else:
+            jitter = 0.01 * (i % 3)
+            boxes.append([{"text": "piratesite", "x0": 0.80 + jitter, "x1": 0.95 + jitter,
+                           "y0": 0.03, "y1": 0.07}])
+    _fake_scene(monkeypatch, boxes)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["reasons"] == ["watermark"], scan
+    assert scan["watermark_texts"][0]["presence"] == 0.75
+
+
+def _sample_ts(index, count, duration=1000.0):
+    start, end = d._OVERLAY_SPAN
+    return round(duration * (start + (end - start) * (index + 0.5) / count), 1)
+
+
+@_needs_cv2
+def test_hardsub_evidence_comes_from_subtitle_hit_frames(monkeypatch):
+    """证据截图必须取自触发判定的字幕命中帧（复审实测：旧逻辑存下的是"任何有字的帧"，
+    361227 的截图里有一张是公交车车身上的字，不是字幕）。"""
+    hits = [2, 5, 9, 13, 17, 19]
+    lines = ["alpha", "bravo", "charlie", "delta", "echoes", "foxtrot"]
+    boxes = [[] for _ in range(20)]
+    boxes[0] = [{"text": "sanisidrosrl", "x0": 0.4, "x1": 0.9, "y0": 0.2, "y1": 0.3}]  # 场景字
+    for line, index in zip(lines, hits):
+        boxes[index] = [_sub_box(line)]
+    _fake_scene(monkeypatch, boxes)
+    scan, evidence = d.detect_overlays("x.mp4")
+    assert scan["reasons"] == ["hardsub"]
+    expected = [_sample_ts(i, 20) for i in (2, 9, 13, 19)]  # 6 个命中帧里均匀挑 4 个
+    assert [e[1] for e in evidence] == expected == scan["evidence_times"]
+
+
+@_needs_cv2
+def test_watermark_evidence_comes_from_watermark_frames(monkeypatch):
+    """文字水印的证据取自水印所在帧，不取没有水印的帧。"""
+    boxes = [[] for _ in range(4)] + [[_corner_box("piratesite")] for _ in range(16)]
+    _fake_scene(monkeypatch, boxes)
+    scan, evidence = d.detect_overlays("x.mp4")
+    assert scan["reasons"] == ["watermark"]
+    no_watermark = {_sample_ts(i, 20) for i in range(4)}
+    assert evidence and not ({e[1] for e in evidence} & no_watermark)
+
+
+@_needs_cv2
+def test_near_miss_hardsub_is_flagged_with_evidence(monkeypatch):
+    """复审实测的漏判形态（626979：占比 0.15 < 0.2，但成句的不同文本有 14 条）：
+    不判死，但标 near_miss 并按命中帧存截图，供人工核对。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_HIT_RATIO", 0.2)
+    monkeypatch.setattr(d, "HARDSUB_MIN_DISTINCT_TEXTS", 5)
+    boxes = [[] for _ in range(20)]
+    for index, line in zip((3, 8, 14), ("alpha", "bravo", "charlie")):
+        boxes[index] = [_sub_box(line)]
+    _fake_scene(monkeypatch, boxes)
+    scan, evidence = d.detect_overlays("x.mp4")
+    assert scan["verdict"] == "clean" and scan["near_miss"] == ["hardsub"]
+    assert [e[1] for e in evidence] == [_sample_ts(i, 20) for i in (3, 8, 14)]
+
+
+@_needs_cv2
+def test_clean_film_grabs_no_evidence(monkeypatch):
+    """干净且不临门槛的片不重抽任何截图（省一次次 ffmpeg 调用）。"""
+    _fake_scene(monkeypatch, [[] for _ in range(20)])
+    scan, evidence = d.detect_overlays("x.mp4")
+    assert scan["verdict"] == "clean" and scan["near_miss"] == []
+    assert evidence == [] and scan["evidence_times"] == []
+
+
+@_needs_cv2
+def test_logo_peak_ignores_letterbox_lines():
+    """复审实测：宽银幕片的"角落边缘常驻比例"被黑边分界线抬到 0.9，画面里却没有台标。
+    统计这个校准值时必须先剔除分界线（判定本就剔除了，记账也要同口径）。"""
+    import cv2
+    import numpy as np
+
+    rng = np.random.default_rng(3)
+    grays = []
+    for _ in range(30):
+        frame = cv2.GaussianBlur(
+            cv2.resize(rng.integers(0, 255, (17, 30), dtype=np.uint8), (480, 270)), (0, 0), 3
+        )
+        frame[:33] = 0
+        frame[-33:] = 0
+        grays.append(frame)
+    stack = np.stack(grays).astype(np.float32)
+    logo, peak, near = d._find_static_logo(grays, stack.std(axis=0), stack.mean(axis=0))
+    assert logo is None and near is False
+    assert peak < d.WATERMARK_LOGO_PRESENCE * d._NEAR_MISS_LOGO_FRACTION, peak
+
+
+def _line(text, cx, y1, h=0.05, w=0.3):
+    """一行文字框：给定水平中心、底边位置与字高（均为相对整帧的比例）。"""
+    return {"text": text, "x0": cx - w / 2, "x1": cx + w / 2, "y0": y1 - h, "y1": y1}
+
+
+_INTERVIEW_LINES = ["alphaline", "bravoline", "charlieline", "deltaline", "echoline",
+                    "foxtrotline", "golfline", "hotelline", "indialine", "julietline"]
+
+
+@_needs_cv2
+def test_aligned_subtitles_with_low_total_ratio_are_hardsub(monkeypatch):
+    """🔴 实测漏判（626979，字幕纪录片）：对白断续，像字幕的帧只占 0.167 < 0.2，总量规则
+    判不出；但居中命中帧的最下行字幕都落在同一条基线上（0.92~0.96）。基线对齐规则
+    （对齐帧占比 ≥ 0.08 且文本 ≥ 5）必须把它判成硬字幕。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_HIT_RATIO", 0.2)
+    monkeypatch.setattr(d, "HARDSUB_MIN_ALIGNED_RATIO", 0.08)
+    monkeypatch.setattr(d, "HARDSUB_MIN_DISTINCT_TEXTS", 5)
+    boxes = [[] for _ in range(60)]
+    aligned = {1: 0.954, 19: 0.956, 26: 0.931, 49: 0.919, 52: 0.958, 59: 0.921}
+    for k, (index, y1) in enumerate(aligned.items()):
+        boxes[index] = [_line(_INTERVIEW_LINES[k], 0.5, y1)]
+    # 跟着偏右的档案画面走的字幕行：不居中，不计入对齐
+    for index, line in zip((17, 28, 36), _INTERVIEW_LINES[6:9]):
+        boxes[index] = [_line(line, 0.66, 0.9)]
+    _fake_scene(monkeypatch, boxes)
+    scan, evidence = d.detect_overlays("x.mp4")
+    assert scan["reasons"] == ["hardsub"], scan
+    assert scan["hit_ratio"] == 0.15 and scan["aligned_hits"] == 6
+    assert abs(scan["subtitle_baseline"] - 0.9425) < 0.001
+    aligned_ts = {_sample_ts(i, 60) for i in aligned}
+    assert {e[1] for e in evidence} <= aligned_ts, "证据优先取基线对齐的字幕帧"
+
+
+@_needs_cv2
+def test_scattered_scene_text_is_not_aligned(monkeypatch):
+    """🔴 防误杀（1054835 / 1380168：商品包装、卡片、日期戳）：底部区域的字位置五花八门，
+    对不齐基线，不能因为基线规则的门槛低就被判死；总量够临门槛则只存截图。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_HIT_RATIO", 0.2)
+    monkeypatch.setattr(d, "HARDSUB_MIN_ALIGNED_RATIO", 0.08)
+    boxes = [[] for _ in range(60)]
+    scattered = [(3, 0.473, 0.794), (17, 0.36, 0.757), (19, 0.335, 0.844),
+                 (28, 0.647, 0.854), (33, 0.499, 0.996), (59, 0.514, 0.95)]
+    for (index, cx, y1), line in zip(scattered, _INTERVIEW_LINES):
+        boxes[index] = [_line(line, cx, y1)]
+    _fake_scene(monkeypatch, boxes)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["verdict"] == "clean", scan
+    assert scan["aligned_hits"] <= 2
+    assert scan["near_miss"] == ["hardsub"], "总量够临门槛：存截图人工核对，不判死"
+
+
+@_needs_cv2
+def test_aligned_rule_still_needs_distinct_texts(monkeypatch):
+    """同一句居中文字反复出现（片中固定标语、重复字卡）对得齐基线，但只有一类文本，
+    不是字幕。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_ALIGNED_RATIO", 0.08)
+    monkeypatch.setattr(d, "HARDSUB_MIN_DISTINCT_TEXTS", 5)
+    boxes = [[] for _ in range(60)]
+    for index in (2, 9, 15, 23, 31, 44):
+        boxes[index] = [_line("samecaption", 0.5, 0.93)]
+    _fake_scene(monkeypatch, boxes)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["verdict"] == "clean" and scan["aligned_hits"] == 6
+    assert scan["aligned_distinct"] == 1
+
+
+def test_judge_hardsub_is_a_pure_function_usable_offline(monkeypatch):
+    """_judge_hardsub 不抽帧、不 OCR，只吃文字框：离线校准与线上判定共用同一份逻辑。"""
+    monkeypatch.setattr(d, "HARDSUB_MIN_HIT_RATIO", 0.2)
+    monkeypatch.setattr(d, "HARDSUB_MIN_ALIGNED_RATIO", 0.08)
+    monkeypatch.setattr(d, "HARDSUB_MIN_DISTINCT_TEXTS", 5)
+    frames = [[] for _ in range(20)]
+    for k, index in enumerate((1, 4, 8, 12, 17)):
+        frames[index] = [dict(_line(_INTERVIEW_LINES[k], 0.505, 0.905), cluster=k)]
+    result = d._judge_hardsub(frames, set(), 20)
+    assert result["is_hardsub"] is True
+    assert result["aligned_indexes"] == [1, 4, 8, 12, 17]
+    assert result["baseline"] == 0.905
+
+
+@_needs_cv2
+def test_short_persistent_text_is_not_a_watermark(monkeypatch):
+    """太短的常驻文字（"ok"）不拿来判水印；但它仍不算字幕。"""
+    _fake_scene(monkeypatch, [[_sub_box("ok")] for _ in range(20)])
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["verdict"] == "clean" and scan["hits"] == 0
+
+
+@_needs_cv2
+def test_watermark_judgement_can_be_switched_off(monkeypatch):
+    _fake_scene(monkeypatch, [[_corner_box("piratesite")] for _ in range(20)])
+    monkeypatch.setattr(d, "WATERMARK_CHECK_ENABLED", False)
+    scan = d.detect_overlays("x.mp4")[0]
+    assert scan["verdict"] == "clean"
+    assert scan["watermark_texts"], "关掉的是判定，检测结果仍记进台账供校准"
+
+
+@_needs_cv2
+def test_overlay_is_unknown_when_duration_or_frames_missing(monkeypatch):
+    """读不到片长、或抽到的帧不足一半 → unknown（调用方按没有放行）。"""
+    monkeypatch.setattr(d, "_probe_duration", lambda p: None)
+    assert d.detect_overlays("x.mp4")[0]["verdict"] == "unknown"
+
+    _fake_scene(monkeypatch, [None] * 15 + [[]] * 5)
+    assert d.detect_overlays("x.mp4")[0]["verdict"] == "unknown"
+
+
+@_needs_ocr
+def test_ocr_self_test_recognizes_the_probe_text():
+    """预检自检在真 OCR 上必须能认出测试文字，否则预检会把正常机器拦下。"""
+    recognized, texts = d._ocr_self_test()
+    assert recognized, texts
+
+

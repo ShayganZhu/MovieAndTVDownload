@@ -892,3 +892,68 @@ def test_worker_does_not_set_halted_on_normal_completion(monkeypatch):
     assert not worker.halted.is_set()
     worker.shutdown()
     assert not worker.halted.is_set()
+
+
+# 以下移植自电影侧 88290a6（中断即停取流）。
+@pytest.fixture(autouse=True)
+def _private_interrupt_flag(monkeypatch):
+    """每个用例一个独立的中断信号。p.main() 会起盯着它的看门线程，而用例常把
+    FetchWorker.shutdown 桩掉、看门线程就不会退出；让它盯全局信号的话，别的用例
+    置位全局信号时它会醒来往那个用例的输出里打印。"""
+    monkeypatch.setattr(p.downloader, "interrupted", threading.Event())
+
+
+# ------------------------------------------------- 中断即停取流（2026-10-27，08 号机）
+
+def _wait_until(predicate, timeout=2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_stop_on_interrupt_sets_stop_as_soon_as_interrupted():
+    stop, interrupted = threading.Event(), threading.Event()
+    watcher = p.stop_on_interrupt(stop, interrupted, poll_seconds=0.02)
+    assert not stop.is_set()
+    interrupted.set()
+    assert _wait_until(stop.is_set), "收到中断后停止信号没有置位"
+    assert _wait_until(lambda: not watcher.is_alive())
+
+
+def test_stop_on_interrupt_watcher_exits_after_normal_shutdown():
+    """正常收尾（shutdown 置位 stop）后看门线程随之退出，不留线程。"""
+    stop, interrupted = threading.Event(), threading.Event()
+    watcher = p.stop_on_interrupt(stop, interrupted, poll_seconds=0.02)
+    stop.set()
+    assert _wait_until(lambda: not watcher.is_alive())
+    assert not interrupted.is_set()
+
+
+def test_main_stops_fetch_and_refetch_while_downloader_is_still_unwinding(monkeypatch):
+    """🔴 08 号机：kill -INT 后下载侧收尾等了 35 分钟，取流侧这段时间（电影侧）又判了 830 部无源、
+    异步重取也照常换链接——它们的停止信号要到 downloader.main() 返回后的 shutdown 才置位。
+    现在中断一到就停，不等下载侧收完尾。"""
+    monkeypatch.setattr(p.sys, "argv", ["pipeline.py"])
+    monkeypatch.setattr(p.fetcher, "_parse_args", lambda argv: None)
+    monkeypatch.setattr(p.FetchWorker, "start", lambda self: None)
+    monkeypatch.setattr(p.FetchWorker, "shutdown", lambda self, timeout=None: None)
+    monkeypatch.setattr(p.AsyncRefetcher, "start", lambda self: None)
+    monkeypatch.setattr(p.downloader, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(p.downloader, "interrupted", threading.Event())
+    seen = {}
+
+    def downloader_main_interrupted():
+        refetcher = p.downloader.async_refetch_hook
+        p.downloader.interrupted.set()      # 信号处理器会做的事
+        # 下载侧还在收尾（还没返回）：取流 / 异步重取的停止信号此刻就该置位。
+        seen["stopped_while_unwinding"] = _wait_until(refetcher._stop.is_set)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(p.downloader, "main", downloader_main_interrupted)
+    assert p.main() == 130
+    assert seen["stopped_while_unwinding"] is True
+
+

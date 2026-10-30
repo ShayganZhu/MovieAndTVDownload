@@ -516,6 +516,28 @@ class AsyncRefetcher:
         print(f"  [重取成功] {key}: {len(result['urls'])} 个新节点", flush=True)
 
 
+def stop_on_interrupt(stop_event, interrupted, poll_seconds=0.5):
+    """收到中断信号即置位 stop_event（取流线程与异步重取共用的停止信号）。
+
+    为什么不能等 shutdown()（电影侧 88290a6，2026-10-27 08 号机 kill -INT 后 35 分钟仍没
+    退出）：shutdown 在 downloader.main() 返回之后才调，而下载侧收尾要等在跑的下载线程，
+    这段时间里取流侧照常开新请求（电影侧又判了 830 部无源），异步重取也照常换链接。
+    中断处理器在信号上下文里只置位 interrupted，这里用一个看门线程转发，
+    不在信号处理器里碰别的锁。stop_event 被 shutdown() 置位后看门线程随之退出。
+    """
+    def _watch():
+        while not stop_event.is_set():
+            if interrupted.wait(poll_seconds):
+                print("\n[pipeline] 收到中断信号，取流与异步重取立即停止发起新请求",
+                      flush=True)
+                stop_event.set()
+                return
+
+    thread = threading.Thread(target=_watch, name="interrupt-watch", daemon=True)
+    thread.start()
+    return thread
+
+
 def main():
     argv = sys.argv[1:]
     if "--recheck-dead" in argv:
@@ -600,6 +622,7 @@ def main():
     downloader.ListEntrySource = source_factory
 
     started = time.time()
+    stop_on_interrupt(worker._stop, downloader.interrupted)
     worker.start()
     interrupted = False
     try:

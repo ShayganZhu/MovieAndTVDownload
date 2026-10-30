@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import difflib
 import json
 import importlib
 import functools
@@ -9,6 +10,7 @@ import os
 import math
 import random
 import re
+import statistics
 import shutil
 import signal
 import subprocess
@@ -279,6 +281,34 @@ TEMP_DIR = resolve_dir(_CFG.get("temp_dir"), "temp")
 SAMPLE_COUNT = int(_CFG.get("sample_count", 10))
 SEG_RETRY_MAX = int(_CFG.get("seg_retry_max", 20))
 SEG_RETRY_DELAY = float(_CFG.get("seg_retry_delay", 1))
+# HLS 分片 403 的"临时风控"重试（电影侧 717939f/4d48ba9/cf5755f 移植；vidup/vidfast 的流同样落在
+# sun.finalsignal.top / moon.goldenkite.top，2026-10-29 实测）。以下为电影侧 2026-10-27 06 号机 videasy /r6/ 实测：
+# sun.finalsignal.top/r6/ 在负载下随机回 Cloudflare 403（同一分片前后两次请求一次 200 一次 403，
+# 三种请求头都 403 的分片 20–30 秒后恢复 200）。分片 403 原本一律按"签名过期"第 1 次就放弃，
+# 于是每部片零散丢 7%–16% 的分片、整片因缺片率超标失败。
+# 现在同一部片里别的分片还在正常下（判别见 _Segment403Tracker）时，403 按 seg_403_retry_delay
+# 起指数退避（封顶 _SEG_403_RETRY_DELAY_MAX）重试至多 seg_403_retry_max 次；
+# 一直没有成功、403 攒够 seg_403_expired_after 次则仍按签名过期快速放弃、转重取。
+# seg_403_retry_max 设 0 即回到旧行为。
+# 4s 起 5 次 → 1s 起 8 次（2026-10-27，06 号机 bb5382a 4 小时实测）：等 4/8/16/30 秒后仍 403 的
+# 比例是 37%/45%/48%/47%——等得再久也只救回一半，长退避只是让分片槽空等（平均约 50 个），
+# 5 次用完还丢了 1470 个分片（31 部上传的片缺 5 片以上）。短起步省空等，多几次补回缺片。
+SEG_403_RETRY_MAX = max(0, int(_CFG.get("seg_403_retry_max", 8)))
+SEG_403_RETRY_DELAY = float(_CFG.get("seg_403_retry_delay", 1))
+SEG_403_EXPIRED_AFTER = max(1, int(_CFG.get("seg_403_expired_after", 8)))
+_SEG_403_RETRY_DELAY_MAX = 30.0
+# 本片最近一次分片成功距今不超过这么久，才算"别的分片还在正常下"。
+# 比单分片的 403 退避总长（1+2+4+8+16+30+30+30 ≈ 2 分钟）短：token 中途过期时，最多白等这么久就转重取。
+_SEG_403_RECENT_OK_SECONDS = 60.0
+# HLS 分片返回 HTML 页面的"临时拦截"重试（2026-10-27，06/08 号机 videasy /r6/ 实测）：
+# sun.finalsignal.top/r6/ 除了随机 403，还会零星把单个分片换成 HTML 页面（HTTP 200），同片别的分片照常
+# 是视频数据。原先一律按"无效源"第 1 次就丢片：06 号机 4d48ba9 一轮丢的 183 个分片里 155 个是它（全在
+# /r6/），206 部上传的片有 40 部带缺片。现在与 403 共用本片的 _Segment403Tracker：同片别的分片还在
+# 正常下时，按 seg_html_retry_delay 起指数退避（封顶 _SEG_403_RETRY_DELAY_MAX）重试至多
+# seg_html_retry_max 次（与 403 各算各的）；整片都回 HTML（真无效源）时仍快速放弃、换节点。
+# 返回 m3u8 的不在此列：那是链接本身指错了，重试必然复现。seg_html_retry_max 设 0 即回到旧行为。
+SEG_HTML_RETRY_MAX = max(0, int(_CFG.get("seg_html_retry_max", 8)))
+SEG_HTML_RETRY_DELAY = float(_CFG.get("seg_html_retry_delay", 1))
 # 采样阶段的分片重试预算，与正片**分层**。
 #
 # 采样只是为了测码率/分辨率来决定"这条候选流要不要"，探不到就换下一条流即可，
@@ -301,6 +331,47 @@ SAMPLE_SEG_RETRY_MAX = max(1, int(_CFG.get("sample_seg_retry_max", 5)))
 # 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒内完成，给足冗余防坏 TS
 # 让 ffmpeg 无限阻塞占死 convert worker。超时判失败(可重试)，不拖垮转封装池。
 CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
+# 转封装时剥除隐藏字幕（CEA-608/708，ATSC A/53）。业务口径：成品里不要任何
+# 字幕，但**只剥不剔**——这类字幕不在画面里，去掉它对剧集零损失，不值得为它
+# 丢集。详见 convert_ts_to_mp4（与电影侧 bc1f621 同一改动）。
+STRIP_CLOSED_CAPTIONS = bool(_CFG.get("strip_closed_captions", True))
+# 画面叠加物检测：硬字幕（烧在画面里的字幕）+ 水印（文字水印、台标）。业务口径：
+# 带硬字幕或水印的**版本**一概不要——检出即就地删除、不上传；这一集还有没试过的
+# 节点（别的版本）就换节点重下，所有版本都检出才整集判死（电影侧 2026-10-24 起的口径，
+# 2026-10-30 移植；见 OVERLAY_RETRY_OTHER_NODES）。**每一集单独检测、只处理这一集**：
+# 一集检出不连累同剧其它集（用户 2026-10-30 定的口径，误报不扩散）。
+# 检测放在转封装之后、移入成品目录之前（下载后检测）：先拿到真实比例，再决定要不要
+# 挪到下载前。两者共用一套抽帧，配置都在 hardsub_check 段。详见 inspect_overlays。
+_HARDSUB_CFG = _CFG.get("hardsub_check", {}) or {}
+# 总开关：关掉则硬字幕与水印都不检测（不抽帧）。
+HARDSUB_CHECK_ENABLED = bool(_HARDSUB_CFG.get("enabled", True))
+# kill = 检出即删除并判死；record = 只检测、记台账与证据帧，照常交付（校准门槛用）。
+HARDSUB_ACTION = str(_HARDSUB_CFG.get("action", "kill")).strip().lower()
+# 水印判定开关（在总开关打开时才生效）与两条常驻门槛：同一串文字 / 角落里同一个
+# 静止图形，出现在不少于该比例的抽样帧里才算水印。
+WATERMARK_CHECK_ENABLED = bool(_HARDSUB_CFG.get("watermark_enabled", True))
+WATERMARK_TEXT_PRESENCE = float(_HARDSUB_CFG.get("watermark_text_presence", 0.3))
+WATERMARK_LOGO_PRESENCE = float(_HARDSUB_CFG.get("watermark_logo_presence", 0.8))
+HARDSUB_SAMPLE_FRAMES = max(1, int(_HARDSUB_CFG.get("sample_frames", 60)))
+HARDSUB_MIN_HIT_RATIO = float(_HARDSUB_CFG.get("min_hit_ratio", 0.2))
+HARDSUB_MIN_DISTINCT_TEXTS = max(1, int(_HARDSUB_CFG.get("min_distinct_texts", 5)))
+HARDSUB_MIN_TEXT_SCORE = float(_HARDSUB_CFG.get("min_text_score", 0.8))
+# 基线对齐的字幕帧占比门槛（见 _judge_hardsub）：对白断续的片（纪录片访谈）字幕在屏
+# 时间少，总占比够不到 min_hit_ratio，但字幕行严格居中、底边落在同一条基线上，
+# 画面里的场景字做不到这一点，故可以用更低的占比门槛把它们抓出来。
+HARDSUB_MIN_ALIGNED_RATIO = float(_HARDSUB_CFG.get("min_aligned_hit_ratio", 0.08))
+HARDSUB_OCR_THREADS = max(1, int(_HARDSUB_CFG.get("ocr_threads", 2)))
+HARDSUB_SCAN_LOG = resolve_file(_HARDSUB_CFG.get("scan_log"), "hardsub_scan.jsonl")
+HARDSUB_EVIDENCE_DIR = resolve_dir(_HARDSUB_CFG.get("evidence_dir"), "hardsub_evidence")
+# 检出硬字幕/水印后先换这一集还没试过的节点重下，所有节点都检出才整集判死。
+# 关掉则回到「检出即整集判死、不再换节点」。电影侧 06/08/19 截至 10-24 判死的 818 部里，
+# 442 部还有没试过的节点（295 部在别的主机上），换个版本可能就是干净的。
+OVERLAY_RETRY_OTHER_NODES = bool(_HARDSUB_CFG.get("retry_other_nodes", True))
+# 节点级台账：每检出一个版本记一行（tmdbId/season/episode + 版本标识），跨运行生效——
+# 重启或重取回来的链接里，已检出的版本不会再下第二次。
+OVERLAY_NODE_REJECT_LOG = resolve_file(
+    _HARDSUB_CFG.get("node_reject_log"), "overlay_node_rejects.jsonl"
+)
 # playlist（master/media）解析阶段的请求重试：源站临时 5xx 抽风时，这一层
 # 若过早放弃会直接判整集失败。但预算也不能给太大 ——
 # 默认 4（2026-09-14 由 10 下调，与电影侧对齐）：退避指数增长、第 7 次起封顶
@@ -310,6 +381,13 @@ CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
 PLAYLIST_RETRY_MAX = int(_CFG.get("playlist_retry_max", 4))
 PLAYLIST_RETRY_BACKOFF = float(_CFG.get("playlist_retry_backoff", 1.0))
 PLAYLIST_RETRY_BACKOFF_MAX = float(_CFG.get("playlist_retry_backoff_max", 60.0))
+# playlist 的 403 先按临时风控短间隔重试（电影侧 4d48ba9 移植）：finalsignal /r6/ 的 master / media
+# playlist 与分片一样随机回 Cloudflare 403（电影侧 06 号机 4 小时：347 部片因此整片失败、
+# 158 条流在采样阶段出局，全被当成签名过期转重取）。从 playlist_403_retry_delay 秒起
+# 指数退避重试至多 playlist_403_retry_max 次（1+2+4 ≈ 7 秒），不占 playlist_retry_max；
+# 还是 403 才按签名过期转重取——真过期的集只多花这几秒。设 0 回到旧行为。
+PLAYLIST_403_RETRY_MAX = max(0, int(_CFG.get("playlist_403_retry_max", 3)))
+PLAYLIST_403_RETRY_DELAY = float(_CFG.get("playlist_403_retry_delay", 1.0))
 # 方案C 分阶重试：多节点 fallback 时，非末节点用更小的 playlist 重试次数，
 # 坏节点快速判定并换下一个备用节点；末节点/单节点仍用 PLAYLIST_RETRY_MAX 死磕。
 PLAYLIST_RETRY_FALLBACK = int(_CFG.get("playlist_retry_fallback", 3))
@@ -616,6 +694,25 @@ class QualityRejectedError(RuntimeError):
 # 一个**的局部信号，只能在"这一集判失败"时打断自己；进程级中断需要这个全局的。
 # 两层并存不冲突：块层同时看 abort_event 与 interrupted，任一置位即放弃退避。
 interrupted = threading.Event()
+_INTERRUPTED_ERROR = "已取消（收到中断信号）"
+# 等在途任务时顺带看一眼中断信号的间隔（秒）：用于那些"在途任务自己不认中断"的等待。
+_INTERRUPT_POLL_SECONDS = 1.0
+
+
+class DownloadInterrupted(RuntimeError):
+    """收到中断信号后，下载线程主动收手时抛出：一路穿过"换下一条流 / 下一个节点"
+    的兜底，直接结束本集（按可重试处理，下次运行照常重下）。
+
+    为什么光让退避可打断还不够（电影侧 88290a6，2026-10-27 08 号机 kill -INT 后 35 分钟
+    仍没退出）：`with ThreadPoolExecutor` 收尾要等在跑的下载线程全部返回，而下载线程并不
+    收手——剩下的分片被逐个投出去再逐个判"已取消"，整集随即以"缺片率过高"失败、换下一个
+    节点，接着请求播放列表、采样、预检 mp4。文案不在任何判死 / 需重取表里。
+    """
+
+
+def _raise_if_interrupted(what=""):
+    if interrupted.is_set():
+        raise DownloadInterrupted(f"{what}{_INTERRUPTED_ERROR}")
 
 
 # 并发开大后用于观察是否被源站风控：统计 403/429/503 的出现次数。
@@ -872,6 +969,15 @@ def _raise_if_hls_host_tripped(url, what):
 # 注意 429/503 不在此列——它们是限流/临时不可用，退避后有很大概率成功，
 # 属于"必须重试"的一类，与本集合语义相反。
 _NO_RETRY_HTTP_STATUS = frozenset({401, 403, 404, 410, 416})
+# 确定性失败里**属于"签名过期、换条新链接就能救"**的那部分（电影侧 2026-09-11 §12.27 移植）。
+# request_with_retry 对这几个额外挂 _NEEDS_REFETCH_MARKER，使 m3u8 链路也能
+# 进重取流闭环——此前该 marker 只在 mp4 直链的两个函数里挂，m3u8 的 token
+# 过期后会被判成普通确定性失败，重取永远挑不到它（vidup/vidfast 的链接约 3–4 小时失效）。
+#
+# 为什么是这三个而不是全部五个：
+#   401/403 鉴权失败、410 已删除 → 签名过期的典型表现，重取有意义；
+#   404 资源真不存在、416 Range 越界 → 换新签名仍是同样结果，重取纯浪费配额。
+_REFETCHABLE_HTTP_STATUS = frozenset({401, 403, 410})
 # 上述状态码抛出的错误统一带此标记，供各重试层快速短路（不必解析 HTTP 文案，
 # 也不依赖 requests/urllib3 的具体措辞，跨层稳定）。
 _HTTP_PERMANENT_MARKER = "确定性HTTP失败"
@@ -950,7 +1056,7 @@ def get_session():
 
 def request_with_retry(
     method, url, retries=3, backoff=0.5, backoff_max=45.0, as_text=False,
-    **kwargs
+    retry_403=0, retry_403_delay=1.0, **kwargs
 ):
     """发起 HTTP 请求；成功时返回 str 或 bytes。
 
@@ -960,6 +1066,11 @@ def request_with_retry(
     确定性 HTTP 失败（401/403/404/410/416）不重试：这类结果重试必然复现，
     白等十几分钟退避只会拖慢换下一个取流节点。抛出的错误带确定性标记，
     供上层继续短路。
+
+    retry_403 / retry_403_delay（播放列表用，电影侧 4d48ba9 移植）：403 先按临时风控以
+    retry_403_delay 起指数退避重试至多 retry_403 次，不占 retries 的名额；还是 403
+    才照上面的确定性失败处理。默认 0 = 不重试（分片层 retries=1 调用本函数，403 由
+    download_single_segment 自己按整集判别）。
     """
     session = get_session()
     kwargs.setdefault("timeout", 30)
@@ -969,7 +1080,9 @@ def request_with_retry(
     request_headers.update(kwargs.pop("headers", {}) or {})
 
     last_error = None
-    for attempt in range(retries):
+    forbidden_retries = 0
+    attempt = 0
+    while attempt < retries:
         try:
             with session.request(
                 method, url, headers=request_headers, **kwargs
@@ -986,20 +1099,42 @@ def request_with_retry(
             status = _status_of(exc)
             if status in (403, 429, 503):
                 record_block_status(status)
+            if status == 403 and forbidden_retries < retry_403:
+                forbidden_retries += 1
+                wait = retry_403_delay * (2 ** (forbidden_retries - 1))
+                wait += random.uniform(0, min(1.0, wait * 0.2))
+                print(
+                    f"  请求 HTTP 403，按临时风控重试 ({forbidden_retries}/{retry_403})，"
+                    f"{wait:.1f}s 后重试: {url}"
+                )
+                # 可打断的退避：中断信号一到立刻收手（电影侧 88290a6 同一口径）。
+                if interrupted.wait(wait):
+                    raise DownloadInterrupted(f"请求{_INTERRUPTED_ERROR}: {url}") from exc
+                continue
             if status in _NO_RETRY_HTTP_STATUS:
+                # 签名过期型（401/403/410）额外挂重取 marker，让 m3u8 链路
+                # 也能进重取流闭环（见 _REFETCHABLE_HTTP_STATUS）。404/416 有意不挂。
+                suffix = (
+                    f"，{_NEEDS_REFETCH_MARKER}"
+                    if status in _REFETCHABLE_HTTP_STATUS else ""
+                )
                 raise RuntimeError(
-                    f"请求失败({_HTTP_PERMANENT_MARKER} HTTP {status}): {url}; {exc}"
+                    f"请求失败({_HTTP_PERMANENT_MARKER} HTTP {status})"
+                    f"{suffix}: {url}; {exc}"
                 ) from exc
-            if attempt == retries - 1:
+            attempt += 1
+            if attempt >= retries:
                 break
-            wait = min(backoff * (2**attempt), backoff_max)
+            wait = min(backoff * (2 ** (attempt - 1)), backoff_max)
             wait += random.uniform(0, min(1.0, wait * 0.2))
             status_hint = f"HTTP {status}" if status else type(exc).__name__
             print(
-                f"  请求重试 {attempt + 1}/{retries - 1} ({status_hint})，"
+                f"  请求重试 {attempt}/{retries - 1} ({status_hint})，"
                 f"{wait:.1f}s 后重试: {url}"
             )
-            time.sleep(wait)
+            # 可打断的退避：Ctrl+C / SIGTERM 后不再空等完退避（播放列表重试最长 60s）。
+            if interrupted.wait(wait):
+                raise DownloadInterrupted(f"请求{_INTERRUPTED_ERROR}: {url}") from exc
 
     raise RuntimeError(f"请求失败: {url}; {last_error}") from last_error
 
@@ -1692,6 +1827,37 @@ def load_dead_keys(threshold_fn=None):
     return dead
 
 
+def _latest_by_key(path):
+    """读 jsonl 台账，返回 集 key -> 该集最后一条记录（纯追加台账的读取口径）。"""
+    latest = {}
+    if not os.path.exists(path):
+        return latest
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            key = record_episode_key(record)
+            if key:
+                latest[key] = record
+    return latest
+
+
+def dead_breakdown(dead_keys):
+    """启动摘要用：把判死的集按原因拆开计数（取判死账本里该集的最后一条记录）。
+
+    判死账本里不止画质：下载后检出硬字幕/水印、临门槛人工 reject 的也在，
+    人工复核确认时长不符（truncated）的也在。没有 reason_class 的老记录都是画质判死。
+    """
+    latest = _latest_by_key(DOWNLOAD_DEAD_LOG)
+    kinds = [(latest.get(key) or {}).get("reason_class") for key in dead_keys]
+    hardsub, watermark = kinds.count("hardsub"), kinds.count("watermark")
+    truncated = kinds.count("truncated")
+    return (f"画质 {len(kinds) - hardsub - watermark - truncated} / 硬字幕 {hardsub} / 水印 {watermark}"
+            + (f" / 时长不符 {truncated}" if truncated else ""))
+
+
 def dead_record_passes_now(record):
     """当前配置门槛下，这条判死记录是否该被放回重试。
 
@@ -1717,6 +1883,11 @@ def dead_record_passes_now(record):
        模式 B 下 height 根本不参与计算，不必挡（挡了反而会把"未知分辨率"
        那批本该复判的记录永久关在门外）。
     """
+    # 硬字幕/水印/时长不符判死与画质门槛无关，调门槛救不回来：永不放回。
+    # （它们也没有码率依据，不先拦下的话会落进下面"没有依据 → 放回"那条。）
+    if record.get("reason_class") in ("hardsub", "watermark", "truncated"):
+        return False
+
     evidence = record.get("evidence") or {}
     bitrate = evidence.get("bitrate_kbps")
     if bitrate is None:
@@ -2697,6 +2868,8 @@ def parse_master_playlist(master_url, retries=None, headers=None):
         backoff=PLAYLIST_RETRY_BACKOFF,
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
         headers=headers,
+        retry_403=PLAYLIST_403_RETRY_MAX,
+        retry_403_delay=PLAYLIST_403_RETRY_DELAY,
     )
     lines = [line.strip() for line in text.splitlines()]
     variants = []
@@ -2751,6 +2924,8 @@ def parse_media_playlist(playlist_url, headers=None):
         backoff=PLAYLIST_RETRY_BACKOFF,
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
         headers=headers,
+        retry_403=PLAYLIST_403_RETRY_MAX,
+        retry_403_delay=PLAYLIST_403_RETRY_DELAY,
     )
     lines = [line.strip() for line in text.splitlines()]
     init_url = None
@@ -2873,8 +3048,11 @@ def probe_codec(sample_path):
     except (subprocess.SubprocessError, OSError):
         return None
 
-    codec = result.stdout.strip().lower()
-    return codec or None
+    # 只取第一行：TS 输入会被 ffprobe 打印两遍（节目段里再列一次同一条流，
+    # 实测输出 "h264\nh264"）。整段当编码名的话 normalize_codec 认不出，
+    # HLS 采样就一律退回 H.264 基准——HEVC 流被按更严的门槛误判。
+    lines = [line.strip().lower() for line in result.stdout.splitlines()]
+    return next((line for line in lines if line), None)
 
 
 def normalize_codec(codec):
@@ -2957,32 +3135,115 @@ def bitrate_reject_message(resolution, codec_label, bitrate, min_bitrate):
 
 
 # ---------- 分片下载 ----------
+class SegmentNotMediaError(RuntimeError):
+    """分片下回来的不是视频数据：kind 为 "html"（HTML 页面）或 "m3u8"（播放列表）。
+
+    文案仍以"服务器返回的不是视频分片"开头：_PERMANENT_FAILURE_MARKERS、
+    _MP4_CHUNK_NO_RETRY_MARKERS 与收尾统计都靠它归类（落盘后只剩字符串）。
+    summary 是 HTML 页面的一句话摘要，供日志说明源站回的到底是什么页。
+    """
+
+    def __init__(self, message, kind, summary=""):
+        super().__init__(message)
+        self.kind = kind
+        self.summary = summary
+
+
+_HTML_TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title", re.IGNORECASE | re.DOTALL)
+_HTML_SUMMARY_MAX_CHARS = 60
+
+
+def _html_page_summary(content):
+    """HTML 页面的一句话摘要：有标题取标题，没有就取去掉标签后的正文开头，附页面字节数。"""
+    head = content[:4096]
+    match = _HTML_TITLE_RE.search(head)
+    raw = match.group(1) if match else re.sub(rb"<[^>]*>", b" ", head)
+    text = " ".join(raw.decode("utf-8", errors="replace").split())
+    text = "".join(ch for ch in text if ch.isprintable())
+    if len(text) > _HTML_SUMMARY_MAX_CHARS:
+        text = text[:_HTML_SUMMARY_MAX_CHARS] + "…"
+    return f"{'标题' if match else '开头'}: {text or '（空）'}，{len(content)} 字节"
+
+
 def validate_segment_content(content, url):
     if not content:
         raise RuntimeError(f"服务器返回空分片: {url}")
 
     prefix = content[:256].lstrip().lower()
-    if prefix.startswith((b"<!doctype html", b"<html", b"#extm3u")):
-        raise RuntimeError(f"服务器返回的不是视频分片: {url}")
+    if prefix.startswith((b"<!doctype html", b"<html")):
+        summary = _html_page_summary(content)
+        raise SegmentNotMediaError(
+            f"服务器返回的不是视频分片（HTML 页面，{summary}）: {url}", "html", summary
+        )
+    if prefix.startswith(b"#extm3u"):
+        raise SegmentNotMediaError(f"服务器返回的不是视频分片（m3u8 播放列表）: {url}", "m3u8")
 
 
-def download_single_segment(url, index, retry_max, delay, headers=None):
+class _Segment403Tracker:
+    """一集（一次 download_segments）内分片被拒的判别：临时风控，还是链接 / 源失效。
+
+    "被拒"指 403，或 HTTP 200 却回了 HTML 页面（两者共用一个计数）。签名过期 /
+    无效源时整集的分片都被拒、一个也下不来；临时风控（如 finalsignal /r6/ 的
+    Cloudflare 403 与零星 HTML 页）只零散打掉一部分请求，同集别的分片照常成功。所以：
+      - 最近 _SEG_403_RECENT_OK_SECONDS 秒内本集有分片成功 → 临时风控，值得退避重试；
+      - 自上次成功以来被拒还不到 SEG_403_EXPIRED_AFTER 次 → 还判断不了，先重试；
+      - 否则（一直没成功、被拒已攒够）→ 快速放弃：403 交给重取流闭环，HTML 换节点。
+    中途 token 过期时，最近一次成功会在 _SEG_403_RECENT_OK_SECONDS 后变旧，
+    之后的被拒随即改判失效，最多白等这么久。线程安全：本集所有分片线程共用一个实例。
+    """
+
+    def __init__(self, expired_after=None, recent_ok_seconds=None, clock=time.monotonic):
+        self._lock = threading.Lock()
+        self._expired_after = expired_after or SEG_403_EXPIRED_AFTER
+        self._recent_ok_seconds = (
+            _SEG_403_RECENT_OK_SECONDS if recent_ok_seconds is None else recent_ok_seconds
+        )
+        self._clock = clock
+        self._last_ok = None
+        self._forbidden_since_ok = 0
+
+    def record_ok(self):
+        with self._lock:
+            self._last_ok = self._clock()
+            self._forbidden_since_ok = 0
+
+    def record_rejected(self):
+        """记一次分片被拒（403 / HTML 页），返回这次是否按临时风控重试（False = 判失效）。"""
+        with self._lock:
+            self._forbidden_since_ok += 1
+            if self._forbidden_since_ok < self._expired_after:
+                return True
+            return (
+                self._last_ok is not None
+                and self._clock() - self._last_ok <= self._recent_ok_seconds
+            )
+
+
+def download_single_segment(url, index, retry_max, delay, headers=None,
+                            forbidden_tracker=None):
     """下载单个 HLS 分片，失败按指数退避重试 retry_max 次。
 
     确定性失败（401/403/404/410/416，或源站返回 HTML/m3u8 而非视频数据）立即
     上抛、不再退避重试：这类结果重下必然复现，白等十几分钟只会占死下载窗口、
     延误换下一个取流节点。与 mp4 直链块层（_download_mp4_chunk）语义对齐。
 
+    例外是 403 和 HTML 页面：传了 forbidden_tracker（本集共用的 _Segment403Tracker）
+    且它判为临时风控时，403 按 SEG_403_RETRY_DELAY 起指数退避重试至多
+    SEG_403_RETRY_MAX 次，HTML 页面按 SEG_HTML_RETRY_DELAY 起至多
+    SEG_HTML_RETRY_MAX 次（两者各算各的，都占用 retry_max 的次数）；判为失效则照旧
+    立即上抛。返回 m3u8 一律立即上抛。
+
     全局 `interrupted` 置位（Ctrl+C / SIGTERM）时立即放弃：开跑前先看一眼，
     退避也用 `interrupted.wait()` 而非裸 sleep。否则 Ctrl+C 后每个 worker 都
     要把剩余重试跑完（最坏 20×60s），进程要拖十几分钟才退得掉——见该事件的注释。
     """
     last_error = None
+    rejected_retries = {"403": 0, "html": 0}
     for attempt in range(1, retry_max + 1):
         # 已中断：不再发起新请求。抛错让上层按"这一分片失败"处理，
         # 整集随之失败并被记为可重试，下次运行重下即可。
         if interrupted.is_set():
-            raise RuntimeError(f"分片 {index + 1} 已取消（收到中断信号）")
+            raise DownloadInterrupted(f"分片 {index + 1} {_INTERRUPTED_ERROR}")
         # 主机已熔断（本线程或别的线程刚触发）：不再发请求、不再退避，
         # 直接上抛让 download_segments 整集止损。
         _raise_if_hls_host_tripped(url, f"分片 {index + 1}")
@@ -2994,6 +3255,8 @@ def download_single_segment(url, index, retry_max, delay, headers=None):
             )
             validate_segment_content(content, url)
             _hls_host_record_result(url, 200)
+            if forbidden_tracker is not None:
+                forbidden_tracker.record_ok()
             return content
         except HostCircuitOpenError:
             raise
@@ -3011,10 +3274,42 @@ def download_single_segment(url, index, retry_max, delay, headers=None):
                     f"{_HLS_HOST_BLOCKED_MARKER}（{_host_of(url)}，HTTP {status}），"
                     f"分片 {index + 1} 不再重试: {url}"
                 ) from exc
+            # 被拒（403 / HTML 页）先交给本集的判别器：临时风控就退避重试，失效才落到
+            # 下面的确定性短路。判别器每次被拒都要记，所以放在次数检查之前。
+            if status == 403:
+                rejected = ("403", SEG_403_RETRY_MAX, SEG_403_RETRY_DELAY, "HTTP 403")
+            elif isinstance(exc, SegmentNotMediaError) and exc.kind == "html":
+                rejected = ("html", SEG_HTML_RETRY_MAX, SEG_HTML_RETRY_DELAY,
+                            f"返回 HTML 页面（{exc.summary}）")
+            else:
+                rejected = None
+            if (
+                rejected is not None
+                and forbidden_tracker is not None
+                and forbidden_tracker.record_rejected()
+                and rejected_retries[rejected[0]] < rejected[1]
+                and attempt < retry_max
+            ):
+                kind, kind_retry_max, kind_delay, what = rejected
+                rejected_retries[kind] += 1
+                wait = min(
+                    kind_delay * (2 ** (rejected_retries[kind] - 1)),
+                    _SEG_403_RETRY_DELAY_MAX,
+                )
+                wait += random.uniform(0, min(1.0, wait * 0.2))
+                print(
+                    f"    分片 {index + 1} {what}，同集其他分片正常，按临时风控重试 "
+                    f"({rejected_retries[kind]}/{kind_retry_max})，{wait:.1f}s 后重试"
+                )
+                if interrupted.wait(wait):
+                    raise DownloadInterrupted(
+                        f"分片 {index + 1} {_INTERRUPTED_ERROR}"
+                    ) from exc
+                continue
             if (
                 attempt == retry_max
                 or is_permanent_http_failure(exc)
-                # 源站返回 HTML/m3u8：通常是无效源，重试无意义。
+                # 源站返回 m3u8，或整集都回 HTML（无效源）/ HTML 重试用完：重试无意义。
                 or "服务器返回的不是视频分片" in message
             ):
                 break
@@ -3027,12 +3322,13 @@ def download_single_segment(url, index, retry_max, delay, headers=None):
             )
             # 可打断的退避：中断信号一到立刻醒来，不必空等完这一轮。
             if interrupted.wait(wait):
-                raise RuntimeError(
-                    f"分片 {index + 1} 已取消（收到中断信号）"
+                raise DownloadInterrupted(
+                    f"分片 {index + 1} {_INTERRUPTED_ERROR}"
                 ) from exc
 
+    # 次数写实际请求数：确定性失败第 1 次就 break，旧版照印 retry_max 会误报"重试 20 次"。
     raise RuntimeError(
-        f"分片 {index + 1} 重试 {retry_max} 次后仍失败: {last_error}"
+        f"分片 {index + 1} 重试 {attempt} 次后仍失败: {last_error}"
     ) from last_error
 
 
@@ -3087,6 +3383,11 @@ def download_segments(
     init_bytes = 0
     failed_indices = []
 
+    # 必须在 open(wb) 之前：中断后不该再截断、重写任何分片文件。
+    _raise_if_interrupted("分片下载")
+    # 本集所有分片共用：据此区分 403 / HTML 页是临时风控（退避重试）还是失效（快速放弃）。
+    forbidden_tracker = _Segment403Tracker()
+
     # 只打开一次：这是修复 PPS/SPS 丢失问题的核心。
     with open(output_path, mode) as output_file:
         # fMP4 的 init 段携带 moov（编解码参数），必须位于所有媒体分片之前。
@@ -3096,7 +3397,8 @@ def download_segments(
         # 分片层分层就白做了（fMP4 源每条候选流都要先过这一关）。
         if init_url and (mode == "wb" or force_init):
             init_data = download_single_segment(
-                init_url, -1, retry_max, SEG_RETRY_DELAY, headers
+                init_url, -1, retry_max, SEG_RETRY_DELAY, headers,
+                forbidden_tracker=forbidden_tracker,
             )
             output_file.write(init_data)
             init_bytes = len(init_data)
@@ -3123,6 +3425,7 @@ def download_segments(
                     retry_max,
                     SEG_RETRY_DELAY,
                     headers,
+                    forbidden_tracker,
                 )
                 future_to_index[future] = index
                 next_submit += 1
@@ -3162,10 +3465,12 @@ def download_segments(
                     except Exception as exc:
                         done_buffer[index] = None
                         failed_indices.append(index)
-                        print(
-                            f"    警告: 分片 {index + 1} 耗尽重试次数，"
-                            f"将跳过并继续；{exc}"
-                        )
+                        # 中断后在途分片成批"已取消"，整集随后按中断上抛，逐条打出来只是刷屏。
+                        if not interrupted.is_set():
+                            print(
+                                f"    警告: 分片 {index + 1} 耗尽重试次数，"
+                                f"将跳过并继续；{exc}"
+                            )
 
                 # 按索引顺序把已就绪的分片落盘，保证输出严格有序。
                 while write_cursor < len(indices):
@@ -3178,10 +3483,18 @@ def download_segments(
                         total_bytes += len(data)
                     write_cursor += 1
 
+                # 收到中断：撤掉还没开跑的分片、不再补片，等在途的几个收尾后整集按中断上抛。
+                # 否则剩下的分片会被逐个投出去再逐个判"已取消"，线程池收尾一直等着它。
+                if interrupted.is_set():
+                    for pending in list(future_to_index):
+                        pending.cancel()
                 # 落盘后再补满窗口，保持 concurrency 个分片始终在途。
-                if circuit_exc is None:
+                elif circuit_exc is None:
                     refill()
 
+    # 中断优先于熔断：被撤掉 / 判"已取消"的分片不是缺片，绝不能当残片交给缺片判定
+    # （缺得少就会被当成功集转封装上传）。
+    _raise_if_interrupted("分片下载")
     if circuit_exc is not None:
         raise circuit_exc
 
@@ -3189,7 +3502,80 @@ def download_segments(
 
 
 # ---------- FFmpeg ----------
+# 隐藏字幕检测的采样窗口（ffprobe -read_intervals 语法）：片头、5/30/60 分钟处
+# 各解码 120 帧。A/53 字幕在带它的码流里通常逐帧都有（无字时发填充数据），
+# 几个窗口足以定论；比整集解码便宜几个数量级（实测 4 个窗口 < 1s）。超出时长
+# 的窗口会读不到帧，不影响结论。
+_CC_PROBE_INTERVALS = "%+#120,300%+#120,1800%+#120,3600%+#120"
+# ffprobe 逐帧 side data 里隐藏字幕的类型名（"ATSC A53 Part 4 Closed Captions"）。
+# 不用流级的 closed_captions 字段：FFmpeg 新版（实测 9.0）已不再输出它，
+# 逐帧 side data 在服务器的 6.1 与本机 9.0 上都可用。
+_CC_SIDE_DATA_MARKER = "Closed Captions"
+# 各编码剥除字幕 SEI 的码流过滤器。H.264 的 A/53 字幕只能随 SEI NAL（类型 6）
+# 整体删掉——h264_metadata 没有专删字幕的选项。删掉的其余 SEI（编码器信息、
+# 缓冲/时序、恢复点）对 MP4 播放无影响：关键帧标记由解复用器在过滤前定好、
+# 原样保留。HEVC 的字幕在前缀 SEI（类型 39）里，与 HDR 母版元数据同类，整删
+# 会丢 HDR 信息，且本地造不出带字幕的 HEVC 样本无法验证，故暂不处理。
+_CC_STRIP_BSF = {"h264": "filter_units=remove_types=6"}
+
+
+def has_closed_captions(path):
+    """视频码流里是否带隐藏字幕（CEA-608/708）。探测失败一律当作没有——
+    宁可漏剥一条字幕，也不能让探测问题把一集拖成转封装失败。"""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-read_intervals",
+        _CC_PROBE_INTERVALS,
+        "-show_frames",
+        "-of",
+        "compact",
+        path,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return _CC_SIDE_DATA_MARKER in result.stdout
+
+
 def convert_ts_to_mp4(ts_path, mp4_path):
+    """转封装为 mp4（纯拷贝，只保留第一条视频与第一条音轨），并按需剥掉隐藏字幕。
+
+    剥除失败（码流过滤器读不动某些码流）时退回原样转封装：成品留着隐藏字幕，
+    也好过因此判这一集转封装失败。
+    """
+    strip_bsf = None
+    if STRIP_CLOSED_CAPTIONS and has_closed_captions(ts_path):
+        codec = normalize_codec(probe_codec(ts_path))
+        strip_bsf = _CC_STRIP_BSF.get(codec)
+        if strip_bsf:
+            print(f"  检测到隐藏字幕，转封装时剥除: {ts_path}", flush=True)
+        else:
+            print(
+                f"  ⚠️ 检测到隐藏字幕，但 {codec or '未知'} 编码暂不支持剥除，"
+                f"原样保留（不因此放弃该集）: {ts_path}",
+                flush=True,
+            )
+
+    if strip_bsf:
+        if _remux_to_mp4(ts_path, mp4_path, strip_bsf):
+            return True
+        print("  ⚠️ 剥除隐藏字幕失败，改为原样转封装（保片优先）", flush=True)
+        remove_file(mp4_path)
+    return _remux_to_mp4(ts_path, mp4_path)
+
+
+def _remux_to_mp4(ts_path, mp4_path, video_bsf=None):
     command = [
         "ffmpeg",
         "-y",
@@ -3208,6 +3594,10 @@ def convert_ts_to_mp4(ts_path, mp4_path):
         "0:a:0?",
         "-c",
         "copy",
+    ]
+    if video_bsf:
+        command += ["-bsf:v", video_bsf]
+    command += [
         "-movflags",
         "+faststart",
         mp4_path,
@@ -3374,11 +3764,9 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
         )
 
     for attempt in range(1, SEG_RETRY_MAX + 1):
+        _raise_if_interrupted(f"直链块 {index + 1} ")
         if _aborted():
-            raise RuntimeError(
-                f"直链块 {index + 1} 已取消"
-                f"（{'收到中断信号' if interrupted.is_set() else '整片已判失败'}）"
-            )
+            raise RuntimeError(f"直链块 {index + 1} 已取消（整片已判失败）")
         try:
             session = get_session()
             merged = dict(HEADERS)
@@ -3445,7 +3833,9 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
                 if abort_event.wait(wait):
                     break
             elif interrupted.wait(wait):
-                break
+                raise DownloadInterrupted(
+                    f"直链块 {index + 1} {_INTERRUPTED_ERROR}"
+                ) from exc
     raise RuntimeError(
         f"直链块 {index + 1} 重试后仍失败: {last_error}"
     ) from last_error
@@ -3637,7 +4027,11 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
 
             refill()
             while future_to_index:
-                done, _ = wait(future_to_index.keys(), return_when=FIRST_COMPLETED)
+                # 带超时：在途块都在退避里时只认 abort_event，靠这里定时看一眼中断。
+                done, _ = wait(
+                    future_to_index.keys(), return_when=FIRST_COMPLETED,
+                    timeout=_INTERRUPT_POLL_SECONDS,
+                )
                 for future in done:
                     index = future_to_index.pop(future)
                     try:
@@ -3648,6 +4042,9 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
                 while write_cursor < len(chunks) and write_cursor in done_buffer:
                     output_file.write(done_buffer.pop(write_cursor))
                     write_cursor += 1
+                # 收到中断：走与"某块失败"同一条止损路径，不再把整集下完。
+                if failure is None and interrupted.is_set():
+                    failure = DownloadInterrupted(f"直链下载{_INTERRUPTED_ERROR}")
                 if failure is not None:
                     # 置位中止信号 + 取消未启动块：在跑的块会在下次重试点立即
                     # 退出，整片失败能在秒级归还下载槽位并换下一个取流节点。
@@ -4031,6 +4428,10 @@ def process_one_entry(entry, processed_ids):
                 remove_file(sample_path)
                 quality_rejected_streams += 1
                 print(f"  处理流 {resolution} 失败: {exc}")
+            except DownloadInterrupted:
+                # 收到中断：不再试其余流（每条都要先请求播放列表）。
+                remove_file(sample_path)
+                raise
             except Exception as exc:
                 remove_file(sample_path)
                 other_failed_streams += 1
@@ -4164,7 +4565,7 @@ def process_one_entry(entry, processed_ids):
         # （wait_for_disk_gate 收到中断会提前返回，故这一判必须在它之后。）
         if interrupted.is_set():
             return normalized_id, False, {
-                "error": "已取消（收到中断信号）", "retriable": True,
+                "error": _INTERRUPTED_ERROR, "retriable": True,
             }
         print(f"\n开始处理: {label} - {title}")
         os.makedirs(TEMP_DIR, exist_ok=True)
@@ -4189,6 +4590,8 @@ def process_one_entry(entry, processed_ids):
         # 若过期节点排在前面（如「节点1 vidlink 403 过期 → 节点2 502」），
         # 按文案判断就永远看不到那条 marker，该直链在剩余所有轮次里都是废的。
         for idx, node in enumerate(urls, start=1):
+            # 中断后不再换节点：下一个节点又要请求播放列表、采样、预检 mp4。
+            _raise_if_interrupted()
             is_last_node = idx == len(urls)
             try:
                 if idx > 1:
@@ -4205,11 +4608,17 @@ def process_one_entry(entry, processed_ids):
                 # 成品里看不出哪家救回来的，也就无从判断某个源该留该撤。
                 conversion_job["provider"] = node["provider"]
                 conversion_job["node_type"] = node["type"]
+                # 下的是哪个节点：检出硬字幕/水印时按它记版本、算还能换哪些节点。
+                conversion_job["node"] = node
                 # 第几个节点成功（1-based）。>1 说明 fallback 真的救回了这一集，
                 # 是"多源到底有没有用"最直接的证据。
                 conversion_job["node_index"] = idx
                 conversion_job["node_total"] = len(urls)
                 break
+            except DownloadInterrupted:
+                # 中断不是本节点的失败：不记节点归因、不换下一个节点，整集按中断收手。
+                remove_file(final_ts)
+                raise
             except Exception as exc:
                 last_exc = exc
                 node_error = str(exc)
@@ -4245,6 +4654,9 @@ def process_one_entry(entry, processed_ids):
         handed_off_to_conversion = True
         return label, True, conversion_job
 
+    except DownloadInterrupted:
+        # 与开头"中断后不再开新集"同一个结论：可重试，下次运行照常重下。
+        return label, False, {"error": _INTERRUPTED_ERROR, "retriable": True}
     except Exception as exc:
         msg = str(exc)
         # 整集可否重试：全节点失败时以“任一节点可重试”为准（乐观，首要目标是下全）；
@@ -4301,6 +4713,801 @@ def process_one_entry(entry, processed_ids):
                 processing_ids.discard(normalized_id)
 
 
+# ---------- 画面叠加物检测：硬字幕 + 水印（下载后、移入成品目录前） ----------
+# 业务口径：带硬字幕或水印的版本一概不要——检出即就地删除、不上传，换这一集别的
+# 版本重下，所有版本都检出才整集判死（见 finalize_one_entry）。检测出错一律按"没有"
+# 放行：检测故障不能变成丢集。以下检测逻辑原样移植自电影侧（2026-10-22～24）。
+#
+# 同一套抽帧（时长 10%~90% 均匀抽 N 帧，避开片头片尾的演职员表），三路判定：
+#   ① 文字水印：整帧 OCR，相似文本归为一类。同一串字压在不同背景上会被识别成
+#      好几个变体（实测半透明网址水印 60 帧认出 8 种写法），不按相似度合并的话
+#      会被当成"内容一直在变"的字幕。某一类**在同一位置**出现在
+#      ≥ watermark_text_presence 的抽样帧里、且周边画面在变 → 文字水印。
+#      "同一位置"挡的是剧情里反复出现的招牌/店名：它们可能在三成镜头里都拍得到，
+#      但每个镜头位置都不同；水印则钉在固定位置。
+#   ② 图形水印（台标）：四角区域里逐帧边缘位置几乎不变（≥ watermark_logo_presence
+#      的帧都在）的紧凑图形、且周边画面在变 → 图形水印。纯图形 OCR 认不出，靠这一路。
+#   ③ 硬字幕：画面底部 30%、水平居中、字号合理的文字框，先剔除①里的常驻文字，
+#      再看：字幕帧占比 ≥ min_hit_ratio 且不同文本类数 ≥ min_distinct_texts。
+#      原片自带的外语强制字幕只零星出现，达不到占比门槛，不会被误判。
+#
+# "周边画面在变"是防误杀的关键：固定机位的片子（舞台剧录像等）背景里的招牌、
+# 门框同样常驻不动，但它们周边的像素随时间也几乎不变；真正的叠加物压在不断切换
+# 的画面上。宽银幕黑边里的水印周边是均匀黑色，单独认作"压在黑边上"。
+
+_OVERLAY_SPAN = (0.10, 0.90)       # 抽帧区间（占片长比例）
+_OVERLAY_FRAME_WIDTH = 960         # OCR 用的帧宽：字幕与水印仍清晰可读
+_STATIC_FRAME_WIDTH = 480          # 静止分析用的灰度小图宽度
+_HARDSUB_BOTTOM = 0.70             # 硬字幕只看画面底部 30%（含宽银幕黑边里的字幕）
+# "像字幕"的文字框几何条件，均相对整帧：框中心横坐标居中、框高在字幕字号范围内。
+_HARDSUB_CENTER_RANGE = (0.30, 0.70)
+_HARDSUB_BOX_HEIGHT_RANGE = (0.02, 0.10)
+_TEXT_SIMILARITY = 0.75            # 两串文字相似度 ≥ 它视为同一句（吸收 OCR 抖动）
+# 字幕基线对齐：命中帧最下面一行字幕框的中心离画面中线不超过 3%，底边离基线（各居中
+# 命中帧底边的中位数）不超过 4%。实测：真字幕片 361227 底边差 0.009、中心偏差 0.011；
+# 字幕纪录片 626979 的居中行底边在 0.919~0.958；而商品/卡片文字片 1054835 底边从
+# 0.757 到 0.996、中心从 0.335 到 0.647。
+_HARDSUB_ALIGN_CX_TOL = 0.03
+_HARDSUB_ALIGN_Y_TOL = 0.04
+_WATERMARK_MIN_TEXT_LEN = 4        # 太短的文字（"ok"、"no"）不拿来判水印
+_WATERMARK_POSITION_TOLERANCE = 0.05   # 框中心偏离常驻位置不超过画面的 5% 才算同一处
+_LOGO_CORNER = (0.25, 0.22)        # 台标搜索区：四角各占宽 25%、高 22%
+# 整行/整列的静止边缘占比超过它 = 宽银幕/画中框的黑边分界线，不是台标，先剔除。
+_LOGO_LINE_FRACTION = 0.4
+_LOGO_LINE_PRESENCE = 0.5          # 认分界线时用的常驻度（低于台标门槛，抖动的线也能认出）
+_LOGO_MIN_EDGE_PIXELS = 40         # 台标的静止边缘像素下限（480 宽小图上）
+_RING_DYNAMIC_STD = 10.0           # 周边像素随时间的标准差中位数 ≥ 它 → 背景在变（固定机位实测约 2）
+_RING_DARK = (24.0, 6.0)           # 周边均值 ≤ 24 且标准差 ≤ 6 → 均匀黑边
+_OVERLAY_EVIDENCE_KEEP = 4         # 每个判死 / 临门槛的集保留几张证据截图
+# 临门槛：没判死、但离门槛不远的集也存截图并在台账标 near_miss，供人工核对有没有漏判。
+#   硬字幕：总量规则或基线对齐规则任一达到"占比 ≥ 门槛一半、不同文本 ≥ 门槛一半"
+#   水印：  有常驻文字但因周边不变 / 位置不固定没判；或把台标常驻门槛放宽到 85% 才找得到
+#           形状像台标的图形
+_NEAR_MISS_FRACTION = 0.5
+_NEAR_MISS_LOGO_FRACTION = 0.85
+_HARDSUB_MARKER = "检测到硬字幕"
+_WATERMARK_MARKER = "检测到水印"
+
+# OCR 引擎按线程各建一份：模型加载只要零点几秒，且避免多线程共用一个会话。
+_hardsub_local = threading.local()
+_overlay_stats_lock = threading.Lock()
+# 本次运行的检测计数（_run_pipeline 开头清零、收尾打印）：比例统计的现场口径，
+# 跨运行的完整口径在 HARDSUB_SCAN_LOG。同时带硬字幕和水印的集两项各计一次。
+# rejected 按「版本」计（换节点重下的集可能计多次），dead 按整集判死计，
+# node_retry 为检出后换节点重下的次数。
+overlay_stats = {
+    "checked": 0, "hardsub": 0, "watermark": 0, "rejected": 0, "unknown": 0, "near_miss": 0,
+    "dead": 0, "node_retry": 0,
+}
+
+
+def _reset_overlay_stats():
+    with _overlay_stats_lock:
+        for key in overlay_stats:
+            overlay_stats[key] = 0
+
+
+def _hardsub_engine():
+    engine = getattr(_hardsub_local, "engine", None)
+    if engine is None:
+        from rapidocr_onnxruntime import RapidOCR
+
+        # 线程数要限：转封装池有多个线程同时检测，onnxruntime 默认会吃满全部核。
+        # 检测模型按"长边不超过帧宽"缩放：默认的"短边至少 736"会把小图放大到
+        # 几千像素宽，实测每帧慢十几倍、结论不变。
+        engine = RapidOCR(
+            intra_op_num_threads=HARDSUB_OCR_THREADS, inter_op_num_threads=1,
+            det_limit_type="max", det_limit_side_len=_OVERLAY_FRAME_WIDTH,
+        )
+        _hardsub_local.engine = engine
+    return engine
+
+
+def _grab_frame(path, timestamp):
+    """抽 timestamp 秒处一帧并缩放到 _OVERLAY_FRAME_WIDTH 宽，返回 BGR 图像；失败返回 None。"""
+    import cv2
+    import numpy as np
+
+    command = [
+        "ffmpeg", "-v", "error", "-ss", f"{timestamp:.3f}", "-i", path,
+        "-frames:v", "1", "-vf", f"scale={_OVERLAY_FRAME_WIDTH}:-2",
+        "-f", "image2pipe", "-c:v", "bmp", "-",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=60)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    return cv2.imdecode(np.frombuffer(result.stdout, np.uint8), cv2.IMREAD_COLOR)
+
+
+def _normalize_sub_text(text):
+    """只留字母、数字、汉字并转小写：比对"是不是同一句"时不受标点空格干扰。"""
+    return re.sub(r"[\W_]+", "", str(text or "")).lower()
+
+
+def _ocr_text_boxes(frame):
+    """整帧 OCR，返回置信度达标的文字框。坐标与框高都是相对整帧的比例。"""
+    result, _ = _hardsub_engine()(frame, use_cls=False)
+    height, width = frame.shape[:2]
+    boxes = []
+    for box, text, score in result or []:
+        if score < HARDSUB_MIN_TEXT_SCORE:
+            continue
+        normalized = _normalize_sub_text(text)
+        if len(normalized) < 2:
+            continue
+        xs = [point[0] for point in box]
+        ys = [point[1] for point in box]
+        boxes.append({
+            "text": normalized,
+            "x0": min(xs) / width, "x1": max(xs) / width,
+            "y0": min(ys) / height, "y1": max(ys) / height,
+        })
+    return boxes
+
+
+def _cluster_texts(frame_boxes):
+    """把各帧的文字框按相似度归类，并给每个框标上类序号 box["cluster"]。
+
+    返回各类：[{"text": 代表文本, "frames": 出现过的帧序号集合, "boxes": [...]}]。
+    """
+    clusters = []
+    for index, boxes in enumerate(frame_boxes):
+        for box in boxes:
+            for cluster_id, cluster in enumerate(clusters):
+                if difflib.SequenceMatcher(
+                    None, cluster["text"], box["text"]
+                ).ratio() >= _TEXT_SIMILARITY:
+                    break
+            else:
+                cluster_id = len(clusters)
+                clusters.append({"text": box["text"], "frames": set(), "boxes": []})
+            box["cluster"] = cluster_id
+            box["frame"] = index
+            clusters[cluster_id]["frames"].add(index)
+            clusters[cluster_id]["boxes"].append(box)
+    return clusters
+
+
+def _background_is_dynamic(std_map, mean_map, x0, y0, x1, y1):
+    """区域 (x0,y0)-(x1,y1)（相对整帧的比例）的周边像素是否随时间在变。
+
+    返回 (是否在变, 周边标准差中位数)。周边是均匀黑边（宽银幕黑边上的水印）也算。
+    """
+    import numpy as np
+
+    height, width = std_map.shape
+    bx0, by0 = max(0, int(x0 * width)), max(0, int(y0 * height))
+    bx1 = min(width, max(bx0 + 1, int(math.ceil(x1 * width))))
+    by1 = min(height, max(by0 + 1, int(math.ceil(y1 * height))))
+    pad = max(4, int(max(bx1 - bx0, by1 - by0) * 0.5))
+    rx0, ry0 = max(0, bx0 - pad), max(0, by0 - pad)
+    rx1, ry1 = min(width, bx1 + pad), min(height, by1 + pad)
+    ring = np.ones((ry1 - ry0, rx1 - rx0), bool)
+    ring[by0 - ry0:by1 - ry0, bx0 - rx0:bx1 - rx0] = False
+    if not ring.any():
+        return False, 0.0
+    ring_std = float(np.median(std_map[ry0:ry1, rx0:rx1][ring]))
+    ring_mean = float(np.median(mean_map[ry0:ry1, rx0:rx1][ring]))
+    dark_border = ring_mean <= _RING_DARK[0] and ring_std <= _RING_DARK[1]
+    return ring_std >= _RING_DYNAMIC_STD or dark_border, ring_std
+
+
+def _find_static_logo(grays, std_map, mean_map):
+    """在四角找逐帧边缘位置几乎不变、周边画面在变的紧凑图形（台标）。
+
+    返回 (台标信息或 None, 角落里最高的边缘常驻比例, 是否有临门槛的台标候选)。
+    峰值供门槛校准（已剔除黑边分界线）；临门槛候选 = 常驻门槛放宽到 85% 才找得到、
+    形状与周边条件都满足的图形——比单个像素的峰值稳得多，不会被纹理里偶然常驻的
+    零星边缘触发。
+    """
+    import cv2
+    import numpy as np
+
+    presence = np.mean([cv2.Canny(gray, 60, 160) > 0 for gray in grays], axis=0)
+    height, width = presence.shape
+    corner = np.zeros((height, width), bool)
+    corner_w = max(1, int(width * _LOGO_CORNER[0]))
+    corner_h = max(1, int(height * _LOGO_CORNER[1]))
+    corner[:corner_h, :corner_w] = corner[:corner_h, -corner_w:] = True
+    corner[-corner_h:, :corner_w] = corner[-corner_h:, -corner_w:] = True
+
+    # 宽银幕/画中框的黑边分界线横贯整行整列，不是台标。用比台标门槛低的常驻度来认
+    # 它（分界线在相邻两行间抖动时，单行的常驻度会低于台标门槛），并向两侧各扩一行：
+    # 既从台标候选里剔除，也不让它虚抬下面记的峰值——实测宽银幕片的峰值曾被分界线
+    # 抬到 0.9，而画面里根本没有台标，拿它校准门槛会误导人。
+    frequent = presence >= _LOGO_LINE_PRESENCE
+    line_rows = np.convolve(frequent.mean(axis=1) >= _LOGO_LINE_FRACTION, [1, 1, 1], "same") > 0
+    line_cols = np.convolve(frequent.mean(axis=0) >= _LOGO_LINE_FRACTION, [1, 1, 1], "same") > 0
+    usable = corner.copy()
+    usable[line_rows, :] = False
+    usable[:, line_cols] = False
+    peak = float(presence[usable].max()) if usable.any() else 0.0
+
+    def candidates(threshold):
+        """常驻度 ≥ threshold 的静止边缘里，形状像台标且周边画面在变的图形。"""
+        static = (presence >= threshold) & usable
+        # 膨胀把字形/图形的零散笔画连成一块再找连通域。
+        merged = cv2.dilate(static.astype(np.uint8), np.ones((5, 5), np.uint8))
+        count, _labels, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
+        for label in range(1, count):
+            x, y, box_w, box_h, _area = (int(v) for v in stats[label])
+            if box_w < 0.02 * width or box_h < 0.02 * height:
+                continue
+            if max(box_w / box_h, box_h / box_w) > 8:
+                continue
+            if int(static[y:y + box_h, x:x + box_w].sum()) < _LOGO_MIN_EDGE_PIXELS:
+                continue
+            dynamic, ring_std = _background_is_dynamic(
+                std_map, mean_map, x / width, y / height,
+                (x + box_w) / width, (y + box_h) / height,
+            )
+            if dynamic:
+                yield {
+                    "bbox": [round(x / width, 3), round(y / height, 3),
+                             round(box_w / width, 3), round(box_h / height, 3)],
+                    "ring_std": round(ring_std, 1),
+                }
+
+    logo = next(candidates(WATERMARK_LOGO_PRESENCE), None)
+    near = logo is None and next(
+        candidates(WATERMARK_LOGO_PRESENCE * _NEAR_MISS_LOGO_FRACTION), None
+    ) is not None
+    return logo, peak, near
+
+
+def _spread(items, count):
+    """从有序列表里均匀挑至多 count 个（首尾都取到），保持顺序。"""
+    items = list(items)
+    if len(items) <= count:
+        return items
+    if count <= 1:
+        return items[:count]
+    return [items[round(i * (len(items) - 1) / (count - 1))] for i in range(count)]
+
+
+def _is_subtitle_box(box):
+    center_x = (box["x0"] + box["x1"]) / 2
+    center_y = (box["y0"] + box["y1"]) / 2
+    box_height = box["y1"] - box["y0"]
+    return (
+        center_y >= _HARDSUB_BOTTOM
+        and _HARDSUB_CENTER_RANGE[0] <= center_x <= _HARDSUB_CENTER_RANGE[1]
+        and _HARDSUB_BOX_HEIGHT_RANGE[0] <= box_height <= _HARDSUB_BOX_HEIGHT_RANGE[1]
+    )
+
+
+def _judge_hardsub(frame_boxes, persistent, sampled):
+    """硬字幕判定（纯计算，离线校准直接复用）。两条规则任一满足即判硬字幕：
+
+    ① 总量：像字幕的帧占比 ≥ min_hit_ratio，且不同文本类数 ≥ min_distinct_texts；
+    ② 基线对齐：只数"最下面一行字幕严格居中、底边落在同一条基线上"的命中帧，其占比
+       ≥ min_aligned_hit_ratio 且不同文本类数 ≥ min_distinct_texts。
+
+    为什么要有②：对白断续的片（纪录片访谈，626979）字幕在屏时间少，①的占比够不到，
+    但它的字幕行位置极其一致；画面里的场景字（商品包装、卡片、招牌）位置和大小每帧
+    都不同，对不齐基线——所以②能用低得多的占比门槛抓字幕，又不误伤场景字多的片。
+
+    返回 dict：hit_indexes / hit_clusters / aligned_indexes / aligned_clusters /
+    baseline（居中命中帧底边的中位数，无则 None）/ is_hardsub / near（临门槛）。
+    """
+    hit_indexes = []
+    hit_clusters = set()
+    lowest = {}  # 命中帧序号 -> (最下面一行字幕框, 该帧字幕的文本类)
+    for index, boxes in enumerate(frame_boxes):
+        subtitles = [
+            box for box in boxes
+            if box["cluster"] not in persistent and _is_subtitle_box(box)
+        ]
+        if not subtitles:
+            continue
+        clusters = {box["cluster"] for box in subtitles}
+        hit_indexes.append(index)
+        hit_clusters |= clusters
+        lowest[index] = (max(subtitles, key=lambda box: box["y1"]), clusters)
+
+    centered = {
+        index: item for index, item in lowest.items()
+        if abs((item[0]["x0"] + item[0]["x1"]) / 2 - 0.5) <= _HARDSUB_ALIGN_CX_TOL
+    }
+    aligned_indexes = []
+    aligned_clusters = set()
+    baseline = None
+    if centered:
+        baseline = statistics.median(box["y1"] for box, _ in centered.values())
+        for index, (box, clusters) in sorted(centered.items()):
+            if abs(box["y1"] - baseline) <= _HARDSUB_ALIGN_Y_TOL:
+                aligned_indexes.append(index)
+                aligned_clusters |= clusters
+
+    hit_ratio = len(hit_indexes) / sampled
+    aligned_ratio = len(aligned_indexes) / sampled
+    by_total = (hit_ratio >= HARDSUB_MIN_HIT_RATIO
+                and len(hit_clusters) >= HARDSUB_MIN_DISTINCT_TEXTS)
+    by_aligned = (aligned_ratio >= HARDSUB_MIN_ALIGNED_RATIO
+                  and len(aligned_clusters) >= HARDSUB_MIN_DISTINCT_TEXTS)
+    half_distinct = math.ceil(HARDSUB_MIN_DISTINCT_TEXTS * _NEAR_MISS_FRACTION)
+    near = not (by_total or by_aligned) and (
+        (hit_ratio >= HARDSUB_MIN_HIT_RATIO * _NEAR_MISS_FRACTION
+         and len(hit_clusters) >= half_distinct)
+        or (aligned_ratio >= HARDSUB_MIN_ALIGNED_RATIO * _NEAR_MISS_FRACTION
+            and len(aligned_clusters) >= half_distinct)
+    )
+    return {
+        "hit_indexes": hit_indexes,
+        "hit_clusters": hit_clusters,
+        "aligned_indexes": aligned_indexes,
+        "aligned_clusters": aligned_clusters,
+        "baseline": round(baseline, 3) if baseline is not None else None,
+        "is_hardsub": by_total or by_aligned,
+        "near": near,
+    }
+
+
+def detect_overlays(path):
+    """抽帧检测一集有没有硬字幕 / 水印。
+
+    返回 (结论字典, 证据截图列表)。结论 verdict 为 hardsub / watermark /
+    hardsub+watermark / clean / unknown（读不到片长、抽到的帧不足一半时为
+    unknown，调用方按"没有"放行）。reasons 列出判死理由。
+    """
+    import cv2
+    import numpy as np
+
+    duration = _probe_duration(path)
+    if not duration or duration <= 0:
+        return {"verdict": "unknown", "reasons": [], "error": "无法读取片长"}, []
+
+    start, end = _OVERLAY_SPAN
+    frame_boxes = []
+    frame_times = []  # 与 frame_boxes 对齐：成功抽到的帧的时间点，证据截图按它重抽
+    grays = []
+    for index in range(HARDSUB_SAMPLE_FRAMES):
+        timestamp = duration * (start + (end - start) * (index + 0.5) / HARDSUB_SAMPLE_FRAMES)
+        frame = _grab_frame(path, timestamp)
+        if frame is None:
+            continue
+        boxes = _ocr_text_boxes(frame)
+        frame_boxes.append(boxes)
+        frame_times.append(timestamp)
+        small_h = max(1, round(frame.shape[0] * _STATIC_FRAME_WIDTH / frame.shape[1]))
+        if grays:
+            small_h = grays[0].shape[0]  # 个别帧尺寸异常时对齐第一帧，保证能堆叠
+        grays.append(cv2.resize(
+            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (_STATIC_FRAME_WIDTH, small_h),
+            interpolation=cv2.INTER_AREA,
+        ))
+
+    sampled = len(frame_boxes)
+    if sampled < max(1, HARDSUB_SAMPLE_FRAMES // 2):
+        return {
+            "verdict": "unknown", "reasons": [], "sampled": sampled,
+            "error": f"只抽到 {sampled}/{HARDSUB_SAMPLE_FRAMES} 帧",
+        }, []
+
+    stack = np.stack(grays).astype(np.float32)
+    std_map, mean_map = stack.std(axis=0), stack.mean(axis=0)
+    clusters = _cluster_texts(frame_boxes)
+
+    # ① 常驻文字：出现在足够多抽样帧里的那几类。它们不可能是字幕（一句字幕只在屏
+    #   几秒），无论是不是水印都从硬字幕统计里剔除；周边画面在变的才算文字水印。
+    persistent = set()
+    watermark_texts = []
+    watermark_frames = set()   # 文字水印（及没判成水印的常驻文字）出现的帧，证据截图用
+    # 常驻但不判水印的文字，记下来供门槛校准：周边画面不变（固定机位的招牌等）、
+    # 位置不固定（不同镜头里反复拍到的招牌/店名）。
+    static_texts = []
+    roaming_texts = []
+    for cluster_id, cluster in enumerate(clusters):
+        presence = len(cluster["frames"]) / sampled
+        if presence < WATERMARK_TEXT_PRESENCE:
+            continue
+        persistent.add(cluster_id)
+        if len(cluster["text"]) < _WATERMARK_MIN_TEXT_LEN:
+            continue
+        # 常驻位置取各帧框中心的中位数，只数落在它附近的那些帧。
+        centers = [((box["x0"] + box["x1"]) / 2, (box["y0"] + box["y1"]) / 2)
+                   for box in cluster["boxes"]]
+        anchor_x = float(np.median([cx for cx, _ in centers]))
+        anchor_y = float(np.median([cy for _, cy in centers]))
+        anchored = [
+            box for box, (cx, cy) in zip(cluster["boxes"], centers)
+            if abs(cx - anchor_x) <= _WATERMARK_POSITION_TOLERANCE
+            and abs(cy - anchor_y) <= _WATERMARK_POSITION_TOLERANCE
+        ]
+        anchored_presence = len({box["frame"] for box in anchored}) / sampled
+        watermark_frames |= {box["frame"] for box in anchored}
+        if anchored_presence < WATERMARK_TEXT_PRESENCE:
+            roaming_texts.append({
+                "text": cluster["text"], "presence": round(presence, 3),
+                "anchored_presence": round(anchored_presence, 3),
+            })
+            continue
+        dynamic, ring_std = _background_is_dynamic(
+            std_map, mean_map,
+            *(float(np.median([box[key] for box in anchored]))
+              for key in ("x0", "y0", "x1", "y1")),
+        )
+        item = {
+            "text": cluster["text"], "presence": round(anchored_presence, 3),
+            "ring_std": round(ring_std, 1),
+        }
+        (watermark_texts if dynamic else static_texts).append(item)
+
+    # ② 图形台标
+    logo, logo_peak, logo_near = _find_static_logo(grays, std_map, mean_map)
+
+    # ③ 硬字幕：剔除常驻文字后的底部居中文字框
+    hardsub = _judge_hardsub(frame_boxes, persistent, sampled)
+    hit_indexes = hardsub["hit_indexes"]
+    hit_clusters = hardsub["hit_clusters"]
+    hit_frames = len(hit_indexes)
+    hit_ratio = hit_frames / sampled
+    is_hardsub = hardsub["is_hardsub"]
+    is_watermark = WATERMARK_CHECK_ENABLED and bool(watermark_texts or logo)
+
+    reasons = (["hardsub"] if is_hardsub else []) + (["watermark"] if is_watermark else [])
+    near_miss = []
+    if not is_hardsub and hardsub["near"]:
+        near_miss.append("hardsub")
+    if not is_watermark and (static_texts or roaming_texts or logo_near):
+        near_miss.append("watermark")
+
+    # 证据截图：只在判死或临门槛时抽，且只抽**触发判定**的那些帧——字幕命中帧、
+    # 水印文字所在帧。只有找不到这类帧时（纯图形台标：没有文字，但每帧都在）才
+    # 均匀取几帧兜底。按时间点重抽，不必在抽帧时把几十张整帧留在内存里。
+    evidence = []
+    evidence_times = []
+    concerned = set(reasons) | set(near_miss)
+    if concerned:
+        picked = []
+        trigger_lists = []
+        if "hardsub" in concerned:
+            # 基线对齐的命中帧最像真字幕，先取它们，再从其余命中帧里补。
+            trigger_lists.append(hardsub["aligned_indexes"])
+            trigger_lists.append(hit_indexes)
+        if "watermark" in concerned:
+            trigger_lists.append(sorted(watermark_frames))
+        for indexes in trigger_lists or [[]]:
+            for index in _spread(indexes, _OVERLAY_EVIDENCE_KEEP):
+                if index not in picked and len(picked) < _OVERLAY_EVIDENCE_KEEP:
+                    picked.append(index)
+        if not picked:
+            picked = _spread(range(sampled), _OVERLAY_EVIDENCE_KEEP)
+        for index in picked:
+            frame = _grab_frame(path, frame_times[index])
+            if frame is not None:
+                evidence.append(frame)
+                evidence_times.append(round(frame_times[index], 1))
+
+    return {
+        "verdict": "+".join(reasons) or "clean",
+        "reasons": reasons,
+        "sampled": sampled,
+        "hits": hit_frames,
+        "hit_ratio": round(hit_ratio, 3),
+        "distinct_texts": len(hit_clusters),
+        # 基线对齐的字幕帧（判据见 _judge_hardsub），门槛校准用。
+        "aligned_hits": len(hardsub["aligned_indexes"]),
+        "aligned_ratio": round(len(hardsub["aligned_indexes"]) / sampled, 3),
+        "aligned_distinct": len(hardsub["aligned_clusters"]),
+        "subtitle_baseline": hardsub["baseline"],
+        # 少量样例供人工复核（已归一化，只留字母数字汉字）。
+        "examples": [clusters[cid]["text"] for cid in sorted(hit_clusters)][:5],
+        "watermark_texts": watermark_texts,
+        "watermark_logo": logo,
+        "static_texts": static_texts,
+        "roaming_texts": roaming_texts,
+        # 角落里最高的边缘常驻比例（已剔除黑边分界线）：没判出台标时也记下，门槛校准用。
+        "logo_peak_presence": round(logo_peak, 3),
+        "near_miss": near_miss,
+        "evidence_times": evidence_times,
+    }, evidence
+
+
+def _save_overlay_evidence(key, frames, near_miss=False, version=None):
+    """保存证据截图：判死的集到 {evidence_dir}/{集 key}/（成品会被删掉，这是事后人工
+    核对有没有误判的唯一依据），临门槛的集到 {evidence_dir}/near_miss/{集 key}/
+    （核对有没有漏判）。集 key 形如 1396_S01E01。version 为版本目录名（换节点重下时同一集会检出多次，
+    各版本分开存，不互相覆盖）。没有截图时不建空目录。失败只告警。"""
+    if not frames:
+        return None
+    try:
+        import cv2
+
+        parts = ["near_miss"] if near_miss else []
+        folder = os.path.join(HARDSUB_EVIDENCE_DIR, *parts, safe_file_token(key))
+        if version:
+            folder = os.path.join(folder, safe_file_token(version))
+        os.makedirs(folder, exist_ok=True)
+        for index, frame in enumerate(frames, 1):
+            cv2.imwrite(os.path.join(folder, f"{index}.jpg"), frame)
+        return folder
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [{key}] ⚠️ 证据截图保存失败: {exc}", flush=True)
+        return None
+
+
+def _overlay_summary(scan):
+    """一句话描述判死依据，用于日志与判死记录。"""
+    parts = []
+    if "hardsub" in scan.get("reasons", []):
+        parts.append(f"{_HARDSUB_MARKER}（字幕帧占比 {scan.get('hit_ratio')}，"
+                     f"不同文本 {scan.get('distinct_texts')} 条）")
+    if "watermark" in scan.get("reasons", []):
+        what = [f"文字「{item['text']}」" for item in scan.get("watermark_texts") or []]
+        if scan.get("watermark_logo"):
+            what.append(f"角落台标 {scan['watermark_logo']['bbox']}")
+        parts.append(f"{_WATERMARK_MARKER}（{'、'.join(what)}）")
+    return "；".join(parts)
+
+
+# reject 接受的理由与中文名。truncated / gaps 是人工复核确认成品不完整时用的（见 reject_films）。
+REJECT_REASON_LABELS = {"hardsub": "硬字幕", "watermark": "水印", "truncated": "时长不符", "gaps": "缺分片"}
+
+
+def _reasons_label(reasons):
+    """理由列表的中文写法，如 "硬字幕/水印"；没有理由时沿用旧文案 "硬字幕/水印"。"""
+    labels = [REJECT_REASON_LABELS.get(r, r) for r in reasons]
+    return "/".join(labels) if labels else "硬字幕/水印"
+
+
+def _overlay_reason_class(reasons):
+    """几条理由并存时记哪一条：硬字幕 > 水印 > 其它（人工复核的 truncated）。
+
+    没有任何理由时记 watermark（沿用旧口径）。
+    """
+    for reason in ("hardsub", "watermark"):
+        if reason in reasons:
+            return reason
+    return reasons[0] if reasons else "watermark"
+
+
+def _overlay_ident(record):
+    """从条目 / conversion_job / 记录里取出一集的身份三元组（写台账用）。"""
+    return {
+        "tmdbId": normalize_tmdb_id(record.get("tmdbId")),
+        "season": parse_int(record.get("season")),
+        "episode": parse_int(record.get("episode")),
+    }
+
+
+def record_overlay_dead(ident, title, scan, node_rejects=None):
+    """把硬字幕/水印集记进 DOWNLOAD_DEAD_LOG（纯追加，读取端按集 key 聚合）。
+
+    ident 为 {tmdbId, season, episode}（见 _overlay_ident）。reason_class 为 hardsub 或
+    watermark（两者都有时记 hardsub，reasons 里列全）；所有版本都是人工复核确认时长不符
+    （reject --reason truncated）时记 truncated。关键在于它不是画质：`--retry-dead`
+    复判只针对画质门槛，这几类永不放回（见 dead_record_passes_now）。
+    node_rejects：换节点重下时各版本的检出结论 {版本标识: 原因}，reasons 取全部版本的并集。
+    """
+    reasons = list(scan.get("reasons") or [])
+    for reason in (node_rejects or {}).values():
+        if reason not in reasons:
+            reasons.append(reason)
+    record = {
+        **ident,
+        "title": title or "",
+        "dead_at": int(time.time()),
+        "reason_class": _overlay_reason_class(reasons),
+        "reasons": reasons,
+        "error": _overlay_summary(scan) or (
+            f"全部 {len(node_rejects)} 个版本都已检出{_reasons_label(reasons)}" if node_rejects else ""
+        ),
+        "evidence": {
+            key: scan.get(key)
+            for key in ("sampled", "hits", "hit_ratio", "distinct_texts", "examples",
+                        "watermark_texts", "watermark_logo")
+        },
+    }
+    if node_rejects:
+        record["node_rejects"] = dict(node_rejects)
+    write_log(DOWNLOAD_DEAD_LOG, record)
+    with _overlay_stats_lock:
+        overlay_stats["dead"] += 1
+
+
+# ---- 换节点重下：节点级台账（电影侧 2026-10-24 移植）----
+_overlay_node_lock = threading.Lock()
+# 集 key -> {版本标识: 原因（hardsub/watermark/truncated）}；None 表示还没从台账读。
+_overlay_node_rejects = None
+
+
+def overlay_node_key(node):
+    """一个「版本」的标识（检出硬字幕/水印时按它记、按它过滤）。
+
+      - mp4：provider 一家算一个版本。vidlink 常给同一集好几个 mp4（不同分辨率），
+        是同一片源转出来的——一个烧了字幕其余也烧着。按文件分开记的话，检出后会
+        接着去下更低分辨率的同一版本：要么白下，要么传上去一个更低清的。
+      - HLS：provider + 主机——同一家同一主机视为同一个版本。
+    """
+    if node["type"] == "mp4":
+        return f"{node['provider']}|mp4"
+    return f"{node['provider']}|m3u8|{_host_of(node['url'])}"
+
+
+def _overlay_version_label(node):
+    """证据截图的版本目录名：provider-类型-标识摘要（同一家两个 mp4 文件也分得开）。"""
+    digest = hashlib.sha1(overlay_node_key(node).encode("utf-8")).hexdigest()[:6]
+    return f"{node['provider']}-{node['type']}-{digest}"
+
+
+def reload_overlay_node_rejects():
+    """丢掉内存里的节点级台账，下次用到时重读（每次运行开头调用）。"""
+    global _overlay_node_rejects
+    with _overlay_node_lock:
+        _overlay_node_rejects = None
+
+
+def _overlay_node_table():
+    """返回节点级台账（调用方须持有 _overlay_node_lock）。"""
+    global _overlay_node_rejects
+    if _overlay_node_rejects is None:
+        table = {}
+        if os.path.exists(OVERLAY_NODE_REJECT_LOG):
+            with open(OVERLAY_NODE_REJECT_LOG, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    key = record_episode_key(record)
+                    node_key = record.get("node_key")
+                    if key and node_key:
+                        table.setdefault(key, {})[node_key] = record.get("reason") or ""
+        _overlay_node_rejects = table
+    return _overlay_node_rejects
+
+
+def overlay_node_rejects(key):
+    """这一集（集 key，如 1396_S01E01）已检出的版本 {版本标识: 原因}（副本）。"""
+    with _overlay_node_lock:
+        return dict(_overlay_node_table().get(key or "", {}))
+
+
+def record_overlay_node_reject(ident, title, node, scan, **extra):
+    """记一个检出硬字幕/水印（或人工复核确认时长不符）的版本（追加台账 + 更新内存）。
+    extra 原样并入记录。"""
+    reasons = scan.get("reasons") or []
+    reason = _overlay_reason_class(reasons)
+    node_key = overlay_node_key(node)
+    write_log(OVERLAY_NODE_REJECT_LOG, {
+        **ident,
+        "title": title or "",
+        "node_key": node_key,
+        "provider": node.get("provider"),
+        "node_type": node.get("type"),
+        "host": _host_of(node["url"]),
+        "reason": reason,
+        "reasons": reasons,
+        "summary": _overlay_summary(scan),
+        "rejected_at": int(time.time()),
+        **extra,
+    })
+    with _overlay_node_lock:
+        _overlay_node_table().setdefault(record_episode_key(ident), {})[node_key] = reason
+
+
+def _entry_nodes(entry):
+    """条目的归一化节点列表，按实际尝试顺序。"""
+    return [
+        node for node in (
+            _normalize_url_entry(item) for item in (entry.get("urls") or [])
+        ) if node
+    ]
+
+
+def strip_rejected_nodes(entry):
+    """去掉这一集已检出硬字幕/水印的版本。返回 (条目, 去掉了几个节点)。
+
+    没去掉任何节点时原样返回同一个对象。解析不了的 url 原样保留（交给下载侧判）。
+    只看这一集自己的台账：同剧别的集检出过同一个版本也不影响它（每集单独处理）。
+    """
+    if not OVERLAY_RETRY_OTHER_NODES:
+        return entry, 0
+    rejected = overlay_node_rejects(record_episode_key(entry))
+    if not rejected:
+        return entry, 0
+    raw = list(entry.get("urls") or [])
+    kept = []
+    for item in raw:
+        node = _normalize_url_entry(item)
+        if node and overlay_node_key(node) in rejected:
+            continue
+        kept.append(item)
+    if len(kept) == len(raw):
+        return entry, 0
+    stripped = dict(entry)
+    stripped["urls"] = kept
+    return stripped, len(raw) - len(kept)
+
+
+def plan_overlay_retry(conversion_job, scan):
+    """检出硬字幕/水印后：记下这个版本，算出还能换哪些节点重下。
+
+    返回去掉全部已检出版本后的条目（还有节点可试），或 None（该整集判死：
+    功能关闭、不知道下的是哪个节点、或所有版本都已检出）。
+    """
+    node = conversion_job.get("node")
+    entry = conversion_job.get("entry")
+    if not OVERLAY_RETRY_OTHER_NODES or not node or not entry:
+        return None
+    record_overlay_node_reject(
+        _overlay_ident(conversion_job), conversion_job.get("title"), node, scan
+    )
+    remaining, _removed = strip_rejected_nodes(entry)
+    if not _entry_nodes(remaining):
+        return None
+    with _overlay_stats_lock:
+        overlay_stats["node_retry"] += 1
+    return remaining
+
+
+def inspect_overlays(ident, title, path, node=None):
+    """检测硬字幕/水印。返回 (应删除这个版本的理由列表, 扫描结果)；理由为空 = 照常交付。
+
+    每个版本的结论都写进 HARDSUB_SCAN_LOG（比例统计与门槛校准用；node 已知时带上
+    版本信息）；判出问题的版本另存证据截图。检测本身任何异常都按"没有"放行。
+    只有 action=kill 时才返回非空理由（record 模式照常交付）。
+    **不写判死台账**：整集判死还是换节点重下由调用方决定（见 finalize_one_entry）。
+    """
+    if not HARDSUB_CHECK_ENABLED:
+        return [], {}
+    key = record_episode_key(ident)
+    try:
+        scan, evidence = detect_overlays(path)
+    except Exception as exc:  # noqa: BLE001 - 检测故障不能变成丢集
+        scan, evidence = {"verdict": "unknown", "reasons": [], "error": str(exc)}, []
+
+    reasons = scan.get("reasons") or []
+    near_miss = scan.get("near_miss") or []
+    with _overlay_stats_lock:
+        overlay_stats["checked"] += 1
+        if scan.get("verdict") == "unknown":
+            overlay_stats["unknown"] += 1
+        for reason in reasons:
+            overlay_stats[reason] += 1
+        if reasons:
+            overlay_stats["rejected"] += 1
+        elif near_miss:
+            overlay_stats["near_miss"] += 1
+
+    record = {
+        **ident,
+        "title": title or "",
+        "checked_at": int(time.time()),
+        "action": HARDSUB_ACTION,
+        **scan,
+    }
+    if node:
+        record.update(node_key=overlay_node_key(node), provider=node.get("provider"),
+                      node_type=node.get("type"))
+    if reasons:
+        record["evidence_dir"] = _save_overlay_evidence(
+            key, evidence, version=_overlay_version_label(node) if node else None
+        )
+    elif near_miss:
+        record["evidence_dir"] = _save_overlay_evidence(key, evidence, near_miss=True)
+    write_log(HARDSUB_SCAN_LOG, record)
+
+    if scan.get("verdict") == "unknown":
+        print(f"  [{key}] ⚠️ 硬字幕/水印检测失败，按没有放行: "
+              f"{scan.get('error')}", flush=True)
+        return [], scan
+    if not reasons:
+        if near_miss:
+            label = "、".join({"hardsub": "硬字幕", "watermark": "水印"}[r] for r in near_miss)
+            print(f"  [{key}] {label}临门槛（未判死，照常交付），已存截图待人工核对",
+                  flush=True)
+        return [], scan
+    if HARDSUB_ACTION != "kill":
+        print(f"  [{key}] {_overlay_summary(scan)}（记录模式，照常交付）", flush=True)
+        return [], scan
+    return reasons, scan
+
+
 def finalize_one_entry(conversion_job, processed_ids):
     """转封装 + 移动到目标目录。成功后登记去重，把成品交给上传阶段。
 
@@ -4315,12 +5522,53 @@ def finalize_one_entry(conversion_job, processed_ids):
     temp_mp4 = conversion_job["temp_mp4"]
     cleanup_paths = conversion_job["cleanup_paths"]
     completed = False
+    overlay_dead = False
 
     try:
         print(f"  [{normalized_id}] 开始转封装为 MP4...", flush=True)
         remove_file(temp_mp4)
         if not convert_ts_to_mp4(final_ts, temp_mp4):
             raise RuntimeError("FFmpeg 转换失败")
+
+        # 硬字幕/水印：在移入成品目录之前查（每一集都查）。检出的版本就地删掉，不进
+        # 成品目录、不存字幕与 meta、不上传。这一集还有没试过的节点就换节点重下（主循环
+        # 把 overlay_retry_entry 放回重投队列），所有版本都检出才整集判死。只处理这一集：
+        # 同剧别的集不受影响（用户 2026-10-30 定的口径）。
+        node = conversion_job.get("node")
+        ident = _overlay_ident(conversion_job)
+        reasons, scan = inspect_overlays(
+            ident, conversion_job["title"], temp_mp4, node=node
+        )
+        if reasons:
+            remove_file(temp_mp4)
+            labels = "、".join(
+                {"hardsub": _HARDSUB_MARKER, "watermark": _WATERMARK_MARKER}[r]
+                for r in reasons
+            )
+            summary = _overlay_summary(scan)
+            # 失败台账的 stage 用它：两者都有时记 hardsub，与判死记录口径一致。
+            reject = "hardsub" if "hardsub" in reasons else "watermark"
+            retry_entry = plan_overlay_retry(conversion_job, scan)
+            if retry_entry is not None:
+                version = f"{node.get('provider')}/{node.get('type')}"
+                left = len(_entry_nodes(retry_entry))
+                print(f"  [{normalized_id}] {summary} → 删除这个版本（{version}），"
+                      f"换剩余 {left} 个节点重下", flush=True)
+                return normalized_id, False, {
+                    "error": f"{labels}（{version}），已删除这个版本，换剩余 {left} 个节点重下",
+                    "overlay_reject": reject,
+                    "overlay_retry_entry": retry_entry,
+                }
+            record_overlay_dead(
+                ident, conversion_job["title"], scan,
+                node_rejects=overlay_node_rejects(normalized_id) or None,
+            )
+            overlay_dead = True
+            print(f"  [{normalized_id}] {summary} → 删除成品并判死", flush=True)
+            return normalized_id, False, {
+                "error": f"{labels}，已删除成品并判死（不上传；没有别的版本可换）",
+                "overlay_reject": reject,
+            }
 
         print(f"  [{normalized_id}] 转封装完成，准备移动文件", flush=True)
         year = conversion_job.get("year")
@@ -4341,6 +5589,9 @@ def finalize_one_entry(conversion_job, processed_ids):
             "node_type": conversion_job.get("node_type"),
             "node_index": conversion_job.get("node_index"),
             "node_total": conversion_job.get("node_total"),
+            # 下的是哪个版本：临门槛人工 reject 时只判这个版本、换别的版本重下。
+            **({"node_key": overlay_node_key(conversion_job["node"])}
+               if conversion_job.get("node") else {}),
             "final_path": final_path,
             "bitrate_kbps": conversion_job["bitrate_kbps"],
             "resolution": conversion_job["resolution"],
@@ -4388,9 +5639,10 @@ def finalize_one_entry(conversion_job, processed_ids):
         for path in cleanup_paths:
             remove_file(path)
         # 成品已落地即登记去重（成败上传都不再重下）；失败则释放 ID 锁允许重试。
+        # 硬字幕/水印判死同样登记：本次运行里重取回来的新链接也不该再下它。
         with processing_lock:
             processing_ids.discard(normalized_id)
-            if completed:
+            if completed or overlay_dead:
                 processed_ids.add(normalized_id)
 
 
@@ -4898,6 +6150,65 @@ def refresh_stale_entries(entries, refetch_counts):
     return refreshed
 
 
+class NodeRetrySource:
+    """硬字幕/水印换节点重下的重投入口 + 已检出版本的过滤（电影侧 2026-10-24 移植）。
+
+    包在每轮来源外面。三件事：
+
+    1. **重投优先**：主循环在某个版本检出硬字幕/水印后 requeue() 剩余节点组成的
+       条目，下一次 poll 先出它，再看原来源。
+    2. **过滤已检出的版本**：经过这里的每一条（取流新结果、重取结果、存量）都
+       去掉这一集节点级台账里已检出的版本——重取会换回完整的一组节点，不滤的话
+       那个带硬字幕的版本会被再下一遍。全部版本都检出过的集不再派发，交给
+       on_all_rejected 整集判死。
+    3. **收尾不丢集**：原来源取空后，只要还有下载或转封装（含检测）在跑就报
+       wait——最后几集检出后换节点重下，仍在本轮之内。必须连下载一起算：
+       主循环一旦收到 done 就再也不来 poll，而还在下载的集下完才进转封装。
+
+    只由主循环线程调用。
+    """
+
+    def __init__(self, work_in_flight=None, on_all_rejected=None):
+        # work_in_flight() -> 是否还有下载或转封装在跑（它们可能产出换节点重下）。
+        self._busy = work_in_flight or (lambda: False)
+        self._on_all_rejected = on_all_rejected or (lambda entry: None)
+        self._source = None
+        self._requeue = deque()
+        self.requeued = 0
+        self.stripped = 0
+        self.all_rejected = 0
+
+    def set_source(self, source):
+        self._source = source
+
+    def requeue(self, entry):
+        """主循环调用：某版本检出后，把剩余节点组成的条目放回来重下。"""
+        self._requeue.append(entry)
+        self.requeued += 1
+
+    def poll(self):
+        while True:
+            if self._requeue:
+                entry = self._requeue.popleft()
+            else:
+                # 原来源报过 done 也每次再问（不记住）：收尾的这段时间里，下载失败投出
+                # 的重取结果还会从它那里回来（pipeline 首轮的队列来源）。
+                state, entry = self._source.poll()
+                if state == "done":
+                    # 还有下载 / 转封装在跑：其中检出的集可能马上要换节点重下，本轮先别收尾。
+                    return ("wait", None) if self._busy() else ("done", None)
+                if state != "item":
+                    return state, entry
+            entry, removed = strip_rejected_nodes(entry)
+            if removed:
+                self.stripped += 1
+                if not _entry_nodes(entry):
+                    self.all_rejected += 1
+                    self._on_all_rejected(entry)
+                    continue
+            return "item", entry
+
+
 class ListEntrySource:
     """把既有的固定 list 包装成来源接口：行为与改造前逐个索引取数完全一致。
 
@@ -5018,6 +6329,74 @@ def preflight_check_ffmpeg():
     print("[ffmpeg 预检通过] ffmpeg 与 ffprobe 均已就绪", flush=True)
 
 
+_OCR_SELF_TEST_TEXT = "OCR SELF TEST"
+
+
+def _ocr_self_test():
+    """在一张画好已知文字的图上真跑一次 OCR，返回 (是否认出, 实际认出的文字)。
+
+    只 import 成功不够：onnxruntime 建会话失败、与机器指令集不兼容、库升级后
+    调用方式变了，这些都要到真推理时才暴露。
+    """
+    import cv2
+    import numpy as np
+
+    image = np.full((120, 640, 3), 30, np.uint8)
+    cv2.putText(image, _OCR_SELF_TEST_TEXT, (40, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                1.6, (255, 255, 255), 3, cv2.LINE_AA)
+    texts = [box["text"] for box in _ocr_text_boxes(image)]
+    expected = _normalize_sub_text(_OCR_SELF_TEST_TEXT)
+    return any(expected in text for text in texts), texts
+
+
+def preflight_check_hardsub():
+    """启用硬字幕/水印检测时预检 action 取值、OCR 依赖与 OCR 是否真能用：不满足就
+    fail-fast 退出。
+
+    不能在运行中才发现：OCR 用不了时每集都会"检测失败按没有放行"，带硬字幕或
+    水印的集照样被上传，而用户以为过滤在生效（全量跑多半被 kill -INT 停下，
+    收尾统计也看不到）。
+    """
+    if not HARDSUB_CHECK_ENABLED:
+        return
+    reason = None
+    if HARDSUB_ACTION not in ("kill", "record"):
+        reason = (f"hardsub_check.action 只能是 kill 或 record，"
+                  f"当前为 {HARDSUB_ACTION!r}")
+    else:
+        try:
+            importlib.import_module("rapidocr_onnxruntime")
+            importlib.import_module("cv2")
+        except Exception as exc:  # noqa: BLE001
+            reason = (f"硬字幕/水印检测依赖缺失（{exc}）。请先 "
+                      f"`pip install -r requirements.txt`；Linux 上若报 libGL.so.1 "
+                      f"缺失，再执行 `apt install -y libgl1 libglib2.0-0`。"
+                      f"或在 config.yaml 里关闭 hardsub_check.enabled")
+    if reason is None:
+        try:
+            recognized, texts = _ocr_self_test()
+            if not recognized:
+                reason = (f"OCR 自检没认出测试文字「{_OCR_SELF_TEST_TEXT}」"
+                          f"（实际认出 {texts}），检测结果不可信")
+        except Exception as exc:  # noqa: BLE001
+            reason = f"OCR 自检运行失败（{type(exc).__name__}: {exc}）"
+        finally:
+            # 自检在主线程建了一份引擎；主线程不做检测，释放掉省内存。
+            _hardsub_local.__dict__.pop("engine", None)
+    if reason:
+        print(f"[硬字幕/水印检测预检失败] {reason}", flush=True)
+        write_log(FAILED_LOG, {
+            "stage": "preflight",
+            "error": reason,
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        release_main_lock()
+        sys.exit(1)
+    print(f"[硬字幕/水印检测预检通过] OCR 自检正常，动作 {HARDSUB_ACTION}，每集抽 "
+          f"{HARDSUB_SAMPLE_FRAMES} 帧，水印判定"
+          f"{'开启' if WATERMARK_CHECK_ENABLED else '关闭'}", flush=True)
+
+
 def install_interrupt_handler():
     """让 Ctrl+C / SIGTERM 置位全局 `interrupted`，把中断意图传达给工作线程。
 
@@ -5074,6 +6453,7 @@ def main():
     acquire_main_lock()
     install_interrupt_handler()
     preflight_check_ffmpeg()
+    preflight_check_hardsub()
     if S3_ENABLED:
         preflight_check_s3()
     monitor_thread = None
@@ -5148,6 +6528,8 @@ def _run_pipeline():
     clean_temp_directory()
     clean_stale_log_tmp()
     print("已清理 temp 目录中的旧临时文件")
+    _reset_overlay_stats()
+    reload_overlay_node_rejects()
 
     logged_ids = load_success_log_ids()
     disk_ids, duplicate_files = scan_downloaded_mp4_ids()
@@ -5164,7 +6546,7 @@ def _run_pipeline():
     print(
         f"成功日志中有 {len(logged_ids)} 个 ID，"
         f"目标目录中有 {len(disk_ids)} 个已下载 ID，"
-        f"画质判死 {len(dead_ids)} 个 ID；"
+        f"判死 {len(dead_ids)} 个 ID（{dead_breakdown(dead_ids)}）；"
         f"合并去重后将跳过 {len(processed_ids)} 个 ID"
     )
 
@@ -5285,6 +6667,36 @@ def _run_pipeline():
     stage_of = {}  # future -> "download" | "conversion" | "upload"
     pending = set()
     stats = {"conversions": 0, "uploads": 0}
+
+    def _all_versions_rejected(entry):
+        """来源里来了一集所有版本都已检出硬字幕/水印（或人工确认时长不符）的：
+        整集判死，不再派发。只看这一集自己的台账。"""
+        ident = _overlay_ident(entry)
+        key = record_episode_key(entry)
+        rejects = overlay_node_rejects(key)
+        record_overlay_dead(ident, entry.get("title"), {"reasons": []},
+                            node_rejects=rejects)
+        with processing_lock:
+            processed_ids.add(key)
+        reasons = list(dict.fromkeys(rejects.values()))
+        stage = _overlay_reason_class(reasons)
+        write_log(FAILED_LOG, {
+            **_entry_identity(entry),
+            "urls": [],
+            "error": f"全部 {len(rejects)} 个版本都已检出{_reasons_label(reasons)}，整集判死",
+            "stage": stage,
+        })
+        print(f"{REJECT_REASON_LABELS.get(stage, stage)}判死: {key}: "
+              f"全部 {len(rejects)} 个版本都已检出", flush=True)
+
+    # 硬字幕/水印换节点重下的重投入口（每轮套在来源外面）。
+    node_retry = (
+        NodeRetrySource(
+            work_in_flight=lambda: bool(download_future_to_entry or conversion_future_to_entry),
+            on_all_rejected=_all_versions_rejected,
+        )
+        if OVERLAY_RETRY_OTHER_NODES else None
+    )
     # 被拒原因聚合（观测性，仅统计下载阶段失败）：按类别计数，分确定性/可重试两组。
     # 确定性失败每片计一次；可重试失败跨轮会重复计（同片多轮重投），打印时分块标注。
     reject_permanent = {}
@@ -5593,13 +7005,26 @@ def _run_pipeline():
                 info = {"error": str(exc)}
 
             if not conversion_success:
+                # 硬字幕/水印单独标 stage：它不是转封装故障，统计与排查时要分开看。
+                # 换节点重下的记 hardsub_retry / watermark_retry，与整集判死区分。
+                overlay = info.get("overlay_reject")
+                retry_entry = info.get("overlay_retry_entry")
+                stage = overlay or "conversion"
+                if overlay and retry_entry is not None:
+                    stage = f"{overlay}_retry"
                 write_log(FAILED_LOG, {
                     **ident,
                     "urls": entry.get("urls", []),
                     "error": info.get("error", "未知错误"),
-                    "stage": "conversion",
+                    "stage": stage,
                 })
-                print(f"转封装失败: {label}: {info.get('error', '未知错误')}")
+                verdict = {
+                    "hardsub": "硬字幕判死", "watermark": "水印判死",
+                    "hardsub_retry": "硬字幕换节点", "watermark_retry": "水印换节点",
+                }.get(stage, "转封装失败")
+                print(f"{verdict}: {label}: {info.get('error', '未知错误')}")
+                if retry_entry is not None and node_retry is not None:
+                    node_retry.requeue(retry_entry)
                 return
 
             # 转封装成功 -> 立即提交上传。反压：先 acquire 信号量（限制
@@ -5682,6 +7107,10 @@ def _run_pipeline():
                 batch_total = f"{len(batch_source)} 集"
             except TypeError:
                 batch_total = "持续接收中"
+            # 硬字幕/水印换节点重下的重投入口：套在本轮来源外面（见 NodeRetrySource）。
+            if node_retry is not None:
+                node_retry.set_source(batch_source)
+                batch_source = node_retry
             if MULTI_ROUND_ENABLED and MAX_ROUNDS > 1:
                 print(
                     f"\n===== 下载轮次 {round_no}/{MAX_ROUNDS}："
@@ -5981,6 +7410,27 @@ def _run_pipeline():
             f"上传 {stats['uploads']} 集。"
         )
 
+        # 硬字幕/水印比例：每集都检测（完整台账见 scan_log）。
+        if overlay_stats["checked"]:
+            checked = overlay_stats["checked"]
+            print(
+                f"\n硬字幕/水印检测：已检测 {checked} 集，"
+                f"硬字幕 {overlay_stats['hardsub']} 集（{overlay_stats['hardsub'] / checked:.1%}），"
+                f"水印 {overlay_stats['watermark']} 集（{overlay_stats['watermark'] / checked:.1%}），"
+                + (f"合计判死 {overlay_stats['dead']} 集（{overlay_stats['dead'] / checked:.1%}）"
+                   if HARDSUB_ACTION == "kill" else
+                   f"合计检出 {overlay_stats['rejected']} 集"
+                   f"（{overlay_stats['rejected'] / checked:.1%}）")
+                + (f"，检出后换节点重下 {overlay_stats['node_retry']} 次"
+                   if overlay_stats["node_retry"] else "")
+                + (f"，检测失败按没有放行 {overlay_stats['unknown']} 集"
+                   if overlay_stats["unknown"] else "")
+                + (f"，临门槛 {overlay_stats['near_miss']} 集（截图在 "
+                   f"{os.path.join(HARDSUB_EVIDENCE_DIR, 'near_miss')}，待人工核对）"
+                   if overlay_stats["near_miss"] else "")
+                + ("" if HARDSUB_ACTION == "kill" else "（记录模式，未删除）")
+            )
+
         # 被拒原因聚合统计（观测性）：量化各类失败占比，指导码率门槛校准。
         def _print_reject_stats(title, counter, note):
             total = sum(counter.values())
@@ -6000,6 +7450,322 @@ def _run_pipeline():
             _print_reject_stats(
                 "可重试失败（瞬时错误）", reject_retriable, "跨轮重投会重复计数"
             )
+
+
+# ---------- 临门槛核对与人工处置（near-miss / reject，电影侧 3679220 起移植） ----------
+_EPISODE_KEY_RE = re.compile(r"^(\d+)_S(\d+)E(\d+)$", re.IGNORECASE)
+
+
+def parse_episode_key(text):
+    """把 1396_S01E01 拆成 (tmdbId, season, episode)；格式不对返回 None。"""
+    match = _EPISODE_KEY_RE.match(str(text or "").strip())
+    if not match:
+        return None
+    return match.group(1), int(match.group(2)), int(match.group(3))
+
+
+def _bytes_to_gb(size):
+    return (size or 0) / 1e9
+
+
+def _manual_reject_times():
+    """人工 reject 处置过的集 -> 最近一次处置时刻（整集判死或版本级记录都算）。"""
+    times = {}
+    for path, field in ((DOWNLOAD_DEAD_LOG, "dead_at"), (OVERLAY_NODE_REJECT_LOG, "rejected_at")):
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = record_episode_key(record)
+                if key and record.get("manual"):
+                    at = parse_int(record.get(field)) or 1
+                    times[key] = max(times.get(key, 0), at)
+    return times
+
+
+def _uploaded_node(key, record):
+    """成品是从哪个节点（版本）下的；找不到返回 None。
+
+    success.jsonl 记了下载链接与 provider / node_type 时直接用；缺 provider 的老记录
+    拿链接回 results.jsonl 里找当时那条节点。
+    """
+    url = (record.get("url") or "").strip()
+    if not url:
+        return None
+    if record.get("provider") and record.get("node_type"):
+        return _normalize_url_entry(
+            {"url": url, "provider": record["provider"], "type": record["node_type"]}
+        )
+    if not os.path.exists(INPUT_JSONL):
+        return None
+    with open(INPUT_JSONL, encoding="utf-8") as fh:
+        for line in fh:
+            if url not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record_episode_key(entry) != key:
+                continue
+            for item in entry.get("urls") or []:
+                node = _normalize_url_entry(item)
+                if node and node["url"] == url:
+                    return node
+    return None
+
+
+def report_near_miss():
+    """列出本机待人工核对的临门槛集（只读）。
+
+    临门槛 = 硬字幕/水印检测没判死、但离门槛不远的集：照常上传了，截图存在
+    {evidence_dir}/near_miss/{集 key}/。人工看过截图、确认确实带硬字幕/水印的，用 reject 处置。
+    """
+    scans = {
+        key: record for key, record in _latest_by_key(HARDSUB_SCAN_LOG).items()
+        if record.get("near_miss")
+    }
+    if not scans:
+        print(f"{HARDSUB_SCAN_LOG} 里没有临门槛的集，无需核对。")
+        return
+    success = _latest_by_key(SUCCESS_LOG)
+    rejected = _manual_reject_times()
+
+    pending = []
+    done = 0
+    for key, scan in sorted(scans.items()):
+        # 处置之后换别的版本重下、又临门槛了的集，扫描记录比处置新：要重新列出来。
+        if key in rejected and rejected[key] >= (parse_int(scan.get("checked_at")) or 0):
+            done += 1
+            continue
+        pending.append((key, scan, success.get(key) or {}))
+
+    print(f"===== 临门槛待核对（{HARDSUB_SCAN_LOG}）=====")
+    total_bytes = 0
+    for key, scan, record in pending:
+        size = int(record.get("file_size_bytes") or 0)
+        total_bytes += size if record.get("uploaded") else 0
+        status = "已上传" if record.get("uploaded") else ("仅本地" if record else "无成品记录")
+        texts = [w["text"] for w in scan.get("watermark_texts") or []] + [
+            w["text"] for w in (scan.get("static_texts") or []) + (scan.get("roaming_texts") or [])
+        ]
+        print(
+            f"{key}\t{(scan.get('title') or record.get('title') or '')[:30]}\t"
+            f"临门槛:{'/'.join(scan['near_miss'])}\t{status} {_bytes_to_gb(size):.2f} GB\t"
+            f"字幕帧 {scan.get('hit_ratio')} 对齐 {scan.get('aligned_ratio')} "
+            f"文本 {scan.get('distinct_texts')}"
+            + (f"\t常驻文字 {texts[:3]}" if texts else "")
+            + f"\t截图 {scan.get('evidence_dir') or '（无）'}"
+        )
+    print(
+        f"待核对 {len(pending)} 集，其中已上传 R2 的合计 {_bytes_to_gb(total_bytes):.2f} GB"
+        + (f"；另有 {done} 集已处置" if done else "")
+    )
+    if pending:
+        print("看过截图、确认带硬字幕/水印的，执行：")
+        print("  python download_tv.py reject <集 key，如 1396_S01E01> [...] [--dry-run]")
+
+
+def _list_r2_keys(client, prefix):
+    keys = []
+    token = None
+    while True:
+        kwargs = {"Bucket": S3_BUCKET, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        response = client.list_objects_v2(**kwargs)
+        keys += [(o["Key"], int(o.get("Size") or 0)) for o in response.get("Contents", [])]
+        if not response.get("IsTruncated"):
+            return keys
+        token = response.get("NextContinuationToken")
+
+
+def _remove_records_by_key(path, key):
+    """从一份按集记账的 jsonl（success / pending）里删掉该集的全部记录（log_lock 保护，原子替换）。
+
+    处置后它不再是"成品"：之后的启动跳过与补传都不会再碰它。
+    """
+    with log_lock:
+        if not os.path.exists(path):
+            return
+        kept = []
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    if record_episode_key(json.loads(stripped)) == key:
+                        continue
+                except (json.JSONDecodeError, AttributeError):
+                    pass  # 无法解析的行原样保留
+                kept.append(stripped)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            for line in kept:
+                fh.write(line + "\n")
+        os.replace(tmp_path, path)
+
+
+def reject_episodes(keys, reason=None, dry_run=False):
+    """人工确认临门槛集确实带硬字幕/水印（或成品不完整）后处置。与电影侧 reject_films 同口径。
+
+    逐集：删 R2 上该集目录下全部对象（视频、meta.json、字幕）→ 确认删干净 →
+    从 SUCCESS_LOG / pending 移除 →
+      - hardsub / watermark / truncated：**只判这个版本**——节点级台账记一条
+        （manual=True），下次运行这一集换别的版本重下，所有版本都检出才整集判死；
+        查不出成品是哪个版本时退回整集判死（manual=True，--retry-dead 永不放回）；
+      - gaps（缺分片过多）：片源没问题，只删 R2 与成品记录，下次运行照常重下。
+    → 失败台账记一笔 → 清本地残留 → 临门槛截图挪到判死目录。
+    R2 删除没确认成功之前**不动任何台账**：宁可留着重试，也不能台账说删了而 R2 里还在。
+    只处理给出的这几集，同剧别的集不受影响。
+
+    reason 不给时取该集临门槛记录里的理由（两者都有时记 hardsub）；不在临门槛清单里
+    的集必须显式给 reason。返回 (处置集数, 释放的 R2 字节数)。
+    """
+    if reason is not None and reason not in REJECT_REASON_LABELS:
+        raise SystemExit(f"--reason 只能是 {' / '.join(REJECT_REASON_LABELS)}，收到 {reason!r}")
+    if is_main_running():
+        print("检测到主流程正在运行；处置会改写 success.jsonl，请在主流程结束后再执行。")
+        return 0, 0
+    scans = _latest_by_key(HARDSUB_SCAN_LOG)
+    success = _latest_by_key(SUCCESS_LOG)
+    client = get_s3_client() if S3_ENABLED else None
+    done = 0
+    freed = 0
+    for raw in keys:
+        parsed = parse_episode_key(raw)
+        if parsed is None:
+            print(f"[{raw}] 不是集 key（应形如 1396_S01E01），跳过")
+            continue
+        key = episode_key(*parsed)
+        record = success.get(key)
+        scan = scans.get(key) or {}
+        if not record:
+            print(f"[{key}] success.jsonl 里没有这一集（未下载或已处置），跳过")
+            continue
+        near = scan.get("near_miss") or []
+        film_reason = reason or ("hardsub" if "hardsub" in near else (near[0] if near else None))
+        if film_reason is None:
+            print(f"[{key}] 不在临门槛清单里，需用 --reason {'|'.join(REJECT_REASON_LABELS)} "
+                  f"指明理由，跳过")
+            continue
+        tmdb_id, season, episode = parsed
+        year = record.get("year")
+        prefix = asset_rel_path(tmdb_id, season, episode, year) + "/"
+        if S3_PREFIX:
+            prefix = f"{S3_PREFIX}/{prefix}"
+        r2_keys = _list_r2_keys(client, prefix) if client else []
+        size = sum(k[1] for k in r2_keys)
+        print(f"[{key}] {record.get('title') or ''}：理由 {film_reason}，"
+              f"R2 上 {len(r2_keys)} 个对象 {_bytes_to_gb(size):.2f} GB（{prefix}）")
+        if dry_run:
+            for r2_key, _ in r2_keys:
+                print(f"    将删除 {r2_key}")
+            continue
+
+        try:
+            for r2_key, _ in r2_keys:
+                client.delete_object(Bucket=S3_BUCKET, Key=r2_key)
+            leftover = _list_r2_keys(client, prefix) if client else []
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{key}] ⚠️ R2 删除失败，台账未改动，可重新执行: {exc}")
+            continue
+        if leftover:
+            print(f"[{key}] ⚠️ R2 上仍有 {len(leftover)} 个对象未删掉，台账未改动，可重新执行")
+            continue
+
+        ident = {"tmdbId": tmdb_id, "season": season, "episode": episode}
+        label = REJECT_REASON_LABELS[film_reason]
+        folder = episode_dir(tmdb_id, season, episode, year)
+        if film_reason == "gaps":
+            # 片源没问题，只是这次下载丢了分片：移出成品、下次运行照常重下（不记版本、不判死）。
+            _remove_records_by_key(SUCCESS_LOG, key)
+            _remove_records_by_key(UPLOAD_PENDING_LOG, key)
+            write_log(FAILED_LOG, {
+                **ident,
+                "title": record.get("title") or "",
+                "error": f"人工复核确认{label}（缺 {record.get('missing_segment_count')} 片），"
+                         f"已从 R2 移除，下次运行重下",
+                "stage": "gaps_retry",
+            })
+            if os.path.isdir(folder):
+                shutil.rmtree(folder, ignore_errors=True)
+            done += 1
+            freed += size
+            print(f"[{key}] 已处置：R2 删除 {len(r2_keys)} 个对象，移出成品，下次运行重下")
+            continue
+        # 硬字幕/水印来自临门槛核对；时长不符来自人工复核成品。
+        source = "临门槛人工确认" if film_reason in ("hardsub", "watermark") else "人工复核确认"
+        node = _uploaded_node(key, record) if OVERLAY_RETRY_OTHER_NODES else None
+
+        # 截图先挪到判死目录（版本级处置挪到该版本的子目录），记录里记挪动后的实际位置。
+        near_dir = os.path.join(HARDSUB_EVIDENCE_DIR, "near_miss", safe_file_token(key))
+        dead_dir = os.path.join(HARDSUB_EVIDENCE_DIR, safe_file_token(key))
+        if node:
+            dead_dir = os.path.join(dead_dir, safe_file_token(_overlay_version_label(node)))
+        if os.path.isdir(near_dir) and not os.path.exists(dead_dir):
+            os.makedirs(os.path.dirname(dead_dir), exist_ok=True)
+            os.replace(near_dir, dead_dir)
+        evidence_dir = next((p for p in (near_dir, dead_dir) if os.path.isdir(p)), None)
+
+        _remove_records_by_key(SUCCESS_LOG, key)
+        _remove_records_by_key(UPLOAD_PENDING_LOG, key)
+        if node:
+            version = f"{node['provider']}/{node['type']}"
+            record_overlay_node_reject(
+                ident, record.get("title"), node, {"reasons": [film_reason]},
+                manual=True, summary=f"{source}{label}，已从 R2 移除",
+                removed_bytes=size, evidence_dir=evidence_dir,
+            )
+            write_log(FAILED_LOG, {
+                **ident,
+                "title": record.get("title") or "",
+                "error": f"{source}{label}（{version}），已从 R2 移除，换其它版本重下",
+                "stage": f"{film_reason}_retry",
+            })
+            if os.path.isdir(folder):
+                shutil.rmtree(folder, ignore_errors=True)
+            done += 1
+            freed += size
+            print(f"[{key}] 已处置：R2 删除 {len(r2_keys)} 个对象，这个版本（{version}）"
+                  f"记为已检出，下次运行换其它版本重下（没有别的版本时整集判死）")
+            continue
+        write_log(DOWNLOAD_DEAD_LOG, {
+            **ident,
+            "title": record.get("title") or "",
+            "dead_at": int(time.time()),
+            "reason_class": film_reason,
+            "reasons": [film_reason],
+            "manual": True,
+            "error": f"{source}{label}，已从 R2 移除",
+            "removed_bytes": size,
+            "evidence": {
+                **{k: scan.get(k)
+                   for k in ("hit_ratio", "aligned_ratio", "distinct_texts", "examples",
+                             "watermark_texts")},
+                "evidence_dir": evidence_dir,
+            },
+        })
+        write_log(FAILED_LOG, {
+            **ident,
+            "title": record.get("title") or "",
+            "error": f"{source}{label}，已从 R2 移除并判死",
+            "stage": film_reason,
+        })
+        if os.path.isdir(folder):
+            shutil.rmtree(folder, ignore_errors=True)
+        done += 1
+        freed += size
+        print(f"[{key}] 已处置：R2 删除 {len(r2_keys)} 个对象，已判死并移出成品统计")
+    if not dry_run:
+        print(f"处置完成 {done}/{len(keys)} 集，释放 R2 {_bytes_to_gb(freed):.2f} GB。"
+              if done else f"处置完成 0/{len(keys)} 集：未处置任何一集。")
+    return done, freed
 
 
 def _reupload_assets_only(record):
@@ -6253,6 +8019,29 @@ def reupload_pending():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "reupload":
         reupload_pending()
+    elif len(sys.argv) > 1 and sys.argv[1] == "near-miss":
+        report_near_miss()
+    elif len(sys.argv) > 1 and sys.argv[1] == "reject":
+        # reject <集 key> [...] [--reason hardsub|watermark|truncated|gaps] [--dry-run]
+        _rest = sys.argv[2:]
+        _dry = "--dry-run" in _rest
+        _reason = None
+        if "--reason" in _rest:
+            _i = _rest.index("--reason")
+            if _i + 1 >= len(_rest):
+                print("错误: --reason 后面要跟 hardsub / watermark / truncated / gaps")
+                raise SystemExit(2)
+            _reason = _rest[_i + 1]
+            _rest = _rest[:_i] + _rest[_i + 2:]
+        _keys = [a for a in _rest if a != "--dry-run"]
+        _bad = [a for a in _keys if parse_episode_key(a) is None]
+        if not _keys or _bad:
+            print(f"错误: 需要给出集 key（形如 1396_S01E01）"
+                  f"{'，无法识别 ' + ' '.join(_bad) if _bad else ''}")
+            print("用法: python download_tv.py reject <集 key> [...] "
+                  "[--reason hardsub|watermark|truncated|gaps] [--dry-run]")
+            raise SystemExit(2)
+        reject_episodes(_keys, reason=_reason, dry_run=_dry)
     else:
         # 沿用既有的裸 sys.argv 分派风格（本文件一直没有引入 argparse）。
         # 两个开关可叠加：--retry-only --retry-dead。
@@ -6266,6 +8055,8 @@ if __name__ == "__main__":
             print(f"错误: 无法识别的参数 {' '.join(sorted(_unknown))}")
             print("用法: python download_tv.py [--retry-only] [--retry-dead]")
             print("      python download_tv.py reupload")
+            print("      python download_tv.py near-miss")
+            print("      python download_tv.py reject <集 key> ... [--reason hardsub|watermark|truncated|gaps] [--dry-run]")
             raise SystemExit(2)
         if RETRY_ONLY_MODE:
             print(

@@ -534,6 +534,34 @@ download_tv:
   sample_count: 10
   seg_retry_max: 20
   seg_retry_delay: 1
+  # HLS 分片 403 的临时风控重试（电影侧 2026-10-27 实测后移植；vidup/vidfast 同样落在 finalsignal/goldenkite）。分片 403 原本一律当签名过期、第 1 次就放弃；
+  # 但 videasy 的 sun.finalsignal.top/r6/ 在负载下会随机回 Cloudflare 403（20–30 秒后恢复），
+  # 06 号机实测每部片因此零散丢 7%–16% 分片、整片缺片失败。
+  # 现在同一部片别的分片还在正常下时，403 从 seg_403_retry_delay 秒起指数退避（封顶 30s）
+  # 重试至多 seg_403_retry_max 次（1+2+4+8+16+30+30+30 ≈ 2 分钟，次数也计入 seg_retry_max）；
+  # 一直没有分片成功、403 攒够 seg_403_expired_after 次则按签名过期快速放弃、转重取。
+  # seg_403_retry_max 设 0 回到旧行为。
+  # 4s 起 5 次 → 1s 起 8 次（2026-10-27，06 号机 4 小时实测）：等 4/8/16/30 秒后仍 403 的比例
+  # 37%/45%/48%/47%，等得再久也只救回一半；长退避让分片槽空等（平均约 50 个），5 次用完还丢了
+  # 1470 个分片（31 部上传的片缺 5 片以上）。短起步省空等，多几次补回缺片。
+  seg_403_retry_max: 8
+  seg_403_retry_delay: 1
+  seg_403_expired_after: 8
+  # HLS 分片返回 HTML 页面（HTTP 200）的临时拦截重试（2026-10-27）。/r6/ 除了随机 403，还会零星
+  # 把单个分片换成 HTML 页面，同片别的分片照常；原先一律按无效源第 1 次就丢片——06 号机一轮丢的
+  # 183 个分片里 155 个是它，206 部上传的片有 40 部带缺片。
+  # 现在与 403 共用本片判别器（seg_403_expired_after 也管它）：同片别的分片还在正常下时，从
+  # seg_html_retry_delay 秒起指数退避（封顶 30s）重试至多 seg_html_retry_max 次（与 403 各算各的，
+  # 次数也计入 seg_retry_max）；整片都是 HTML（真无效源）仍快速放弃、换节点。返回 m3u8 照旧不重试。
+  # 日志会带上页面标题（或正文开头）和字节数，便于确认源站回的是什么页。设 0 回到旧行为。
+  seg_html_retry_max: 8
+  seg_html_retry_delay: 1
+  # playlist 的 403 先按临时风控短间隔重试（电影侧 2026-10-27 实测后移植）：finalsignal /r6/ 的 master / media
+  # playlist 与分片一样随机回 Cloudflare 403（电影侧 06 号机 4 小时：347 部片整片失败、158 条流采样出局，
+  # 全被当成签名过期转重取）。从 playlist_403_retry_delay 秒起指数退避重试至多 playlist_403_retry_max
+  # 次（1+2+4 ≈ 7 秒），不占 playlist_retry_max；还是 403 才按签名过期转重取。0 = 旧行为。
+  playlist_403_retry_max: 3
+  playlist_403_retry_delay: 1
   # 采样阶段的分片重试预算，与正片**分层**。
   # 采样只为测码率/分辨率来决定"这条候选流要不要"，探不到换下一条流即可；
   # 正片才是"这一集最后的希望"，值得死磕 20 次。
@@ -550,6 +578,41 @@ download_tv:
   sample_seg_retry_max: 5
   # 转封装(ffmpeg -c copy)单片超时(秒)：单集通常 20~60 分钟，比电影短，1800 足够冗余
   convert_timeout: 1800
+  # 转封装时剥掉视频码流里的隐藏字幕（CEA-608/708，ATSC A/53，藏在 SEI 里）。
+  # 只剥不剔：检测到就去掉字幕、照常交付这一集。目前只支持 H.264；其它编码
+  # 检测到隐藏字幕时原样保留并记日志，绝不因此放弃该集。
+  strip_closed_captions: true
+  # 画面叠加物检测：硬字幕（烧在画面里的字幕）+ 水印（文字水印、角落台标）。
+  # 转封装之后、移入成品目录之前，在每集时长 10%~90% 均匀抽帧做 OCR 与静止区域分析。
+  # **每一集都检测、检出后只处理这一集**（不连累同剧其它集；2026-10-30 定的口径）。
+  # 检出任一项的**版本**：就地删除、不上传。这一集还有没试过的节点（别的版本）就换
+  # 节点重下（retry_other_nodes）；所有版本都检出才整集判死（download_dead.jsonl，
+  # reason_class=hardsub/watermark，--retry-dead 永不放回）。
+  # 检测出错一律按没有放行。依赖 rapidocr_onnxruntime（见 requirements.txt）。
+  hardsub_check:
+    enabled: true             # 总开关：关掉则硬字幕与水印都不检测
+    action: kill              # kill=检出即删除判死；record=只检测记账、照常交付（校准门槛用）
+    sample_frames: 60         # 每集在时长 10%~90% 均匀抽帧数
+    # -- 硬字幕：画面底部 30%、水平居中、字号合理的文字（先剔除常驻文字） --
+    min_hit_ratio: 0.2        # 像字幕的帧占比门槛（对白片字幕在屏约三到五成）
+    min_distinct_texts: 5     # 不同文本数门槛（相似文本归为一类后计数）
+    # 基线对齐规则：只数"最下行字幕严格居中、底边落在同一基线"的帧，占比 ≥ 此值（且不同
+    # 文本 ≥ min_distinct_texts）也判硬字幕。抓对白断续的字幕片（纪录片访谈），场景字对不齐不受影响
+    min_aligned_hit_ratio: 0.08
+    min_text_score: 0.8       # OCR 置信度下限（硬字幕与文字水印共用）
+    # -- 水印：常驻画面、且周边画面在变（固定机位的招牌/门框不算） --
+    watermark_enabled: true
+    watermark_text_presence: 0.3   # 同一串文字出现在 ≥ 该比例的抽样帧 → 文字水印
+    watermark_logo_presence: 0.8   # 四角同一静止图形出现在 ≥ 该比例的抽样帧 → 台标
+    ocr_threads: 2            # 每个检测线程的 OCR 线程数（转封装池多线程并发检测）
+    scan_log: "hardsub_scan.jsonl"     # 每集的检测结论（比例统计与门槛校准用）
+    evidence_dir: "hardsub_evidence"   # 判死 / 临门槛集的证据截图（成品删除后人工复核用）
+    # 检出后先换这一集还没试过的节点重下，所有节点都检出才整集判死（电影侧 2026-10-24 口径）。
+    # 「同一个版本」的认法：mp4 = 一家 provider 算一个版本（vidlink 给的 1920 / 1280 /
+    # 640 几个 mp4 是同一片源的不同分辨率，一个烧了字幕其余也烧着）；HLS = provider +
+    # 主机。设 false 回到检出即整片判死。
+    retry_other_nodes: true
+    node_reject_log: "overlay_node_rejects.jsonl"   # 节点级台账：已检出的版本，跨运行不再下
   # ---- playlist(master/media)解析阶段的请求重试 ----
   #
   # 🔴 2026-09-14 由 10 降到 4，与电影侧对齐（与 max_rounds 同批调整）。
