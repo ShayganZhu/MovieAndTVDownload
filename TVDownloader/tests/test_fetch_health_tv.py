@@ -392,3 +392,44 @@ def test_videasy_is_enabled_before_vidlink():
     assert "videasy" in m.PROVIDERS
     assert cfg["providers"] == ["vidup", "vidfast", "videasy", "vidlink"], \
         "videasy 长期启用、排在 vidlink 前（画质优先）"
+
+
+# ------------------------------------------------------------ 哪些源熔断才阻止判死（2026-10-30）
+
+def test_videasy_outage_does_not_block_a_dead_verdict(monkeypatch):
+    """🔴 videasy 熔断、其余源都说无此集：照常判死（走二次确认），不推迟。
+    TV 绝大多数集是真无源，不能让一个没有独占的源的宕机把它们全部推迟。"""
+    seen = _install_fake_session(monkeypatch, PAGE, [], page_status=404)
+    _use_breaker(monkeypatch, trip=1).record("videasy", "down")
+    status, result = m.process_episode("42", 1, 1, providers=["vidup", "vidfast", "videasy", "vidlink"])
+    assert (status, result) == ("dead", None)
+    assert seen["order"].count("vidup") == 2, "照常走判死二次确认"
+    assert "videasy" not in seen["order"], "熔断中的 videasy 不该被调用"
+
+
+def test_core_provider_outage_still_defers(monkeypatch):
+    _install_fake_session(monkeypatch, PAGE, [])
+    b = _use_breaker(monkeypatch, trip=1)
+    b.record("videasy", "down")
+    b.record("vidup", "down")
+    status, result = m.process_episode("42", 1, 1, providers=["vidup", "vidfast", "videasy", "vidlink"])
+    assert status == "deferred" and result["providers"] == ["vidup", "videasy"]
+
+
+def test_nobody_answered_is_never_dead_even_for_videasy(monkeypatch):
+    """只问了 videasy 而它在熔断：没有任何一家实际答过，绝不能凭空判死。"""
+    _install_fake_session(monkeypatch, PAGE, [])
+    _use_breaker(monkeypatch, trip=1).record("videasy", "down")
+    status, result = m.process_episode("42", 1, 1, providers=["videasy"])
+    assert status == "deferred" and result["providers"] == ["videasy"]
+
+
+def test_shipped_config_lists_the_dead_blocking_providers():
+    import os
+
+    import yaml
+
+    path = os.path.join(os.path.dirname(m.__file__), "config.yaml")
+    cfg = yaml.safe_load(open(path, encoding="utf-8"))["tv_ids_to_links"]["provider_breaker"]
+    assert cfg["blocks_dead"] == ["vidup", "vidfast", "vidlink"]
+    assert "videasy" not in m.BREAKER_BLOCKS_DEAD

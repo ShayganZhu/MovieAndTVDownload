@@ -188,6 +188,10 @@ tv_ids_to_links:
     enabled: true
     trip_after: 30              # 连续多少次"整体不可用"才熔断；个别被拉黑的出口凑不满
     probe_interval_minutes: 10
+    # 熔断时会阻止判死的源：只有它们熔断、没问到时才把集记为推迟。不在这里的源（videasy）
+    # 熔断期间，问到的源都说无此集就照常判死（2026-10-30 定：TV 绝大多数集是真无源，videasy
+    # 实测没有独占的集，不能让它的宕机把成百万的无源判定全部推迟、每次运行重查）。
+    blocks_dead: [vidup, vidfast, vidlink]
   # ---- 直连分流 ----
   # 代理网关在新加坡（24 号机往返 230ms），经它的请求中位 1.2–5.4 秒、约 8% 在 12 秒内
   # 超时；直连只要 0.2 秒。2026-10-24 在 24 号机实测：enc-dec.app 直连 40 次全 200、
@@ -620,7 +624,12 @@ download_tv:
   # 检测出错一律按没有放行。依赖 rapidocr_onnxruntime（见 requirements.txt）。
   hardsub_check:
     enabled: true             # 总开关：关掉则硬字幕与水印都不检测
-    action: kill              # kill=检出即删除判死；record=只检测记账、照常交付（校准门槛用）
+    # kill=检出即删除（换版本重下 / 判死）；record=只检测记账、存证据截图、照常交付（校准门槛用）。
+    # 2026-10-30 定：TV 首批用 record。TV 里电视台台标（广播录制源的角落常驻台标）与日韩综艺的
+    # 节目组字幕远比电影常见，直接 kill 可能误删大量集。首批跑完先看收尾统计的检出比例，用
+    # `python download_tv.py near-miss` 列出检出 / 临门槛的集、核对证据截图，确认带问题的用
+    # `reject <集 key>` 处置，再决定是否切回 kill。
+    action: record
     sample_frames: 60         # 每集在时长 10%~90% 均匀抽帧数
     # -- 硬字幕：画面底部 30%、水平居中、字号合理的文字（先剔除常驻文字） --
     min_hit_ratio: 0.2        # 像字幕的帧占比门槛（对白片字幕在屏约三到五成）

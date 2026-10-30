@@ -5,8 +5,14 @@
 机器上用它补跑一遍；--verify-r2 顺带核对 R2 与台账是否一致（每轮跑之前的体检）。
 
 与电影侧的差异：TV 的统计单位是**集**，补跑的输入却是**剧**（ids.txt 一行一部剧，
-主流程自己按季集展开、跳过已完成的集）。所以逐集分类、按剧汇总：只要一部剧还有一集
-未完成（且不是 --exclude-dead 排除的判死集），这部剧就进 ids_remaining.txt。
+主流程自己按季集展开、跳过已完成的集）。所以逐集分类、按剧汇总：一部剧还有一集**补跑能推进**
+的未完成集，这部剧就进 ids_remaining.txt。
+
+只剩无源 / 判死集的剧默认不进名单（2026-10-30 定）：正常运行把这些集当已处理跳过（取流侧跳过
+fail.txt 的无源集与整剧无源，下载侧跳过判死集），补跑一遍什么也不会发生；而 TV 集级有源率只有
+个位数百分比，几乎每部剧都有无源集，不排除的话名单约等于整个 ids.txt。它们照常计数、照常进
+--report 明细，由专用模式处理：无源集 `tv_ids_to_links.py --recheck-dead`、画质判死
+`download_tv.py --retry-dead`（两者自己读台账，用完整的 ids.txt 跑）。--include-dead 恢复旧口径。
 
 集的全集取自取流侧的季集缓存（seasons_cache.jsonl）：
   - 尚未播出的集（air_date + air_grace_days 在今天之后、或未完结剧的 TBA 集）不算未完成，
@@ -59,6 +65,16 @@ REASONS = {
 SHOW_REASONS = {
     "show:no_source": "整剧无源（fail.txt）",
     "show:not_expanded": "季集还没展开（seasons_cache 里没有）",
+}
+# 补跑不会推进的原因：正常运行把这些集 / 剧当已处理跳过，只有专用模式才会再碰。
+# 默认不让它们把剧留在补跑名单里（--include-dead 才留）。
+TERMINAL_REASONS = frozenset(
+    [reason for reason in REASONS if reason.startswith("dead:")] + ["no_source", "show:no_source"]
+)
+# 汇总表末尾给的处理办法（只列有专用模式的原因）。
+TERMINAL_HINTS = {
+    "no_source": "源站后补上架的无源集：python tv_ids_to_links.py --recheck-dead",
+    "dead:quality": "调松画质门槛后放回画质判死集：python download_tv.py --retry-dead",
 }
 RETRY_EXHAUSTED_TAG = "retry-exhausted"
 _KEY_FIELDS_RE = {
@@ -419,7 +435,7 @@ def _main_running(lock_path):
 
 
 def run(base_dir, ids=None, out="ids_remaining.txt", report=None, verify_r2=False,
-        exclude_dead=False, r2_client=None, config=None, today=None):
+        include_dead=False, r2_client=None, config=None, today=None):
     """主逻辑（命令行与测试共用）。返回汇总字典。"""
     base_dir = Path(base_dir).resolve()
     paths = build_paths(base_dir, ids=ids, config=config)
@@ -456,18 +472,23 @@ def run(base_dir, ids=None, out="ids_remaining.txt", report=None, verify_r2=Fals
         r2_note = f"R2 {bucket}/{prefix} 下共 {len(r2)} 集 mp4（列举 {time.time() - t0:.1f}s）"
 
     done, remaining, excluded, show_reasons, rows = Counter(), Counter(), Counter(), Counter(), []
+    shows_by_reason = Counter()   # 原因 -> 有这类未完成集的剧数（一部剧可计入多个原因）
     unaired = 0
+    held_back = 0                 # 有未完成集、但只剩补跑不推进的集，没写进名单的剧
     keep = []
     for tid in id_list:
         if tid not in shows:
             reason = "show:no_source" if tid in ledgers["fail_shows"] else "show:not_expanded"
             show_reasons[reason] += 1
-            if reason == "show:not_expanded" or not exclude_dead:
+            listed = include_dead or reason not in TERMINAL_REASONS
+            if listed:
                 keep.append(tid)
             if report_path:
-                rows.append(json.dumps({"tmdbId": tid, "reason": reason}, ensure_ascii=False))
+                rows.append(json.dumps({"tmdbId": tid, "reason": reason, "in_remaining": listed},
+                                       ensure_ascii=False))
             continue
         show_open = False
+        open_reasons = set()
         for season, episode, not_aired in shows[tid]:
             key = episode_key(tid, season, episode)
             if not_aired:
@@ -477,8 +498,9 @@ def run(base_dir, ids=None, out="ids_remaining.txt", report=None, verify_r2=Fals
             if finished:
                 done[reason] += 1
                 continue
-            dropped = exclude_dead and (reason.startswith("dead:") or reason == "no_source")
+            dropped = not include_dead and reason in TERMINAL_REASONS
             (excluded if dropped else remaining)[reason] += 1
+            open_reasons.add(reason)
             show_open = show_open or not dropped
             if report_path:
                 rows.append(json.dumps({
@@ -489,8 +511,11 @@ def run(base_dir, ids=None, out="ids_remaining.txt", report=None, verify_r2=Fals
                     "local_mp4": key in ledgers["local_mp4"],
                     "in_r2": None if r2 is None else key in r2,
                 }, ensure_ascii=False))
+        shows_by_reason.update(open_reasons)
         if show_open:
             keep.append(tid)
+        elif open_reasons:
+            held_back += 1
 
     _write_atomic(out_path, keep)
     if report_path:
@@ -500,16 +525,17 @@ def run(base_dir, ids=None, out="ids_remaining.txt", report=None, verify_r2=Fals
         "shows": len(id_list), "duplicates": duplicates, "episodes": sum(done.values())
         + sum(remaining.values()) + sum(excluded.values()), "unaired": unaired,
         "done": dict(done), "remaining": dict(remaining), "excluded": dict(excluded),
-        "show_reasons": dict(show_reasons), "written": len(keep),
+        "show_reasons": dict(show_reasons), "shows_by_reason": dict(shows_by_reason),
+        "held_back": held_back, "written": len(keep),
         "bad_lines": dict(ledgers["bad_lines"]), "out": str(out_path),
         "report": str(report_path) if report_path else None,
         "r2_listed": None if r2 is None else len(r2),
     }
-    _print_summary(summary, r2_note, time.time() - started, exclude_dead)
+    _print_summary(summary, r2_note, time.time() - started, include_dead)
     return summary
 
 
-def _print_summary(s, r2_note, seconds, exclude_dead):
+def _print_summary(s, r2_note, seconds, include_dead):
     total = s["episodes"] or 1
     print(f"\n剧 {s['shows']} 部" + (f"（另有重复 {s['duplicates']} 个已去掉）" if s["duplicates"] else "")
           + f"，已播出的集 {s['episodes']} 集" + (f"（另有未播出 {s['unaired']} 集不计）" if s["unaired"] else ""))
@@ -518,18 +544,34 @@ def _print_summary(s, r2_note, seconds, exclude_dead):
     done = sum(s["done"].values())
     print(f"已完成（已进 R2）{done} 集（{done / total:.1%}）"
           + (f"，其中台账没记、R2 上已有 {s['done']['r2_only']} 集" if s["done"].get("r2_only") else ""))
-    print("未完成：")
-    for reason, label in REASONS.items():
-        kept, dropped = s["remaining"].get(reason, 0), s["excluded"].get(reason, 0)
-        if kept or dropped:
-            tail = "（已按 --exclude-dead 排除）" if dropped else ""
-            print(f"  {kept + dropped:7d}  {label}{tail}")
-    for reason, label in SHOW_REASONS.items():
-        if s["show_reasons"].get(reason):
-            print(f"  {s['show_reasons'][reason]:7d}  部剧：{label}")
-    if exclude_dead:
-        print(f"按 --exclude-dead 排除判死 / 无源的 {sum(s['excluded'].values())} 集")
-    print(f"写入 {s['out']}：{s['written']} 部剧（还有未完成集）" + (f"；明细 {s['report']}" if s["report"] else ""))
+    sections = [("未完成", lambda reason: True)] if include_dead else [
+        ("未完成·补跑能推进（进名单）", lambda reason: reason not in TERMINAL_REASONS),
+        ("未完成·补跑不推进（不进名单）", lambda reason: reason in TERMINAL_REASONS),
+    ]
+    for title, wanted in sections:
+        lines = []
+        for reason, label in REASONS.items():
+            count = s["remaining"].get(reason, 0) + s["excluded"].get(reason, 0)
+            if count and wanted(reason):
+                lines.append(f"  {count:9d} 集  {s['shows_by_reason'].get(reason, 0):6d} 部剧  {label}")
+        for reason, label in SHOW_REASONS.items():
+            if s["show_reasons"].get(reason) and wanted(reason):
+                lines.append(f"  {'':12s}  {s['show_reasons'][reason]:6d} 部剧  {label}")
+        if lines:
+            print(f"{title}：")
+            print("\n".join(lines))
+    print(f"写入 {s['out']}：{s['written']} 部剧"
+          + ("（有未完成集，含只剩无源 / 判死集的剧）" if include_dead else "（有补跑能推进的集）")
+          + (f"；明细 {s['report']}" if s["report"] else ""))
+    skipped_shows = s["held_back"] + (0 if include_dead else s["show_reasons"].get("show:no_source", 0))
+    if skipped_shows:
+        print(f"另有 {skipped_shows} 部剧只剩无源 / 判死集，补跑不会推进，未写入（--include-dead 可一并写入）。")
+    hints = [hint for reason, hint in TERMINAL_HINTS.items()
+             if s["remaining"].get(reason) or s["excluded"].get(reason)]
+    if hints:
+        print("这些集要用专用模式处理（自己读台账，用完整的 ids.txt 跑，不要用补跑名单）：")
+        for hint in hints:
+            print(f"  {hint}")
     if s["bad_lines"]:
         print("⚠️ 跳过的坏行：" + "，".join(f"{k} {v} 行" for k, v in s["bad_lines"].items()))
     print(f"用时 {seconds:.1f}s")
@@ -545,11 +587,15 @@ def main(argv=None):
     parser.add_argument("--out", default="ids_remaining.txt", help="输出文件（相对 --dir，必须是普通文件）")
     parser.add_argument("--report", default=None, help="逐集明细 jsonl（相对 --dir，可选，必须是普通文件）")
     parser.add_argument("--verify-r2", action="store_true", help="列一遍 R2 核对（需 .env 里的 R2 凭证）")
-    parser.add_argument("--exclude-dead", action="store_true",
-                        help="排除判死（画质 / 硬字幕 / 水印 / 时长不符 / 人工）与确认无源的集")
+    dead = parser.add_mutually_exclusive_group()
+    dead.add_argument("--include-dead", action="store_true",
+                      help="只剩判死（画质 / 硬字幕 / 水印 / 时长不符 / 人工）或无源集的剧也写进名单"
+                           "（默认不写：补跑不会推进它们）")
+    dead.add_argument("--exclude-dead", action="store_true",
+                      help="已是默认行为（保留以兼容电影侧的用法）")
     args = parser.parse_args(argv)
     run(args.dir, ids=args.ids, out=args.out, report=args.report,
-        verify_r2=args.verify_r2, exclude_dead=args.exclude_dead)
+        verify_r2=args.verify_r2, include_dead=args.include_dead)
 
 
 if __name__ == "__main__":

@@ -160,3 +160,16 @@ def test_shipped_config():
     assert cfg["link_health"]["vidlink_cache_roll_hours"] == 49
     assert cfg["link_health"]["broken_vidlink_hosts"] == ["bcdnxw.hakunaymatata.com"]
     assert cfg["link_health"]["signed_link_max_age_hours"] == {"bcdn4.hakunaymatata.com": 24}
+
+
+def test_tripped_host_does_not_drain_the_whole_source(capsys):
+    """🔴 熔断时闸门不能把来源整条拖进冷却堆：单独跑时会在一次 poll 里空转几万集、
+    pipeline 模式下会抽空取流侧的有界队列、反压失效。冷却堆满了就报 wait。"""
+    _trip(FINAL, 1000)
+    src = Src([ep(7, i, [hls("7", i)]) for i in range(1, 501)], closed=False)
+    screen = d.DispatchScreen(wall=lambda: NOW, max_held=8)
+    screen.set_source(src)
+    assert screen.poll() == ("wait", None)
+    assert len(src.items) == 500 - 8, "冷却堆满了就不再从来源往外拿"
+    assert screen.poll() == ("wait", None)
+    assert len(src.items) == 500 - 8

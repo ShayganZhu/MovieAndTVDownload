@@ -614,3 +614,65 @@ def test_reject_refuses_while_main_runs(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(d, "is_main_running", lambda: True)
     assert d.reject_episodes(["66_S01E02"]) == (0, 0)
     assert r2.deleted == [] and "主流程正在运行" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------ 记录模式（TV 首批校准，2026-10-30）
+
+def _add_record_mode_hit(tid="66", season=1, episode=3, reasons=("hardsub",), action="record"):
+    """同剧下一集 66_S01E03 在记录模式下判出硬字幕、照常上传了；截图在 {集 key}/{版本}/。"""
+    node = d._normalize_url_entry(hls(tid, episode))
+    key = d.episode_key(tid, season, episode)
+    folder = os.path.join(d.HARDSUB_EVIDENCE_DIR, key, d._overlay_version_label(node))
+    os.makedirs(folder)
+    open(os.path.join(folder, "1.jpg"), "wb").close()
+    with open(d.HARDSUB_SCAN_LOG, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": tid, "season": season, "episode": episode, "title": f"T{tid}",
+                             "action": action, "verdict": "rejected", "reasons": list(reasons),
+                             "near_miss": [], "checked_at": 100, "evidence_dir": folder,
+                             "node_key": d.overlay_node_key(node)}) + "\n")
+    return folder
+
+
+def test_near_miss_report_lists_record_mode_hits(tmp_path, monkeypatch, capsys):
+    _setup_reject(tmp_path, monkeypatch)
+    folder = _add_record_mode_hit()
+    d.report_near_miss()
+    out = capsys.readouterr().out
+    assert "66_S01E03\tT66\t检出:hardsub\t已上传 0.80 GB" in out and folder in out
+    assert "66_S01E02\tT66\t临门槛:hardsub" in out
+    assert "待核对 3 集（临门槛 2、检出 1）" in out
+
+
+def test_kill_mode_hits_are_not_listed(tmp_path, monkeypatch, capsys):
+    """kill 模式判出的集已就地删除，不该出现在待核对清单里。"""
+    _setup_reject(tmp_path, monkeypatch)
+    _add_record_mode_hit(action="kill")
+    d.report_near_miss()
+    out = capsys.readouterr().out
+    assert "66_S01E03" not in out and "待核对 2 集" in out
+
+
+def test_reject_takes_reason_from_record_mode_hit(tmp_path, monkeypatch):
+    """记录模式检出的集不用 --reason：理由取检出的，只拉黑这个版本，截图留在原版本目录。"""
+    r2 = _setup_reject(tmp_path, monkeypatch)
+    folder = _add_record_mode_hit(reasons=("watermark",))
+
+    assert d.reject_episodes(["66_S01E03"]) == (1, 800_000_000)
+
+    assert r2.deleted == ["test/tv/2010/66/S01/E03/E03.mp4"]
+    assert "test/tv/2010/66/S01/E02/E02.mp4" in r2.objects, "同剧上一集不动"
+    rejects = _read_jsonl(d.OVERLAY_NODE_REJECT_LOG)
+    assert [(r["episode"], r["node_key"], r["reason"], r["manual"], r["evidence_dir"])
+            for r in rejects] == [(3, "vidup|m3u8|" + FINAL, "watermark", True, folder)]
+    assert rejects[0]["summary"].startswith("记录模式检出、人工确认")
+    assert os.path.isfile(os.path.join(folder, "1.jpg"))
+    assert [r["stage"] for r in _read_jsonl(d.FAILED_LOG)] == ["watermark_retry"]
+
+
+def test_shipped_config_records_instead_of_killing():
+    """TV 首批用记录模式：只记录、照常交付，跑完一批再定要不要切回 kill。"""
+    import yaml
+
+    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
+                              encoding="utf-8"))["download_tv"]
+    assert cfg["hardsub_check"]["action"] == "record"

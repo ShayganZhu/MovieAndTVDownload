@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 import heapq
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import (
     FIRST_COMPLETED,
     CancelledError,
@@ -6263,12 +6263,16 @@ class DispatchScreen:
        （不带"需重新取流"标记，免得重取闭环白跑），下次运行到点后照常处理。
 
     来源报 done 时还有挂起冷却中的集就报 wait，冷却到点再派出去。
+    冷却中的集最多 max_held 个（默认 DOWNLOAD_QUEUE_DEPTH）：满了就报 wait、不再从来源往外拿。
+    没有这道上限的话，主机熔断期间一次 poll 会把来源整条拖进冷却堆——单独跑时是整轮存量
+    （实测 2 万集一次拿空、刷 2 万行日志），pipeline 模式下会抽空取流侧的有界队列、反压失效。
     """
 
-    def __init__(self, on_skip=None, clock=time.monotonic, wall=time.time):
+    def __init__(self, on_skip=None, clock=time.monotonic, wall=time.time, max_held=None):
         self._on_skip = on_skip or (lambda entry, reason: None)
         self._clock = clock
         self._wall = wall
+        self._max_held = max(1, int(max_held if max_held is not None else DOWNLOAD_QUEUE_DEPTH))
         self._source = None
         self._cooling = []
         self._seq = 0
@@ -6284,6 +6288,9 @@ class DispatchScreen:
             now = self._clock()
             if self._cooling and self._cooling[0][0] <= now:
                 _due, _seq, entry = heapq.heappop(self._cooling)
+            elif len(self._cooling) >= self._max_held:
+                # 冷却堆满了：先不从来源往外拿，等冷却到点再说（保住来源的反压）。
+                return "wait", None
             else:
                 state, entry = self._source.poll()
                 if state == "done" and self._cooling:
@@ -7715,18 +7722,34 @@ def _uploaded_node(key, record):
     return None
 
 
+def _scan_flags(scan):
+    """一条检测记录要人工核对的理由：("检出", 理由列表) / ("临门槛", 理由列表) / None。
+
+    检出 = 记录模式（action=record）下判出硬字幕/水印、却照常交付了的集（TV 首批用记录模式
+    校准，2026-10-30）；kill 模式下判出的集已就地删除，不在此列。
+    """
+    if scan.get("action") == "record" and scan.get("reasons"):
+        return "检出", list(scan["reasons"])
+    if scan.get("near_miss"):
+        return "临门槛", list(scan["near_miss"])
+    return None
+
+
 def report_near_miss():
-    """列出本机待人工核对的临门槛集（只读）。
+    """列出本机待人工核对的集（只读）：记录模式下检出的集 + 临门槛的集。
 
     临门槛 = 硬字幕/水印检测没判死、但离门槛不远的集：照常上传了，截图存在
-    {evidence_dir}/near_miss/{集 key}/。人工看过截图、确认确实带硬字幕/水印的，用 reject 处置。
+    {evidence_dir}/near_miss/{集 key}/。
+    记录模式检出 = action=record 时判出硬字幕/水印、照常上传了的集，截图存在
+    {evidence_dir}/{集 key}/{版本}/。
+    人工看过截图、确认确实带硬字幕/水印的，用 reject 处置。
     """
     scans = {
         key: record for key, record in _latest_by_key(HARDSUB_SCAN_LOG).items()
-        if record.get("near_miss")
+        if _scan_flags(record)
     }
     if not scans:
-        print(f"{HARDSUB_SCAN_LOG} 里没有临门槛的集，无需核对。")
+        print(f"{HARDSUB_SCAN_LOG} 里没有检出或临门槛的集，无需核对。")
         return
     success = _latest_by_key(SUCCESS_LOG)
     rejected = _manual_reject_times()
@@ -7740,9 +7763,12 @@ def report_near_miss():
             continue
         pending.append((key, scan, success.get(key) or {}))
 
-    print(f"===== 临门槛待核对（{HARDSUB_SCAN_LOG}）=====")
+    print(f"===== 检出 / 临门槛待核对（{HARDSUB_SCAN_LOG}）=====")
     total_bytes = 0
+    kinds = Counter()
     for key, scan, record in pending:
+        kind, flags = _scan_flags(scan)
+        kinds[kind] += 1
         size = int(record.get("file_size_bytes") or 0)
         total_bytes += size if record.get("uploaded") else 0
         status = "已上传" if record.get("uploaded") else ("仅本地" if record else "无成品记录")
@@ -7751,14 +7777,15 @@ def report_near_miss():
         ]
         print(
             f"{key}\t{(scan.get('title') or record.get('title') or '')[:30]}\t"
-            f"临门槛:{'/'.join(scan['near_miss'])}\t{status} {_bytes_to_gb(size):.2f} GB\t"
+            f"{kind}:{'/'.join(flags)}\t{status} {_bytes_to_gb(size):.2f} GB\t"
             f"字幕帧 {scan.get('hit_ratio')} 对齐 {scan.get('aligned_ratio')} "
             f"文本 {scan.get('distinct_texts')}"
             + (f"\t常驻文字 {texts[:3]}" if texts else "")
             + f"\t截图 {scan.get('evidence_dir') or '（无）'}"
         )
     print(
-        f"待核对 {len(pending)} 集，其中已上传 R2 的合计 {_bytes_to_gb(total_bytes):.2f} GB"
+        f"待核对 {len(pending)} 集（" + "、".join(f"{k} {v}" for k, v in sorted(kinds.items()))
+        + f"），其中已上传 R2 的合计 {_bytes_to_gb(total_bytes):.2f} GB"
         + (f"；另有 {done} 集已处置" if done else "")
     )
     if pending:
@@ -7844,10 +7871,10 @@ def reject_episodes(keys, reason=None, dry_run=False):
         if not record:
             print(f"[{key}] success.jsonl 里没有这一集（未下载或已处置），跳过")
             continue
-        near = scan.get("near_miss") or []
-        film_reason = reason or ("hardsub" if "hardsub" in near else (near[0] if near else None))
+        flags = (_scan_flags(scan) or (None, []))[1]
+        film_reason = reason or ("hardsub" if "hardsub" in flags else (flags[0] if flags else None))
         if film_reason is None:
-            print(f"[{key}] 不在临门槛清单里，需用 --reason {'|'.join(REJECT_REASON_LABELS)} "
+            print(f"[{key}] 不在检出 / 临门槛清单里，需用 --reason {'|'.join(REJECT_REASON_LABELS)} "
                   f"指明理由，跳过")
             continue
         tmdb_id, season, episode = parsed
@@ -7896,7 +7923,12 @@ def reject_episodes(keys, reason=None, dry_run=False):
             print(f"[{key}] 已处置：R2 删除 {len(r2_keys)} 个对象，移出成品，下次运行重下")
             continue
         # 硬字幕/水印来自临门槛核对；时长不符来自人工复核成品。
-        source = "临门槛人工确认" if film_reason in ("hardsub", "watermark") else "人工复核确认"
+        if film_reason not in ("hardsub", "watermark"):
+            source = "人工复核确认"
+        elif (_scan_flags(scan) or ("",))[0] == "检出":
+            source = "记录模式检出、人工确认"
+        else:
+            source = "临门槛人工确认"
         node = _uploaded_node(key, record) if OVERLAY_RETRY_OTHER_NODES else None
 
         # 截图先挪到判死目录（版本级处置挪到该版本的子目录），记录里记挪动后的实际位置。

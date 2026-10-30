@@ -79,8 +79,10 @@ def test_episodes_are_classified_and_shows_with_open_episodes_are_listed(box):
     }
     assert summary["done"] == {"uploaded": 3}
     assert summary["unaired"] == 1, "未播出的 1_S01E09 不算未完成"
-    assert (box / "ids_remaining.txt").read_text(encoding="utf-8").split() == ["1", "3", "4"], \
-        "剧 2 全部完成，不进补跑名单；重复的 1 只出现一次"
+    assert (box / "ids_remaining.txt").read_text(encoding="utf-8").split() == ["1", "4"], \
+        "剧 2 全部完成、剧 3 整剧无源，都不进补跑名单；重复的 1 只出现一次"
+    assert summary["excluded"] == {"dead:hardsub": 1, "no_source": 1}, \
+        "剧 1 的判死 / 无源集照常计数，只是不算补跑能推进的集"
 
 
 def test_verify_r2_reports_missing_mismatch_and_r2_only(box):
@@ -97,10 +99,60 @@ def test_verify_r2_reports_missing_mismatch_and_r2_only(box):
     assert summary["r2_listed"] == 3
 
 
-def test_exclude_dead_drops_dead_and_no_source_episodes(box):
-    summary, _ = _reasons(box, exclude_dead=True)
-    assert summary["excluded"] == {"dead:hardsub": 1, "no_source": 1}
+def _add_terminal_only_shows(box):
+    """剧 5 只剩无源 + 硬字幕判死的集，剧 6 只剩画质判死的集：补跑都不会推进。"""
+    with open(box / "ids.txt", "a", encoding="utf-8") as fh:
+        fh.write("5\n6\n")
+    with open(box / "seasons_cache.jsonl", "a", encoding="utf-8") as fh:
+        for tid in ("5", "6"):
+            fh.write(json.dumps({"tmdbId": tid, "ended": True,
+                                 "seasons": [{"season": 1, "episodes": [1, 2]}]}) + "\n")
+    with open(box / "fail.txt", "a", encoding="utf-8") as fh:
+        fh.write("5\t1\t1\n")
+    with open(box / "download_dead.jsonl", "a", encoding="utf-8") as fh:
+        for tid, ep, cls in (("5", 2, "hardsub"), ("6", 1, "quality"), ("6", 2, "quality")):
+            fh.write(json.dumps({"tmdbId": tid, "season": 1, "episode": ep, "reason_class": cls}) + "\n")
+
+
+def test_shows_with_only_dead_or_no_source_episodes_are_held_back(box, capsys):
+    """🔴 TV 集级有源率只有个位数百分比：只剩无源 / 判死集的剧照常计数、进明细，但不进补跑名单
+    ——否则名单约等于整个 ids.txt，补跑一遍什么也不会发生。"""
+    _add_terminal_only_shows(box)
+    summary, reasons = _reasons(box)
+    out = capsys.readouterr().out
+
     assert (box / "ids_remaining.txt").read_text(encoding="utf-8").split() == ["1", "4"]
+    assert summary["held_back"] == 2
+    assert summary["excluded"] == {"dead:hardsub": 2, "dead:quality": 2, "no_source": 2}
+    assert summary["shows_by_reason"]["dead:quality"] == 1
+    assert summary["shows_by_reason"]["no_source"] == 2, "剧 1 与剧 5 各有无源集"
+    assert reasons["6_S01E01"] == "dead:quality", "明细照常列出"
+    rows = [json.loads(x) for x in (box / "report.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert {row.get("key") or row["tmdbId"]: row["in_remaining"] for row in rows
+            if row["tmdbId"] in ("3", "5")} == {"3": False, "5_S01E01": False, "5_S01E02": False}
+
+    assert "另有 3 部剧只剩无源 / 判死集" in out, "剧 5、6 加整剧无源的剧 3"
+    assert "python tv_ids_to_links.py --recheck-dead" in out
+    assert "python download_tv.py --retry-dead" in out
+
+
+def test_include_dead_restores_the_old_list(box, capsys):
+    _add_terminal_only_shows(box)
+    summary, _ = _reasons(box, include_dead=True)
+    assert (box / "ids_remaining.txt").read_text(encoding="utf-8").split() == ["1", "3", "4", "5", "6"]
+    assert summary["excluded"] == {} and summary["held_back"] == 0
+    assert "补跑不会推进" not in capsys.readouterr().out
+
+
+def test_cli_keeps_exclude_dead_as_the_default(box, monkeypatch):
+    seen = []
+    monkeypatch.setattr(r, "run", lambda *a, **kw: seen.append(kw["include_dead"]))
+    r.main(["--dir", str(box), "--exclude-dead"])
+    r.main(["--dir", str(box)])
+    r.main(["--dir", str(box), "--include-dead"])
+    assert seen == [False, False, True]
+    with pytest.raises(SystemExit):
+        r.main(["--dir", str(box), "--include-dead", "--exclude-dead"])
 
 
 def test_specials_are_skipped_when_disabled(box):

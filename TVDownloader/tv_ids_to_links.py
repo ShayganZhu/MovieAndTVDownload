@@ -613,6 +613,13 @@ _BREAKER_CFG = _CFG.get("provider_breaker") or {}
 BREAKER_ENABLED = bool(_BREAKER_CFG.get("enabled", True))
 BREAKER_TRIP_AFTER = max(1, int(_BREAKER_CFG.get("trip_after", 30)))
 BREAKER_PROBE_INTERVAL = max(1.0, float(_BREAKER_CFG.get("probe_interval_minutes", 10)) * 60)
+# 熔断时会阻止判死的源（2026-10-30 用户定的口径）：只有它们熔断、没问到时才推迟；其余源
+# （videasy）熔断期间，问到的源都说无此集就照常判死。TV 绝大多数集是真无源，videasy 又没见过
+# 独占的集——让它的宕机把成百万的无源判定全部推迟、每次运行重查，代价远大于收益。
+BREAKER_BLOCKS_DEAD = frozenset(
+    str(name).strip() for name in
+    (_BREAKER_CFG.get("blocks_dead") or ("vidup", "vidfast", "vidlink")) if str(name).strip()
+)
 
 # 各家的第一跳（源站自己的接口，不含 enc-dec）。只有这一步被拒才说明"整个源不可用"；
 # 后面环节的错误多半只关乎某部片或某个 server。enc-dec 是三家共用的服务，它坏了
@@ -1461,8 +1468,14 @@ def process_episode(tid, season, episode, providers=None, stop_event=None):
                 if down_providers:
                     # 问到的源都说无此集，但还有源在熔断中没问到：这时下不了"无源"的结论，
                     # 再重试也只是空转（它恢复前每次都一样），交给上层另记名单。
-                    return "deferred", {"tmdbId": str(tid), "season": int(season),
-                                        "episode": int(episode), "providers": down_providers}
+                    # 例外：熔断的只有不阻止判死的源（BREAKER_BLOCKS_DEAD 以外，即 videasy），
+                    # 且至少有一家实际答了"无此集"——照常走无源判定（含判死二次确认）。
+                    blocking = [n for n in down_providers if n in BREAKER_BLOCKS_DEAD]
+                    if blocking or not nosource_errors:
+                        return "deferred", {"tmdbId": str(tid), "season": int(season),
+                                            "episode": int(episode), "providers": down_providers}
+                    nosource_errors.append(
+                        f"{'、'.join(down_providers)}: 熔断中未问到（不阻止判死）")
                 raise NoSource("; ".join(nosource_errors))
 
             except Exception as e:
