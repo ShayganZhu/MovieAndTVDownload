@@ -145,12 +145,11 @@ tv_ids_to_links:
   # vidlink 垫底——它的价值是**兜底覆盖**（独占 798/1278 集）而非画质，
   # 且其失败中 99.1% 是"码率未达门槛"，排前面只会增加无效试错。
   # ⚠️ 别按覆盖率排序：vidlink 覆盖 94% 但画质最差，排前面会系统性拉低成片质量。
-  # videasy 2026-10-30 起长期启用，放在 vidlink 前（画质优先）：06 号机实测它的流与 vidup /
-  # vidfast 同在 sun.finalsignal.top / moon.goldenkite.top，热门剧样本里没见到独占的集，但
-  # vidup / vidfast 临时取不到时能兜底给出 HLS（《双城之战》S01E02：两者连续超时，videasy 照样
-  # 出流，否则只剩画质最差的 vidlink）。代价是每集多 seed + 各 server 的 sources + dec
-  # 共 5–7 个请求；取流吞吐吃紧时可去掉它。
-  providers: [vidup, vidfast, videasy, vidlink]
+  # videasy 2026-10-30 起移出（上午曾长期启用）：23 号机首轮 572 集有链接的集里，有 videasy
+  # 链接的 20 集都同时有别家的链接，已上传的 127 集没有一集是用它下成的；而它的 phoenix 等满
+  # 60 秒不回、miami 回 401 / 500，每集白等半分钟以上。代码仍保留，要恢复就加回本列表（它不在
+  # provider_breaker.blocks_dead 里，出错不阻止判死）。
+  providers: [vidup, vidfast, vidlink]
   # 并发线程数：同时解析多少集。配合住宅代理分散 IP。
   # 无源404不重试，任务为纯IO等待，可拉高并发；电影版 50 实测稳定。
   # 2026-09 全量实跑：50 并发时老剧段（判死需 2 轮 × 5 server）仅 ~72 集/分钟，瓶颈在代理 RTT，
@@ -163,7 +162,10 @@ tv_ids_to_links:
   retry_delay: 1
   # 判死二次确认：首次 404 只算“疑似无源”，换出口 IP 再完整探一次，连续两次 404 才写 fail.txt，
   # 防 CDN/代理抖动把有源集永久误判丢失；命中过 404 的集重试预算 +1。false 则单次 404 即判死。
-  dead_confirm: true
+  # 🔴 2026-10-30 TV 全量起关闭（用户定）：它让取流成本翻倍（每集无源要把各家完整问两遍），
+  # 而 09 月 5 万集"疑似无源"经二次确认翻成有源的是 0 集；10-30 那两例"有链接却判了无源"
+  # 是慢 server 超时造成的，已由 stream_timeout 修好。要复查无源集用 --recheck-dead。
+  dead_confirm: false
   # 批量误杀熔断：连续 N 集判死且中间无一成功时，先复探 3 个历史成功集（金丝雀，优先本轮刚成功的）：
   # 有任一成功 → 上游正常、这段只是真无源，继续跑；无一成功且至少一个明确 404 → 判定 vidup/enc-dec
   # 系统性变更，回滚本窗口写入 fail_file 的 N 行并以退出码 2 终止，防止上游一坏就把整批集“正确地”永久判死。
@@ -191,6 +193,9 @@ tv_ids_to_links:
     # 熔断时会阻止判死的源：只有它们熔断、没问到时才把集记为推迟。不在这里的源（videasy）
     # 熔断期间，问到的源都说无此集就照常判死（2026-10-30 定：TV 绝大多数集是真无源，videasy
     # 实测没有独占的集，不能让它的宕机把成百万的无源判定全部推迟、每次运行重查）。
+    # 不在这里的源出任何错（超时、401、500……）也一样不阻止判死，而且连续 trip_after 次出错
+    # 就熔断跳过——23 号机首轮 videasy 的 phoenix 等满 60 秒不回、miami 回 401 / 500，入口
+    # seed 却正常，旧规则下每一集都被它拖成"瞬时错误"、判不了死，还每次白等半分钟以上。
     blocks_dead: [vidup, vidfast, vidlink]
   # ---- 直连分流 ----
   # 代理网关在新加坡（24 号机往返 230ms），经它的请求中位 1.2–5.4 秒、约 8% 在 12 秒内
@@ -212,6 +217,13 @@ tv_ids_to_links:
   round_backoff_max: 300
   # 单个 HTTP 请求超时（秒）
   timeout: 12
+  # 向各 server 要流（vidup / vidfast 的 stream、videasy 的 {server}/sources）的超时（秒）。
+  # 2026-10-30 23 号机首轮：vidup 的 Eclipse、vidfast 的 Bravo / Horizon 没片时要 13~18 秒才回 404
+  # （19 号机放宽到 60 秒实测：中位 13.4~15.9 秒、最长 18.4 秒；有片时 Eclipse 中位 10.4 秒、
+  # 最长 16.1 秒），12 秒的超时恰好卡在它们作答之前——这一集永远判不了无源（45 分钟判死 0 集），
+  # Eclipse 有片时也会漏掉链接。而这几个 server 恰恰出片最多（23 号机 Eclipse 给了 47 集、
+  # Bravo 38 集，大多只有它们有）。其余 server 1 秒左右作答，放宽不影响它们。
+  stream_timeout: 30
   # 代理配置：vidup.to 有 Cloudflare 机房 IP 拦截，直连会 403，需走住宅代理。
   # 敏感项 user/password 请配置到同目录 .env 的 PROXY_USER / PROXY_PASSWORD（见 .env.example）。
   # 环境变量优先；此处 user/password 留空，仅作本地调试回退。生产环境务必留空。

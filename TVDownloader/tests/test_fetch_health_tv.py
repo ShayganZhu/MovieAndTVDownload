@@ -382,16 +382,18 @@ def test_videasy_without_a_title_asks_only_the_first_server(monkeypatch):
     assert not any("/miami/" in u for u in session.urls)
 
 
-def test_videasy_is_enabled_before_vidlink():
+def test_shipped_providers_and_dead_confirm():
     import os
 
     import yaml
 
     path = os.path.join(os.path.dirname(m.__file__), "config.yaml")
     cfg = yaml.safe_load(open(path, encoding="utf-8"))["tv_ids_to_links"]
-    assert "videasy" in m.PROVIDERS
-    assert cfg["providers"] == ["vidup", "vidfast", "videasy", "vidlink"], \
-        "videasy 长期启用、排在 vidlink 前（画质优先）"
+    assert "videasy" in m.PROVIDERS, "代码保留，要恢复就加回 providers"
+    assert cfg["providers"] == ["vidup", "vidfast", "vidlink"], \
+        "2026-10-30 起移出 videasy：23 号机首轮没有一集只有它有、也没有一集用它下成"
+    assert cfg["dead_confirm"] is False and m.DEAD_CONFIRM is False, \
+        "TV 全量关闭判死二次确认（用户 2026-10-30 定）"
 
 
 # ------------------------------------------------------------ 哪些源熔断才阻止判死（2026-10-30）
@@ -399,6 +401,7 @@ def test_videasy_is_enabled_before_vidlink():
 def test_videasy_outage_does_not_block_a_dead_verdict(monkeypatch):
     """🔴 videasy 熔断、其余源都说无此集：照常判死（走二次确认），不推迟。
     TV 绝大多数集是真无源，不能让一个没有独占的源的宕机把它们全部推迟。"""
+    monkeypatch.setattr(m, "DEAD_CONFIRM", True)   # 配置已关闭，这里专测打开时的行为
     seen = _install_fake_session(monkeypatch, PAGE, [], page_status=404)
     _use_breaker(monkeypatch, trip=1).record("videasy", "down")
     status, result = m.process_episode("42", 1, 1, providers=["vidup", "vidfast", "videasy", "vidlink"])
@@ -433,3 +436,187 @@ def test_shipped_config_lists_the_dead_blocking_providers():
     cfg = yaml.safe_load(open(path, encoding="utf-8"))["tv_ids_to_links"]["provider_breaker"]
     assert cfg["blocks_dead"] == ["vidup", "vidfast", "vidlink"]
     assert "videasy" not in m.BREAKER_BLOCKS_DEAD
+
+
+# ------------------------------------------------------------ 慢 server 与 videasy 出错（2026-10-30，23 号机首轮）
+
+def test_stream_requests_wait_for_slow_servers(monkeypatch):
+    """🔴 vidup 的 Eclipse、vidfast 的 Bravo / Horizon 没片时要 13~18 秒才回 404：向 server 要流
+    必须用更长的 stream_timeout，其余请求照旧用 timeout。"""
+    monkeypatch.setattr(m, "STREAM_TIMEOUT", 30.0)
+    monkeypatch.setattr(m, "TIMEOUT", 12)
+    _install_fake_session(monkeypatch, PAGE, [{"url": "u1"}])
+    fake = m.requests.Session
+    seen = []
+    orig = fake.post
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        seen.append((url.rsplit("/", 2)[-2] if "/stream/" in url else url.rsplit("/", 1)[-1], timeout))
+        return orig(self, url, headers=headers, json=json, timeout=timeout)
+
+    monkeypatch.setattr(fake, "post", post)
+    status, _ = m.process_episode("42", 1, 1, providers=["vidup"])
+    assert status == "ok"
+    assert ("stream", 30.0) in seen
+    assert all(t == 12 for name, t in seen if name != "stream"), seen
+
+
+def test_shipped_stream_timeout_covers_the_slow_servers():
+    import os
+
+    import yaml
+
+    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(m.__file__), "config.yaml"),
+                              encoding="utf-8"))["tv_ids_to_links"]
+    assert cfg["stream_timeout"] == 30 and cfg["timeout"] == 12
+    assert m.STREAM_TIMEOUT == 30
+
+
+def _videasy_raises(monkeypatch, exc):
+    def broken(net, tid, season, episode):
+        raise exc
+    monkeypatch.setitem(m.PROVIDERS, "videasy", broken)
+
+
+ALL4 = ["vidup", "vidfast", "videasy", "vidlink"]
+
+
+def test_videasy_error_does_not_block_a_dead_verdict(monkeypatch):
+    """🔴 23 号机首轮：videasy 入口正常、server 全部超时 / 401 / 500，旧规则下每一集都被它拖成
+    瞬时错误。现在它出错等同没问到：其余源都说无此集就照常判死（走二次确认）。"""
+    _install_fake_session(monkeypatch, PAGE, [], page_status=404)
+    _videasy_raises(monkeypatch, Exception("Operation timed out after 30001 milliseconds"))
+    status, result = m.process_episode("42", 1, 1, providers=ALL4)
+    assert (status, result) == ("dead", None)
+
+
+def test_core_provider_error_still_retries(monkeypatch):
+    _install_fake_session(monkeypatch, PAGE, [], page_status=503)
+    status, _ = m.process_episode("42", 1, 1, providers=ALL4)
+    assert status == "retry", "vidup 出错仍是瞬时错误，不能判死"
+
+
+def test_only_videasy_and_it_errors_is_never_dead(monkeypatch):
+    _install_fake_session(monkeypatch, PAGE, [])
+    _videasy_raises(monkeypatch, m.HttpStatusError(401, "videasy-miami"))
+    status, _ = m.process_episode("42", 1, 1, providers=["videasy"])
+    assert status == "retry", "谁也没答过，不能凭空判死"
+
+
+def test_videasy_errors_trip_its_breaker_so_it_is_skipped(monkeypatch):
+    """不阻止判死的源出任何错都算一次不可用：连续出错就熔断跳过，不再每集白等。"""
+    b = _use_breaker(monkeypatch, trip=3)
+    for exc in (Exception("timed out"), m.HttpStatusError(401, "videasy-miami"),
+                m.HttpStatusError(500, "videasy-phoenix")):
+        assert m._breaker_outcome("videasy", exc) == "down"
+        b.record("videasy", m._breaker_outcome("videasy", exc))
+    assert b.is_down("videasy")
+    assert m._breaker_outcome("vidup", Exception("timed out")) is None, "核心源的超时仍是中性"
+    assert m._breaker_outcome("videasy", m.NoSource("x")) == "up"
+
+
+# ------------------------------------------------------------ 超时当场重发 / server 挨个问（2026-10-30）
+
+from test_tv_ids_to_links import _FakeResp  # noqa: E402
+
+
+class _Flaky:
+    """前 n 次请求抛 exc，之后正常返回。"""
+
+    def __init__(self, n, exc):
+        self.n, self.exc, self.calls = n, exc, 0
+
+    def get(self, url, **kw):
+        self.calls += 1
+        if self.calls <= self.n:
+            raise self.exc
+        return _FakeResp(text="ok")
+
+
+def test_timed_out_request_is_resent_once(monkeypatch):
+    """🔴 19 号机实测：经代理的取流页 8%~10% 超时，一集十几个请求任何一个超时整次尝试作废。
+    超时的请求当场再发一次。"""
+    monkeypatch.setattr(m, "RETRY_STATS", m._RetryStats())
+    timeout = m.requests.exceptions.Timeout("Operation timed out after 12001 milliseconds")
+    proxied = _Flaky(1, timeout)
+    assert m._Net(proxied).get("https://vidup.to/tv/1/1/1/").text == "ok"
+    assert proxied.calls == 2
+    assert m.RETRY_STATS.summary() == "超时重发 1 次、1 次成功"
+
+    twice = _Flaky(2, Exception("Connection timed out after 12000 milliseconds"))
+    with pytest.raises(Exception, match="timed out"):
+        m._Net(twice).get("https://vidup.to/tv/1/1/1/")
+    assert twice.calls == 2, "只重发一次"
+
+
+def test_other_errors_are_not_resent():
+    refused = _Flaky(1, Exception("Connection refused"))
+    with pytest.raises(Exception, match="refused"):
+        m._Net(refused).get("https://vidup.to/tv/1/1/1/")
+    assert refused.calls == 1
+
+
+class _ParallelSite:
+    """vidup 同构链路的最小假会话：每个 server 要流都要等 delay 秒，replies: data -> url / 404。"""
+
+    def __init__(self, replies, delay):
+        self.replies, self.delay = replies, delay
+        self.servers = [{"name": f"s{i}", "data": d} for i, d in enumerate(replies)]
+
+    def get(self, url, headers=None, timeout=None):
+        if "vidup.to/tv/" in url:
+            return _FakeResp(text=PAGE)
+        if url.endswith("&stage=1"):
+            return _FakeResp(payload={"status": 200, "result": {"stage1": "https://x/stage1", "token": "t"}})
+        if url.endswith("&stage=2"):
+            return _FakeResp(payload={"status": 200, "result": {
+                "servers": "https://x/servers", "stream": "https://x/stream", "token": "t"}})
+        raise AssertionError(url)
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        if url == "https://x/stage1":
+            return _FakeResp(text="S1TEXT")
+        if url == "https://x/servers":
+            return _FakeResp(text="enc-servers")
+        if url.endswith("/dec-vidup"):
+            if json["text"] == "enc-servers":
+                return _FakeResp(payload={"status": 200, "result": self.servers})
+            return _FakeResp(payload={"status": 200, "result": {"url": self.replies[json["text"]]}})
+        if url.startswith("https://x/stream/"):
+            import time as _t
+            _t.sleep(self.delay)
+            data = url.rsplit("/", 1)[1]
+            return _FakeResp(text=data, status=404 if self.replies[data] == 404 else 200)
+        raise AssertionError(url)
+
+
+def test_servers_are_asked_one_by_one_in_order():
+    """🔴 必须挨个问：19 号机实测同一集的各 server 同时问，stream 接口一律回 HTTP 500。"""
+    import threading as _th
+
+    site = _ParallelSite({"d0": "u0", "d1": 404, "d2": "u2", "d3": "u0", "d4": "u4"}, delay=0.05)
+    inflight, peak, lock = [0], [0], _th.Lock()
+    orig = site.post
+
+    def post(url, **kw):
+        if not url.startswith("https://x/stream/"):
+            return orig(url, **kw)
+        with lock:
+            inflight[0] += 1
+            peak[0] = max(peak[0], inflight[0])
+        try:
+            return orig(url, **kw)
+        finally:
+            with lock:
+                inflight[0] -= 1
+
+    site.post = post
+    urls, _, _ = m._fetch_vidup(site, "1", 1, 1)
+    assert peak[0] == 1, "同一集同时只能有一个 stream 请求"
+    assert [u["url"] for u in urls] == ["u0", "u2", "u4"]
+
+
+def test_concurrent_servers_all_404_is_still_nosource():
+    site = _ParallelSite({f"d{i}": 404 for i in range(5)}, delay=0.05)
+    with pytest.raises(m.NoSource, match="all 5 vidup servers returned 404"):
+        m._fetch_vidup(site, "1", 1, 1)

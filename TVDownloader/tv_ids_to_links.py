@@ -29,7 +29,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from urllib.parse import quote, urlsplit
@@ -106,6 +106,9 @@ API = _CFG.get("api", "https://enc-dec.app/api")
 MAX_RETRIES = _CFG.get("max_retries", 3)
 RETRY_DELAY = _CFG.get("retry_delay", 1)  # 秒
 TIMEOUT = _CFG.get("timeout", 12)  # 单个 HTTP 请求超时（秒）
+# 向各 server 要流的超时（秒）：vidup 的 Eclipse、vidfast 的 Bravo / Horizon 没片时要 13~18 秒
+# 才回 404，12 秒会卡在它们作答之前、这一集永远判不了无源（见 config.yaml stream_timeout）。
+STREAM_TIMEOUT = float(_CFG.get("stream_timeout", 30))
 
 # ---- 多轮捞回的轮间退避 ----
 # 每轮之间递增等待，给 enc-dec / 代理的短时故障留恢复窗口，避免 8 轮在几秒内烧光。
@@ -661,6 +664,10 @@ def _breaker_outcome(name, exc):
     if (isinstance(exc, HttpStatusError) and exc.where == _PROVIDER_ENTRY.get(name)
             and exc.status in _OUTAGE_STATUSES):
         return "down"
+    # 不阻止判死的源（videasy）：出任何错都算一次"不可用"。它熔断了也不会推迟任何一集，
+    # 不如早点跳过、不再每集白等（23 号机首轮：入口 seed 正常，server 却全部超时 / 401 / 500）。
+    if name not in BREAKER_BLOCKS_DEAD:
+        return "down"
     return None
 
 
@@ -851,6 +858,20 @@ class _Net:
         return self._send("post", url, kwargs)
 
     def _send(self, method, url, kwargs):
+        """超时的请求当场再发一次（2026-10-30，19 号机实测）：经代理的取流页约 8%~10%、
+        vidlink 接口约 5%~9% 在超时内拿不到响应，而一集要发十几个请求——任何一个超时
+        整次尝试就作废、整集重来。这些请求都是只读的，再发一次即可。只重试一次。"""
+        try:
+            return self._send_once(method, url, kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if not _is_timeout(exc):
+                raise
+            RETRY_STATS.note("retried")
+            resp = self._send_once(method, url, kwargs)
+            RETRY_STATS.note("recovered")
+            return resp
+
+    def _send_once(self, method, url, kwargs):
         route = _route_for(url) if self.direct is not None else None
         if route is not None and route.use_direct():
             resp = getattr(self.direct, method)(url, **kwargs)
@@ -861,10 +882,36 @@ class _Net:
         return getattr(self.proxied, method)(url, **kwargs)
 
 
+def _is_timeout(exc):
+    """curl 的连接 / 读超时（curl 28：Operation / Connection timed out）。"""
+    return isinstance(exc, requests.exceptions.Timeout) or "timed out" in str(exc).lower()
+
+
+class _RetryStats:
+    """超时当场重发的计数（线程安全），供轮次小结打印。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.counts = Counter()
+
+    def note(self, what):
+        with self._lock:
+            self.counts[what] += 1
+
+    def summary(self):
+        with self._lock:
+            retried, recovered = self.counts["retried"], self.counts["recovered"]
+        return f"超时重发 {retried} 次、{recovered} 次成功" if retried else ""
+
+
+RETRY_STATS = _RetryStats()
+
+
 def _direct_summary():
     parts = [f"{r.name} 直连 {r.served} 次、回退代理 {r.fallbacks} 次"
              for r in (ENCDEC_ROUTE, VIDLINK_ROUTE) if r.enabled]
-    return "直连：" + "；".join(parts) if parts else ""
+    retry = RETRY_STATS.summary()
+    return "；".join(x for x in ("直连：" + "；".join(parts) if parts else "", retry) if x)
 
 
 def _ep_label(tid, season, episode):
@@ -1098,27 +1145,39 @@ def _fetch_vidup_like(session, site, api_name, tid, season, episode):
     if not servers_decrypted or not isinstance(servers_decrypted, list):
         raise Exception("No servers found")
 
-    # 遍历所有服务器，收集全部可用 url
+    def ask(server):
+        """问一个 server 要流（5. stream POST → 6. dec 解密），返回解密后的流信息。"""
+        data_val = server['data']
+        stream_url = f"{stream}/{data_val}"
+        resp = _check(session.post(stream_url, headers=headers_with_token, timeout=STREAM_TIMEOUT),
+                      "stream")
+        resp = _check(session.post(dec_url, json={"text": resp.text}, timeout=TIMEOUT),
+                      f"dec-{api_name}(stream)")
+        stream_decrypted = validate(_json(resp, f"dec-{api_name}(stream)"), dec_url)
+        if not isinstance(stream_decrypted, dict):
+            raise Exception("decrypted stream is not an object")
+        return stream_decrypted
+
+    # ⚠️ 必须挨个问：2026-10-30 19 号机试过同一集的各 server 同时问，vidup / vidfast 的 stream
+    # 接口一律回 HTTP 500（11 个 server 共 5,700 多次，无一例外），一集也判不了。
+    answers = []
+    for server in servers_decrypted:
+        try:
+            answers.append((ask(server), None))
+        except Exception as exc:  # noqa: BLE001
+            answers.append((None, exc))
+
+    # 收集全部可用 url
     last_server_error = None
     urls = []
     result_title = None
     result_captions = []
     stream_404 = 0
-    for server in servers_decrypted:
+    for server, (stream_decrypted, error) in zip(servers_decrypted, answers):
         server_name = server.get('name', 'unknown') if isinstance(server, dict) else 'unknown'
         try:
-            data_val = server['data']
-            # 5. 获取加密的流数据
-            stream_url = f"{stream}/{data_val}"
-            resp = _check(session.post(stream_url, headers=headers_with_token, timeout=TIMEOUT), "stream")
-            stream_encrypted = resp.text
-
-            # 6. 解密流数据
-            resp = _check(session.post(dec_url, json={"text": stream_encrypted}, timeout=TIMEOUT), f"dec-{api_name}(stream)")
-            stream_decrypted = validate(_json(resp, f"dec-{api_name}(stream)"), dec_url)
-            if not isinstance(stream_decrypted, dict):
-                raise Exception("decrypted stream is not an object")
-
+            if error is not None:
+                raise error
             url = stream_decrypted.get("url")
             if not url:
                 raise Exception("Missing url in decrypted data")
@@ -1292,7 +1351,7 @@ def _fetch_videasy(session, tid, season, episode):
                    f"&year={year}&episodeId={int(episode)}&seasonId={int(season)}"
                    f"&tmdbId={quote(str(tid), safe='')}&imdbId={quote(str(imdb), safe='')}"
                    f"&enc=2&seed={quote(str(seed), safe='')}")
-            resp = session.get(url, headers=VIDEASY_API_HEADERS, timeout=TIMEOUT)
+            resp = session.get(url, headers=VIDEASY_API_HEADERS, timeout=STREAM_TIMEOUT)
             if resp.status_code == 404 or not resp.text.strip():
                 empty += 1
                 continue
@@ -1414,6 +1473,8 @@ def process_episode(tid, season, episode, providers=None, stop_event=None):
                 nosource_errors = []
                 transient_errors = []
                 down_providers = []
+                # 不阻止判死的源（videasy）出的错：不算瞬时错误，等同没问到（见下方判定）。
+                nonblocking_errors = []
                 for name in providers:
                     try:
                         provider_urls, provider_title, provider_captions = \
@@ -1425,6 +1486,10 @@ def process_episode(tid, season, episode, providers=None, stop_event=None):
                         nosource_errors.append(f"{name}: {e}")
                         continue
                     except Exception as e:
+                        if name not in BREAKER_BLOCKS_DEAD:
+                            nonblocking_errors.append(f"{name}: {e}")
+                            print(f"  [{name} 出错，不阻止判死] {label}: {e}")
+                            continue
                         transient_errors.append(f"{name}: {e}")
                         print(f"  [{name} 瞬时错误] {label}: {e}")
                         continue
@@ -1481,6 +1546,13 @@ def process_episode(tid, season, episode, providers=None, stop_event=None):
 
                 if transient_errors:
                     raise Exception(f"All providers failed for {label}: {transient_errors}")
+                if nonblocking_errors and not nosource_errors and not down_providers:
+                    # 只问了不阻止判死的源、而且它们都出错了：谁也没答过，不能判死。
+                    raise Exception(f"All providers failed for {label}: {nonblocking_errors}")
+                if nonblocking_errors:
+                    # 其余源都说无此集（或在熔断中，见下）：videasy 出错不妨碍判死。
+                    nosource_errors.append(
+                        f"{'、'.join(e.split(':', 1)[0] for e in nonblocking_errors)}: 出错未问到（不阻止判死）")
                 if down_providers:
                     # 问到的源都说无此集，但还有源在熔断中没问到：这时下不了"无源"的结论，
                     # 再重试也只是空转（它恢复前每次都一样），交给上层另记名单。
