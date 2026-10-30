@@ -311,9 +311,14 @@ _IDENTITY_KEYS = frozenset({
     # 字幕地址 —— 与 season/episode 被覆盖是同一类事故，且更难发现
     # （字幕能下下来，只是内容对不上集）。
     "captions",
+    # 集级的 TMDB 单集时长，同理不能被剧级元数据盖掉。
+    "episode_runtime_minutes",
 })
 # tmdbId -> TMDB 剧名，由 main() 在季集展开后填充；源站不返回 title 时用它兜底
 _TMDB_NAMES = {}
+# (tmdbId, 季, 集) -> TMDB 单集时长（分钟），由 main() 在季集展开后填充；写进结果的
+# episode_runtime_minutes，下载侧拿它当参考时长、事后 audit 筛查时长不符。
+_EPISODE_RUNTIMES = {}
 
 
 # ---------- TMDB 季集结构展开 ----------
@@ -433,6 +438,7 @@ def fetch_seasons_from_tmdb(tmdb_id):
             sd = data.get(f"season/{n}") or {}
             eps = set()
             air_dates = {}
+            runtimes = {}
             for e in (sd.get("episodes") or []):
                 num = e.get("episode_number")
                 if num is None:
@@ -442,8 +448,15 @@ def fetch_seasons_from_tmdb(tmdb_id):
                 ad = e.get("air_date")
                 if ad:
                     air_dates[str(num)] = ad
+                # TMDB 单集时长（分钟）：下载侧拿它当参考时长，事后 audit 筛查时长不符。
+                rt = e.get("runtime")
+                if isinstance(rt, (int, float)) and rt > 0:
+                    runtimes[str(num)] = rt
             if eps:
-                seasons.append({"season": n, "episodes": sorted(eps), "air_dates": air_dates})
+                season = {"season": n, "episodes": sorted(eps), "air_dates": air_dates}
+                if runtimes:
+                    season["runtimes"] = runtimes
+                seasons.append(season)
 
     year = None
     fad = info.get("first_air_date") or ""
@@ -1454,6 +1467,9 @@ def process_episode(tid, season, episode, providers=None, stop_event=None):
                     # 空列表字段（results.jsonl 是几十万行的大文件）。
                     if result_captions:
                         result["captions"] = result_captions
+                    runtime = _EPISODE_RUNTIMES.get((str(tid), int(season), int(episode)))
+                    if runtime:
+                        result["episode_runtime_minutes"] = runtime
                     # 合并剧级静态元数据，但**绝不覆盖上面的身份字段**：元数据来自
                     # tv_series.jsonl，是剧级的（一剧一条），若它哪天多出 season/
                     # episode/tmdbId 之类的键，直接 update 会把本集的真实身份改掉，
@@ -1950,6 +1966,9 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
             meta["year"] = entry["year"]
         if entry.get("name"):
             _TMDB_NAMES[tid] = entry["name"]
+        for s in entry["seasons"]:
+            for e, minutes in (s.get("runtimes") or {}).items():
+                _EPISODE_RUNTIMES[(tid, int(s["season"]), int(e))] = minutes
         # 旧版缓存行没有 ended / air_dates 字段：air_dates 缺失时不做未播判断（全部纳入），
         # 避免把老缓存里的集全当成 TBA 跳过
         ended = bool(entry.get("ended"))

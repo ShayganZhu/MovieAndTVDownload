@@ -676,3 +676,15 @@ def test_shipped_config_records_instead_of_killing():
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
                               encoding="utf-8"))["download_tv"]
     assert cfg["hardsub_check"]["action"] == "record"
+
+
+def test_reject_no_audio_rejects_only_that_version(tmp_path, monkeypatch):
+    """audit 列出的无音轨集：只拉黑这个版本、下次运行换别的版本重下，不整集判死。"""
+    r2 = _setup_reject(tmp_path, monkeypatch)
+    assert d.reject_episodes(["66_S01E03"], reason="no_audio") == (1, 800_000_000)
+    assert r2.deleted == ["test/tvs/2010/66/S01/E03/E03.mp4"]
+    rejects = _read_jsonl(d.OVERLAY_NODE_REJECT_LOG)
+    assert [(r["episode"], r["reason"], r["manual"]) for r in rejects] == [(3, "no_audio", True)]
+    assert rejects[0]["summary"].startswith("人工复核确认无音轨")
+    assert [r["stage"] for r in _read_jsonl(d.FAILED_LOG)] == ["no_audio_retry"]
+    assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == []

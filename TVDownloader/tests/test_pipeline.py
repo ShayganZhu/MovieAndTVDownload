@@ -70,8 +70,8 @@ def test_sentinel_closes_the_source():
 def test_queue_items_are_delivered_before_backlog_and_backlog_is_not_lost():
     """🔴 实时队列优先于存量，但存量必须一条不漏地发完。
 
-    队列里是刚签出的直链，有时效；大存量若先发完，队列会灌满、取流线程在
-    on_result 里等 ENQUEUE_TIMEOUT 后 dropped，新鲜链接本次运行根本消费不到。
+    队列里是刚签出的直链，有时效；大存量若先发完，队列会灌满、取流线程全卡在
+    on_result 里等，刚签出的直链在队列里一起变旧。
     另一方面下载侧启动时读的 results.jsonl 存量，取流侧 load_processed 会跳过，
     它们**永远不会从队列里出来**，来源若只认队列这批集就被静默丢弃。
     """
@@ -279,7 +279,6 @@ def test_shutdown_drains_queue_to_release_a_blocked_put(monkeypatch):
             on_result(_ep("1", 1, i))
 
     monkeypatch.setattr(p.fetcher, "main", fake_main)
-    monkeypatch.setattr(p, "ENQUEUE_TIMEOUT", 30)
     q = queue.Queue(maxsize=1)
     worker = p.FetchWorker(q)
     worker.start()
@@ -294,25 +293,53 @@ def test_shutdown_drains_queue_to_release_a_blocked_put(monkeypatch):
     assert elapsed < 5, f"shutdown 花了 {elapsed:.1f}s，说明没解开阻塞的 put"
 
 
-def test_enqueue_timeout_falls_back_to_file_without_losing_the_episode(
-    monkeypatch, capsys,
-):
-    """队列满超时只是"推迟"不是"丢失"：结果已落盘 results.jsonl。"""
+def test_full_queue_waits_for_the_downloader_instead_of_dropping(monkeypatch):
+    """🔴 队列满时取流等下载侧腾位，不再超时放弃（TV 全量是下载跟不上取流：
+    放弃入队的集本次运行下不到，下次运行读出来时直链早已过期）。"""
+    monkeypatch.setattr(p, "ENQUEUE_POLL_SECONDS", 0.05)
+
     def fake_main(argv=None, on_result=None, stop_event=None):
-        on_result(_ep("1", 1, 1))
-        on_result(_ep("1", 1, 2))   # 队列已满 -> 超时 -> dropped
+        for i in (1, 2, 3):
+            on_result(_ep("1", 1, i))
 
     monkeypatch.setattr(p.fetcher, "main", fake_main)
-    monkeypatch.setattr(p, "ENQUEUE_TIMEOUT", 1)
     q = queue.Queue(maxsize=1)
     worker = p.FetchWorker(q)
     worker.start()
-    time.sleep(2.0)
-
-    assert worker.dropped == 1
-    out = capsys.readouterr().out
-    assert "results.jsonl 落盘承接" in out
+    got = []
+    for _ in range(3):
+        time.sleep(0.3)           # 下载侧慢：取流早已撞上满队列
+        got.append(q.get(timeout=5)["episode"])
+    assert q.get(timeout=5) is p._SENTINEL
+    assert got == [1, 2, 3], "一条都不能被挤出本轮"
+    assert worker.enqueued == 3 and worker.left_on_disk == 0
+    assert worker.waited == 2 and worker.wait_seconds > 0.3
     worker.shutdown()
+
+
+def test_stop_releases_a_fetch_thread_waiting_on_a_full_queue(monkeypatch):
+    """停止信号一到，等在满队列上的取流线程立刻放手；结果已落盘，计入"停止时未入队"。"""
+    monkeypatch.setattr(p, "ENQUEUE_POLL_SECONDS", 0.05)
+    blocked = threading.Event()
+
+    def fake_main(argv=None, on_result=None, stop_event=None):
+        on_result(_ep("1", 1, 1))
+        blocked.set()
+        on_result(_ep("1", 1, 2))   # 队列已满：一直等
+        assert stop_event.is_set()
+
+    monkeypatch.setattr(p.fetcher, "main", fake_main)
+    q = queue.Queue(maxsize=1)
+    worker = p.FetchWorker(q)
+    worker.start()
+    assert blocked.wait(5)
+    time.sleep(0.3)
+    assert worker.thread.is_alive() and worker.left_on_disk == 0
+    worker.shutdown(timeout=5)
+    assert not worker.thread.is_alive()
+    # shutdown 排空队列的瞬间，等着的那次 put 可能刚好放进去又被排掉：两种计法都对，
+    # 反正结果已落盘 results.jsonl。
+    assert worker.enqueued + worker.left_on_disk == 2
 
 
 def test_stop_event_is_passed_to_the_fetcher(monkeypatch):

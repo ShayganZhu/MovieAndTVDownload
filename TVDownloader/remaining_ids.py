@@ -52,6 +52,7 @@ REASONS = {
     "dead:hardsub": "判死：硬字幕",
     "dead:watermark": "判死：水印",
     "dead:truncated": "判死：时长不符",
+    "dead:no_audio": "判死：无音轨",
     "dead:manual": "判死：人工 reject",
     "dead:other": "判死：其它原因",
     "downloaded_not_uploaded": "已下载、未上传（本地有成品或台账 uploaded=false）",
@@ -387,7 +388,7 @@ def classify(key, ledgers, r2=None):
             return True, "r2_only"
     if key in ledgers["dead"]:
         kinds = ledgers["dead"][key]
-        for kind in ("manual", "quality", "hardsub", "watermark", "truncated"):
+        for kind in ("manual", "quality", "hardsub", "watermark", "truncated", "no_audio"):
             if kind in kinds:
                 return False, f"dead:{kind}"
         return False, "dead:other"
@@ -589,7 +590,7 @@ def main(argv=None):
     parser.add_argument("--verify-r2", action="store_true", help="列一遍 R2 核对（需 .env 里的 R2 凭证）")
     dead = parser.add_mutually_exclusive_group()
     dead.add_argument("--include-dead", action="store_true",
-                      help="只剩判死（画质 / 硬字幕 / 水印 / 时长不符 / 人工）或无源集的剧也写进名单"
+                      help="只剩判死（画质 / 硬字幕 / 水印 / 时长不符 / 无音轨 / 人工）或无源集的剧也写进名单"
                            "（默认不写：补跑不会推进它们）")
     dead.add_argument("--exclude-dead", action="store_true",
                       help="已是默认行为（保留以兼容电影侧的用法）")

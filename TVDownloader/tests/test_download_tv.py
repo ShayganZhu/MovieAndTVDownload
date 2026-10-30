@@ -1406,18 +1406,21 @@ def test_attribution_records_which_node_won_the_fallback(sandbox, monkeypatch):
 
 
 def test_attribution_of_extracts_all_keys():
-    """归因字段集中定义，缺键补 None（reupload 等路径可能没有这些键）。"""
+    """归因字段与成品实测字段集中定义，缺键补 None（reupload 等路径可能没有这些键）。"""
+    media = {key: None for key in d._MEDIA_KEYS}
     got = d._attribution_of({
         "provider": "vidup", "node_type": "m3u8",
         "node_index": 1, "node_total": 3, "irrelevant": "x",
+        "duration_seconds": 2580.4, "audio_streams": 1,
     })
     assert got == {
         "provider": "vidup", "node_type": "m3u8",
         "node_index": 1, "node_total": 3,
+        **media, "duration_seconds": 2580.4, "audio_streams": 1,
     }
     assert d._attribution_of({}) == {
         "provider": None, "node_type": None,
-        "node_index": None, "node_total": None,
+        "node_index": None, "node_total": None, **media,
     }
     assert d._attribution_of(None)["provider"] is None
 
@@ -6801,3 +6804,87 @@ def test_ocr_self_test_recognizes_the_probe_text():
     assert recognized, texts
 
 
+
+
+# ------------------------------------------------ 播放列表 500 看年龄判过期（电影侧 f4889f9 移植）
+
+FINAL_HOST = "sun.finalsignal.top"
+
+
+def _playlist_500(url):
+    """模拟 request_with_retry 重试耗尽后的形态：RuntimeError，__cause__ 是那次 HTTP 500。"""
+    cause = d.requests.HTTPError("500 Server Error", response=_FakeResp(500))
+    try:
+        raise RuntimeError(f"请求失败: {url}; {cause}") from cause
+    except RuntimeError as exc:
+        return exc
+
+
+def _final_entry(age_minutes):
+    return {"tmdbId": "77", "season": 1, "episode": 4,
+            "fetched_at": int(time.time() - age_minutes * 60),
+            "urls": [{"url": f"https://{FINAL_HOST}/r6/x/master.m3u8",
+                      "provider": "vidup", "type": "m3u8"}]}
+
+
+@pytest.fixture
+def playlist_500(sandbox, monkeypatch):
+    monkeypatch.setattr(d, "PLAYLIST_500_EXPIRED_AFTER_SECONDS", {FINAL_HOST: 150 * 60})
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+
+
+def test_aged_finalsignal_link_with_playlist_500_goes_to_refetch(playlist_500, monkeypatch):
+    """🔴 finalsignal 上签名过期的链接播放列表回 500：满 150 分钟就按过期进重取闭环，
+    否则当成普通瞬时错误，这一集本次运行永远换不到新链接。"""
+    def master(url, retries=None, headers=None):
+        raise _playlist_500(url)
+
+    monkeypatch.setattr(d, "parse_master_playlist", master)
+    _, ok, info = d.process_one_entry(_final_entry(200), set())
+    assert ok is False and info["needs_refetch"] is True
+    assert "签名过期的表现" in info["error"]
+
+
+def test_fresh_link_playlist_500_stays_a_transient_error(playlist_500, monkeypatch):
+    """过载时新链接也会偶发 500：没到年龄门槛（或不知道年龄）不能判过期。"""
+    def master(url, retries=None, headers=None):
+        raise _playlist_500(url)
+
+    monkeypatch.setattr(d, "parse_master_playlist", master)
+    for entry in (_final_entry(30), {**_final_entry(30), "fetched_at": None}):
+        _, ok, info = d.process_one_entry(entry, set())
+        assert ok is False and info["retriable"] is True
+        assert not info.get("needs_refetch")
+
+
+def test_media_playlist_500_on_aged_link_marks_refetch(playlist_500, monkeypatch):
+    media_url = f"https://{FINAL_HOST}/r6/x/1080/index.m3u8"
+    monkeypatch.setattr(d, "parse_master_playlist",
+                        lambda url, retries=None, headers=None: [("1920x1080", media_url, 5000.0)])
+
+    def media(url, headers=None):
+        raise _playlist_500(url)
+
+    monkeypatch.setattr(d, "parse_media_playlist", media)
+    _, ok, info = d.process_one_entry(_final_entry(200), set())
+    assert ok is False and info["needs_refetch"] is True
+
+
+def test_playlist_500_rule_ignores_other_hosts_errors_and_interrupts(playlist_500):
+    old = 200 * 60
+    assert d._playlist_500_as_expired(_playlist_500("u"), "https://moon.goldenkite.top/m.m3u8", old) is None
+    not_500 = RuntimeError("请求失败")
+    assert d._playlist_500_as_expired(not_500, f"https://{FINAL_HOST}/m.m3u8", old) is None
+    stopped = d.DownloadInterrupted("中断")
+    stopped.__cause__ = _playlist_500("u").__cause__
+    assert d._playlist_500_as_expired(stopped, f"https://{FINAL_HOST}/m.m3u8", old) is None
+    assert d.link_age_seconds({"fetched_at": 1000}, now=1600) == 600
+    assert d.link_age_seconds({}) is None
+
+
+def test_shipped_playlist_500_rule_covers_finalsignal():
+    import yaml
+
+    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
+                              encoding="utf-8"))["download_tv"]
+    assert cfg["link_health"]["playlist_500_expired_after_minutes"] == {FINAL_HOST: 150}

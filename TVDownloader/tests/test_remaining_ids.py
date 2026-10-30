@@ -173,3 +173,10 @@ def test_output_must_be_a_regular_file(box, out):
 def test_output_cannot_overwrite_the_input(box):
     with pytest.raises(SystemExit, match="不能指向输入文件"):
         r.run(box, out="ids.txt", config={})
+
+
+def test_no_audio_dead_is_its_own_class(box):
+    with open(box / "download_dead.jsonl", "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "1", "season": 1, "episode": 5, "reason_class": "no_audio"}) + "\n")
+    _, reasons = _reasons(box)
+    assert reasons["1_S01E05"] == "dead:no_audio"

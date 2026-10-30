@@ -37,24 +37,16 @@ import tv_ids_to_links as fetcher
 
 _PIPELINE_CFG = (downloader._CFG.get("pipeline", {}) or {})
 
-# 队列容量：满了之后取流侧的 on_result 回调会阻塞，天然形成反压。
-# 取流侧才是瓶颈（每集要打多个 provider，而有源率只有个位数百分比），
-# 故队列长期偏空、这个上限基本不会碰到；它是保险丝，不是主调节手段。
+# 队列容量：满了之后取流侧的 on_result 回调一直等到下载侧腾出空位，形成反压，
+# 取流随下载的速度推进。
 #
-# ⚠️ 队列里的每一条都是**等待被下载的签名直链**，而 vidlink 的 mp4 直链带时效。
-# 容量越大 = 允许取流跑在下载前面越多 = 队首那条在队列里待得越久。
-# 故本值真正决定的不是吞吐（正常时队列本就偏空），而是**下载侧出故障、
-# 积压到上限时最坏能坏到什么程度**。
+# ⚠️ 队列里的每一条都是**等待被下载的签名直链**，带时效（vidup ~3 小时、videasy
+# ~4 小时、vidlink bcdn4 24 小时）。容量越大 = 允许取流跑在下载前面越多 = 队首那条
+# 在队列里待得越久。故本值决定的是取流最多能领先下载多少，不是吞吐。
 QUEUE_MAXSIZE = max(1, int(_PIPELINE_CFG.get("queue_maxsize", 512)))
 
-# 取流侧入队的最长等待（秒）。只在**队列满**时才起作用：队列满且下载侧长时间
-# 不消费时，不能让取流线程永久卡死（那样 Ctrl+C 都退不出去），
-# 超时就放弃走快车道——结果**已经落盘 results.jsonl**，下次运行仍能读到，
-# 是「推迟」而非「丢失」。
-#
-# 按设计它**基本不该触发**（取流是瓶颈、队列长期偏空）。真频繁触发说明
-# "取流是瓶颈"的判断错了，那是要重新设计的信号，不是靠调这个数字解决。
-ENQUEUE_TIMEOUT = max(1, int(_PIPELINE_CFG.get("enqueue_timeout_seconds", 120)))
+# 队列满时取流线程每隔这么久醒来看一次停止信号（秒）。只影响 Ctrl+C / 收尾的响应速度。
+ENQUEUE_POLL_SECONDS = 1.0
 
 
 # 队列终止哨兵：取流线程主任务跑完后放入，下载侧读到即知"不会再有新集了"。
@@ -76,9 +68,8 @@ class QueueEntrySource:
     🔴 投递优先级：重取结果 > 实时队列 > backlog。
     队列里是**刚签出的直链**，有时效；backlog 是躺在 results.jsonl 里的旧链接，
     再等一会儿也不会更坏。若先把存量发完再看队列，大存量场景下队列会灌满、
-    取流线程在 on_result 里等 ENQUEUE_TIMEOUT 后被迫 dropped，新鲜链接本次
-    运行根本消费不到，等下次运行从文件读出来时早已过期——这是直接砍取流
-    成果的路径。故队列有货就先发队列，队列空档才发 backlog。
+    取流线程全卡在 on_result 里等，刚签出的直链在队列里一起变旧。
+    故队列有货就先发队列，队列空档才发 backlog。
     重取结果（AsyncRefetcher 换回的新直链）时效最紧、且是救回失败集的唯一
     机会，排最前。
 
@@ -260,31 +251,43 @@ class FetchWorker:
         self.thread = threading.Thread(target=self._run, name="fetch-worker",
                                        daemon=True)
         self.error = None
+        # 下面几个计数由多个取流线程并发更新（on_result 在各取流线程里回调）。
+        self._stats_lock = threading.Lock()
         self.enqueued = 0
-        self.dropped = 0
+        # 停止信号置位时还没入队的条数：已落盘 results.jsonl，下次运行读得到。
+        self.left_on_disk = 0
+        # 因队列满等过下载侧腾位的条数与累计等待秒数（下载是瓶颈的直接证据）。
+        self.waited = 0
+        self.wait_seconds = 0.0
 
     def _on_result(self, result):
         """取流侧每拿到一条 ok 结果就回调这里（在其写盘锁**之外**）。
 
-        允许阻塞：队列满说明下载侧严重滞后，此时让取流线程等一等正是我们要的
-        反压。取流侧已把该回调移出临界区，故这里的等待只影响当前这一条，
-        不会堵住其余取流线程。
+        队列满时一直等到下载侧腾出空位（2026-10-30 起；此前等满 120 秒就放弃入队、
+        只落盘，那一集本次运行就下不到了，等下次运行读出来时直链早已过期）。
+        TV 全量是下载侧跟不上取流：热门剧整季有源时一连串成功结果会把队列灌满，
+        09-16 第二轮小样本就有 195 集这样被挤出本轮。等待只占住当前这一个取流线程
+        （回调在取流侧的临界区之外），其余线程照常取流、各自到这里排队——取流随
+        下载的速度推进，直链从签出到被下载始终只隔一个队列的距离。
+        每 ENQUEUE_POLL_SECONDS 看一次停止信号：Ctrl+C / 下载侧收尾（shutdown）时
+        立刻放手，结果已落盘 results.jsonl，下次运行读得到。
         """
-        if self._stop.is_set():
+        started = None
+        while not self._stop.is_set():
+            try:
+                self._q.put(result, timeout=ENQUEUE_POLL_SECONDS)
+            except queue.Full:
+                if started is None:
+                    started = time.monotonic()
+                continue
+            with self._stats_lock:
+                self.enqueued += 1
+                if started is not None:
+                    self.waited += 1
+                    self.wait_seconds += time.monotonic() - started
             return
-        try:
-            self._q.put(result, timeout=ENQUEUE_TIMEOUT)
-            self.enqueued += 1
-        except queue.Full:
-            # 结果已落盘 results.jsonl，走不了快车道也不算丢：
-            # 下次运行会从文件里读到它。只是本次跑不到而已。
-            self.dropped += 1
-            label = downloader.record_episode_key(result) or result.get("tmdbId")
-            print(
-                f"⚠️ [pipeline] 队列满 {ENQUEUE_TIMEOUT}s，"
-                f"{label} 改由 results.jsonl 落盘承接（不丢集）",
-                flush=True,
-            )
+        with self._stats_lock:
+            self.left_on_disk += 1
 
     def _run(self):
         try:
@@ -652,8 +655,12 @@ def _print_summary(worker, source, refetcher, started, interrupted=False):
     print("\n" + "=" * 70)
     print(f"[pipeline] {'已中断' if interrupted else '结束'}："
           f"取流入队 {worker.enqueued} 集"
-          + (f"（{worker.dropped} 集改走文件承接）" if worker.dropped else "")
+          + (f"（{worker.left_on_disk} 集停止时未入队，已落盘 results.jsonl、下次运行接着下）"
+             if worker.left_on_disk else "")
           + f"，下载侧消费 {delivered} 集，总耗时 {elapsed / 60:.1f} 分钟")
+    if worker.waited:
+        print(f"[pipeline] 下载侧跟不上取流：{worker.waited} 集入队前等过下载腾位，"
+              f"累计等待 {worker.wait_seconds / 3600:.1f} 线程·小时（取流已随下载降速）")
     if source is not None and source.skipped_duplicates:
         print(f"[pipeline] 队列与存量重叠去重 {source.skipped_duplicates} 集"
               f"（避免白占下载槽位）")

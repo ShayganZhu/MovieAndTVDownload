@@ -370,6 +370,18 @@ HARDSUB_EVIDENCE_DIR = resolve_dir(_HARDSUB_CFG.get("evidence_dir"), "hardsub_ev
 OVERLAY_RETRY_OTHER_NODES = bool(_HARDSUB_CFG.get("retry_other_nodes", True))
 # 节点级台账：每检出一个版本记一行（tmdbId/season/episode + 版本标识），跨运行生效——
 # 重启或重取回来的链接里，已检出的版本不会再下第二次。
+# 成品时长 / 音轨筛查（2026-10-30）：每集转封装后用 ffprobe 记下实测时长与音轨数，事后
+# `python download_tv.py audit` 对照参考时长列出可疑的集，人工核对后 `reject --from` 处置。
+# 下载时不拦截（同硬字幕首批的记录模式）：门槛要拿首批数据校准。
+_MEDIA_AUDIT_CFG = _CFG.get("media_audit", {}) or {}
+# 实测时长 / 参考时长（TMDB 单集时长，没有时用 IMDB 剧级时长）低于它算偏短、高于它算偏长。
+MEDIA_AUDIT_MIN_RUNTIME_RATIO = float(_MEDIA_AUDIT_CFG.get("min_runtime_ratio", 0.5))
+MEDIA_AUDIT_MAX_RUNTIME_RATIO = float(_MEDIA_AUDIT_CFG.get("max_runtime_ratio", 2.5))
+# 实测时长 / 片源声明时长（HLS 播放列表各分片时长之和）低于它算没下全。
+MEDIA_AUDIT_MIN_SOURCE_RATIO = float(_MEDIA_AUDIT_CFG.get("min_source_ratio", 0.95))
+# 没有任何参考时长时，短于这么多秒的按预告片 / 片段处理。
+MEDIA_AUDIT_MIN_SECONDS = float(_MEDIA_AUDIT_CFG.get("min_seconds_without_reference", 300))
+MEDIA_AUDIT_OUTPUT = resolve_file(_MEDIA_AUDIT_CFG.get("output"), "audit_flagged.tsv")
 OVERLAY_NODE_REJECT_LOG = resolve_file(
     _HARDSUB_CFG.get("node_reject_log"), "overlay_node_rejects.jsonl"
 )
@@ -401,6 +413,12 @@ SIGNED_LINK_MAX_AGE_SECONDS = {
     str(host).strip().lower(): float(hours) * 3600
     for host, hours in (_LINK_HEALTH_RAW.get("signed_link_max_age_hours") or {}).items()
     if str(host).strip() and float(hours) > 0
+}
+# 签名过期时播放列表回 500 的主机：链接满这么久（秒）后的 500 按过期处理（见 _playlist_500_as_expired）。
+PLAYLIST_500_EXPIRED_AFTER_SECONDS = {
+    str(host).strip().lower(): float(minutes) * 60
+    for host, minutes in (_LINK_HEALTH_RAW.get("playlist_500_expired_after_minutes") or {}).items()
+    if str(host).strip() and float(minutes) > 0
 }
 PLAYLIST_RETRY_MAX = int(_CFG.get("playlist_retry_max", 4))
 PLAYLIST_RETRY_BACKOFF = float(_CFG.get("playlist_retry_backoff", 1.0))
@@ -1406,6 +1424,8 @@ def reconcile_unlogged_downloads(disk_ids, logged_ids):
             "title": "",
             "year": year,
             **_attribution_of(None),
+            # 成品还在本地：顺手测时长 / 音轨，audit 才筛得到它（没有取流条目，无参考时长）。
+            **_media_fields(mp4_path, None),
             "final_path": mp4_path,
             "s3_key": s3_key,
             # 巡检这一步刚好 stat 过，顺手带上体积，免得补传路径再 stat 一次。
@@ -1421,7 +1441,7 @@ def reconcile_unlogged_downloads(disk_ids, logged_ids):
                 "episode": episode,
                 "title": "",
                 "year": year,
-                **_attribution_of(None),
+                **_attribution_of(record),
                 "local_path": mp4_path,
                 "s3_key": s3_key,
                 "file_size_bytes": size,
@@ -1872,14 +1892,15 @@ def dead_breakdown(dead_keys):
     """启动摘要用：把判死的集按原因拆开计数（取判死账本里该集的最后一条记录）。
 
     判死账本里不止画质：下载后检出硬字幕/水印、临门槛人工 reject 的也在，
-    人工复核确认时长不符（truncated）的也在。没有 reason_class 的老记录都是画质判死。
+    人工复核确认时长不符（truncated）/ 无音轨（no_audio）的也在。没有 reason_class 的老记录都是画质判死。
     """
     latest = _latest_by_key(DOWNLOAD_DEAD_LOG)
     kinds = [(latest.get(key) or {}).get("reason_class") for key in dead_keys]
     hardsub, watermark = kinds.count("hardsub"), kinds.count("watermark")
-    truncated = kinds.count("truncated")
-    return (f"画质 {len(kinds) - hardsub - watermark - truncated} / 硬字幕 {hardsub} / 水印 {watermark}"
-            + (f" / 时长不符 {truncated}" if truncated else ""))
+    truncated, no_audio = kinds.count("truncated"), kinds.count("no_audio")
+    return (f"画质 {len(kinds) - hardsub - watermark - truncated - no_audio} / 硬字幕 {hardsub} / 水印 {watermark}"
+            + (f" / 时长不符 {truncated}" if truncated else "")
+            + (f" / 无音轨 {no_audio}" if no_audio else ""))
 
 
 def dead_record_passes_now(record):
@@ -1907,9 +1928,9 @@ def dead_record_passes_now(record):
        模式 B 下 height 根本不参与计算，不必挡（挡了反而会把"未知分辨率"
        那批本该复判的记录永久关在门外）。
     """
-    # 硬字幕/水印/时长不符判死与画质门槛无关，调门槛救不回来：永不放回。
+    # 硬字幕/水印/时长不符/无音轨判死与画质门槛无关，调门槛救不回来：永不放回。
     # （它们也没有码率依据，不先拦下的话会落进下面"没有依据 → 放回"那条。）
-    if record.get("reason_class") in ("hardsub", "watermark", "truncated"):
+    if record.get("reason_class") in ("hardsub", "watermark", "truncated", "no_audio"):
         return False
 
     evidence = record.get("evidence") or {}
@@ -2347,15 +2368,19 @@ def write_pending(record):
 
 
 # provider 归因字段。集中定义避免各写入点漏抄其中一个。
-_ATTRIBUTION_KEYS = ("provider", "node_type", "node_index", "node_total")
+# 成品实测字段（见 probe_media / finalize_one_entry），audit 筛查时长不符 / 无音轨全靠它们。
+_MEDIA_KEYS = ("duration_seconds", "audio_streams", "video_streams",
+               "source_duration_seconds", "expected_runtime_minutes", "runtime_source")
+_ATTRIBUTION_KEYS = ("provider", "node_type", "node_index", "node_total") + _MEDIA_KEYS
 
 
 def _attribution_of(source):
-    """从 success_info / conversion_job 抽出 provider 归因字段。
+    """从 success_info / conversion_job 抽出 provider 归因字段与成品实测字段。
 
     pending 记录必须带上它们：补传成功后 reupload 会用 pending 里的值重建
     success 记录，漏了这几个键就等于把"这集是哪家下成的"抹掉——而降级留本地的
-    集恰恰是上传侧故障时的一大批，抹掉会让各源转化率统计系统性偏低。
+    集恰恰是上传侧故障时的一大批，抹掉会让各源转化率统计系统性偏低；
+    实测时长 / 音轨数抹掉了，audit 就筛不到这一集。
     """
     return {key: (source or {}).get(key) for key in _ATTRIBUTION_KEYS}
 
@@ -2707,6 +2732,8 @@ def build_meta(entry, success_info, subtitle_files=None):
             "resolution": success_info.get("resolution"),
             "bitrateKbps": success_info.get("bitrate_kbps"),
             "missingSegmentCount": success_info.get("missing_segment_count"),
+            "durationSeconds": success_info.get("duration_seconds"),
+            "audioStreams": success_info.get("audio_streams"),
         },
         "subtitles": [
             {"language": os.path.basename(path).rsplit(".", 1)[0],
@@ -2878,6 +2905,43 @@ def write_assets_only_pending(success_info, local_path, s3_key, failed):
 
 
 # ---------- M3U8 解析 ----------
+def link_age_seconds(entry, now=None):
+    """条目链接的年龄（秒，从 fetched_at 算）；没有 fetched_at 时返回 None。"""
+    fetched_at = parse_int((entry or {}).get("fetched_at"))
+    if fetched_at is None or fetched_at <= 0:
+        return None
+    return (now or time.time()) - fetched_at
+
+
+def _playlist_500_as_expired(exc, url, link_age):
+    """播放列表请求的 HTTP 500 该不该按签名过期处理；该就返回补挂了重取标记的新异常。
+
+    link_health.playlist_500_expired_after_minutes 里配了的主机：重试耗尽仍是 HTTP 500、
+    且链接年龄（link_age，秒）已到该值时才算（电影侧 f4889f9 移植，2026-10-30）。
+    finalsignal 上签名过期的 vidup / videasy 链接回 500 而不是 401/403，不挂
+    _NEEDS_REFETCH_MARKER 的话它被当成普通瞬时错误，这一集本次运行永远换不到新链接。
+
+    🔴 必须看年龄：源站过载时新链接也会偶发 500。年龄未知（无 fetched_at）一律按瞬时错误。
+    只用于主/媒体播放列表（见 _attempt_download）；分片 500 仍是瞬时错误。
+    退避中途收到中断时，DownloadInterrupted 的 __cause__ 正是那次 500：不能改写成
+    "需重取"，得原样抛出让整集收手。不该算过期时返回 None。
+    """
+    if isinstance(exc, DownloadInterrupted):
+        return None
+    host = _host_of(url)
+    after = PLAYLIST_500_EXPIRED_AFTER_SECONDS.get(host, 0)
+    if (
+        after > 0 and link_age is not None and link_age >= after
+        and _status_of(exc.__cause__) == 500
+        and _NEEDS_REFETCH_MARKER not in str(exc)
+    ):
+        return RuntimeError(
+            f"{exc}；链接已 {link_age / 60:.0f} 分钟、播放列表持续 HTTP 500"
+            f"（{host} 上签名过期的表现），{_NEEDS_REFETCH_MARKER}"
+        )
+    return None
+
+
 def parse_master_playlist(master_url, retries=None, headers=None):
     """返回 [(resolution, media_playlist_url, declared_bandwidth_kbps), ...]。
 
@@ -3699,6 +3763,60 @@ def _mp4_request_headers(node_headers):
     return headers
 
 
+def probe_media(path):
+    """ffprobe 读成品的实测时长（秒）与音视频流数：{duration_seconds, audio_streams, video_streams}。
+
+    任何失败都返回空 dict（筛查是旁路需求，绝不影响整集成败）；单项读不到记 None。
+    """
+    command = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type",
+        "-of", "json", path,
+    ]
+    try:
+        result = subprocess.run(
+            command, check=True, capture_output=True, text=True,
+            errors="replace", timeout=120,
+        )
+        data = json.loads(result.stdout or "{}")
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return {}
+    types = [str(s.get("codec_type") or "") for s in data.get("streams") or []]
+    try:
+        duration = round(float((data.get("format") or {}).get("duration")), 1)
+    except (TypeError, ValueError):
+        duration = None
+    return {
+        "duration_seconds": duration,
+        "audio_streams": types.count("audio"),
+        "video_streams": types.count("video"),
+    }
+
+
+def expected_runtime_of(entry):
+    """一集的参考时长（分钟）与出处：TMDB 单集时长优先，没有时退回 IMDB 剧级时长。"""
+    for field, source in (("episode_runtime_minutes", "tmdb_episode"),
+                          ("runtime_minutes", "imdb_show")):
+        try:
+            minutes = float((entry or {}).get(field) or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes > 0:
+            return minutes, source
+    return None, None
+
+
+def _media_fields(path, entry, source_duration=None):
+    """成品实测 + 参考时长，合成写进 success 记录的字段（见 _MEDIA_KEYS）。"""
+    expected, source = expected_runtime_of(entry)
+    return {
+        "duration_seconds": None, "audio_streams": None, "video_streams": None,
+        **probe_media(path),
+        "source_duration_seconds": source_duration,
+        "expected_runtime_minutes": expected,
+        "runtime_source": source,
+    }
+
+
 def _probe_duration(path):
     """ffprobe 读容器时长（秒）；失败返回 None。"""
     command = [
@@ -4225,10 +4343,16 @@ def process_one_entry(entry, processed_ids):
         # 分片主机与 playlist 主机通常同域（peakstorm 即如此）；不同域时此检查
         # 落空，但候选流循环与分片层还会再拦一次。
         _raise_if_hls_host_tripped(url, "该节点")
-        variants = parse_master_playlist(
-            url, retries=None if is_last_node else PLAYLIST_RETRY_FALLBACK,
-            headers=node_headers,
-        )
+        try:
+            variants = parse_master_playlist(
+                url, retries=None if is_last_node else PLAYLIST_RETRY_FALLBACK,
+                headers=node_headers,
+            )
+        except Exception as exc:  # noqa: BLE001
+            expired = _playlist_500_as_expired(exc, url, link_age_seconds(entry))
+            if expired is None:
+                raise
+            raise expired from exc
         if not variants:
             raise RuntimeError("没有找到媒体播放列表或清晰度变体")
 
@@ -4326,9 +4450,17 @@ def process_one_entry(entry, processed_ids):
             remove_file(sample_path)
 
             try:
-                segment_urls, durations, init_url = parse_media_playlist(
-                    playlist_url, headers=node_headers
-                )
+                try:
+                    segment_urls, durations, init_url = parse_media_playlist(
+                        playlist_url, headers=node_headers
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    expired = _playlist_500_as_expired(
+                        exc, playlist_url, link_age_seconds(entry)
+                    )
+                    if expired is None:
+                        raise
+                    raise expired from exc
                 # 分片主机可能与 playlist 主机不同域：按首个分片 url 再拦一次。
                 if segment_urls:
                     _raise_if_hls_host_tripped(segment_urls[0], "该节点的分片")
@@ -4571,6 +4703,8 @@ def process_one_entry(entry, processed_ids):
             "resolution": best_resolution,
             "missing_segment_count": len(failed_segment_indices),
             "missing_segment_indices": failed_segment_indices,
+            # 片源声明时长（所选流播放列表的分片时长之和）：audit 用它查"没下全"。
+            "source_duration_seconds": round(sum(best_durations), 1),
             # 取流侧带回的内嵌字幕，转封装成功后由 save_subtitles 落盘。
             "captions": entry.get("captions"),
         }
@@ -5268,8 +5402,10 @@ def _overlay_summary(scan):
     return "；".join(parts)
 
 
-# reject 接受的理由与中文名。truncated / gaps 是人工复核确认成品不完整时用的（见 reject_films）。
-REJECT_REASON_LABELS = {"hardsub": "硬字幕", "watermark": "水印", "truncated": "时长不符", "gaps": "缺分片"}
+# reject 接受的理由与中文名。truncated / no_audio / gaps 是人工复核确认成品不合格时用的
+# （audit 列出可疑的集，见 audit_media）。
+REJECT_REASON_LABELS = {"hardsub": "硬字幕", "watermark": "水印", "truncated": "时长不符",
+                        "no_audio": "无音轨", "gaps": "缺分片"}
 
 
 def _reasons_label(reasons):
@@ -5623,7 +5759,12 @@ def finalize_one_entry(conversion_job, processed_ids):
             "missing_segment_indices": conversion_job[
                 "missing_segment_indices"
             ],
+            # 实测时长 / 音轨数 + 参考时长：事后 audit 筛查时长不符、无音轨（下载时不拦截）。
+            **_media_fields(final_path, conversion_job.get("entry"),
+                            conversion_job.get("source_duration_seconds")),
         }
+        if success_info["audio_streams"] == 0:
+            print(f"  [{normalized_id}] ⚠️ 成品没有音轨（照常上传，待 audit 筛查）", flush=True)
 
         # 内嵌字幕：成品已落地才抓，抓不到不影响整集。
         # save_subtitles 内部已逐条吞异常，但 episode_dir 等仍可能抛，故再兜一层。
@@ -7735,6 +7876,121 @@ def _scan_flags(scan):
     return None
 
 
+def _audit_flags(record):
+    """一条成品记录的可疑项：[(建议的 reject 理由, 说明), ...]；没问题返回空列表。
+
+    没有实测时长的老记录（2026-10-30 之前下的）返回 None，单独计数。
+    """
+    duration = record.get("duration_seconds")
+    if duration is None and record.get("audio_streams") is None:
+        return None
+    flags = []
+    if record.get("audio_streams") == 0:
+        flags.append(("no_audio", "没有音轨"))
+    if duration is not None:
+        expected = record.get("expected_runtime_minutes")
+        source = record.get("source_duration_seconds")
+        if expected:
+            ratio = duration / (float(expected) * 60)
+            where = "TMDB 单集" if record.get("runtime_source") == "tmdb_episode" else "IMDB 剧级"
+            if ratio < MEDIA_AUDIT_MIN_RUNTIME_RATIO:
+                flags.append(("truncated", f"偏短：{duration / 60:.1f} 分钟，{where}时长 {expected:g} 分钟"
+                                           f"（{ratio:.0%}）"))
+            elif ratio > MEDIA_AUDIT_MAX_RUNTIME_RATIO:
+                flags.append(("truncated", f"偏长：{duration / 60:.1f} 分钟，{where}时长 {expected:g} 分钟"
+                                           f"（{ratio:.0%}）"))
+        elif duration < MEDIA_AUDIT_MIN_SECONDS:
+            flags.append(("truncated", f"极短：{duration / 60:.1f} 分钟（没有参考时长）"))
+        if source and duration < float(source) * MEDIA_AUDIT_MIN_SOURCE_RATIO:
+            flags.append(("truncated", f"没下全：{duration / 60:.1f} 分钟，片源声明 "
+                                       f"{float(source) / 60:.1f} 分钟（{duration / float(source):.0%}）"))
+    return flags
+
+
+def audit_media(output=None):
+    """筛查已下载的集：时长不符（偏短 / 偏长 / 没下全 / 极短）、没有音轨（只读台账）。
+
+    依据 success.jsonl 里每集转封装后实测的时长与音轨数（见 _media_fields），参考时长取
+    TMDB 单集时长（取流侧带回），没有时退回 IMDB 剧级时长；门槛见 config.yaml 的 media_audit。
+    可疑的集写进 output（默认 audit_flagged.tsv，每行 `集 key<TAB>理由<TAB>说明`）：人工核对、
+    删掉误报的行之后，`python download_tv.py reject --from audit_flagged.tsv` 按行里的理由处置。
+    已经 reject 掉的集不在 success.jsonl 里，不会再列出来。返回可疑集数。
+    """
+    path = output or MEDIA_AUDIT_OUTPUT
+    if str(path).startswith("/dev/") or (os.path.exists(path) and not os.path.isfile(path)):
+        raise SystemExit(f"audit 输出必须是普通文件路径，收到 {path}")
+    success = _latest_by_key(SUCCESS_LOG)
+    unprobed = 0
+    rows = []
+    kinds = Counter()
+    for key, record in sorted(success.items()):
+        flags = _audit_flags(record)
+        if flags is None:
+            unprobed += 1
+            continue
+        if not flags:
+            continue
+        # 一集只给一个处置理由：没有音轨优先（换版本重下），其余都是时长不符。
+        reason = "no_audio" if any(r == "no_audio" for r, _ in flags) else "truncated"
+        detail = "；".join(text for _, text in flags)
+        kinds[reason] += 1
+        rows.append((key, reason, detail, record))
+
+    print(f"===== 成品时长 / 音轨筛查（{SUCCESS_LOG}，{len(success)} 集）=====")
+    for key, reason, detail, record in rows:
+        status = "已上传" if record.get("uploaded") else "仅本地"
+        print(f"{key}\t{(record.get('title') or '')[:30]}\t{REJECT_REASON_LABELS[reason]}\t"
+              f"{detail}\t{status} {_bytes_to_gb(int(record.get('file_size_bytes') or 0)):.2f} GB\t"
+              f"{record.get('provider') or ''}/{record.get('node_type') or ''}")
+    print(f"可疑 {len(rows)} 集（" + "、".join(
+        f"{REJECT_REASON_LABELS[k]} {v}" for k, v in sorted(kinds.items())) + "）"
+        + (f"；另有 {unprobed} 集是加上实测之前下的，没有时长 / 音轨记录" if unprobed else ""))
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write("# 集 key\t理由\t说明 —— 核对后删掉误报的行，再执行 "
+                 "python download_tv.py reject --from 本文件 [--dry-run]\n")
+        for key, reason, detail, _ in rows:
+            fh.write(f"{key}\t{reason}\t{detail}\n")
+    os.replace(tmp_path, path)
+    if rows:
+        print(f"清单已写入 {path}；核对后执行：")
+        print(f"  python download_tv.py reject --from {path} [--dry-run]")
+    return len(rows)
+
+
+def read_reject_list(path):
+    """reject --from 的清单：每行 `集 key[<TAB>理由[<TAB>说明]]`，# 开头与空行跳过。
+
+    返回 [(key, 理由或 None), ...]，保持文件顺序。
+    """
+    items = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            items.append((cols[0].strip(), cols[1].strip() if len(cols) > 1 and cols[1].strip() else None))
+    return items
+
+
+def reject_list(items, reason=None, dry_run=False):
+    """按清单处置：items = [(集 key, 理由或 None), ...]（见 read_reject_list）。
+
+    清单里逐行写的理由优先，没写的用 reason（再没有就按临门槛 / 检出记录取，见
+    reject_episodes）。同一理由的集合并成一次 reject_episodes。返回 (处置集数, 释放字节数)。
+    """
+    groups = {}
+    for key, row_reason in items:
+        groups.setdefault(row_reason or reason, []).append(key)
+    done = freed = 0
+    for group_reason, keys in groups.items():
+        n, size = reject_episodes(keys, reason=group_reason, dry_run=dry_run)
+        done += n
+        freed += size
+    return done, freed
+
+
 def report_near_miss():
     """列出本机待人工核对的集（只读）：记录模式下检出的集 + 临门槛的集。
 
@@ -7839,7 +8095,7 @@ def reject_episodes(keys, reason=None, dry_run=False):
 
     逐集：删 R2 上该集目录下全部对象（视频、meta.json、字幕）→ 确认删干净 →
     从 SUCCESS_LOG / pending 移除 →
-      - hardsub / watermark / truncated：**只判这个版本**——节点级台账记一条
+      - hardsub / watermark / truncated / no_audio：**只判这个版本**——节点级台账记一条
         （manual=True），下次运行这一集换别的版本重下，所有版本都检出才整集判死；
         查不出成品是哪个版本时退回整集判死（manual=True，--retry-dead 永不放回）；
       - gaps（缺分片过多）：片源没问题，只删 R2 与成品记录，下次运行照常重下。
@@ -8249,27 +8505,51 @@ if __name__ == "__main__":
         reupload_pending()
     elif len(sys.argv) > 1 and sys.argv[1] == "near-miss":
         report_near_miss()
+    elif len(sys.argv) > 1 and sys.argv[1] == "audit":
+        # audit [--out 清单路径]
+        _rest = sys.argv[2:]
+        _out = None
+        if _rest[:1] == ["--out"] and len(_rest) == 2:
+            _out = _rest[1]
+        elif _rest:
+            print("用法: python download_tv.py audit [--out 清单路径]")
+            raise SystemExit(2)
+        audit_media(_out)
     elif len(sys.argv) > 1 and sys.argv[1] == "reject":
-        # reject <集 key> [...] [--reason hardsub|watermark|truncated|gaps] [--dry-run]
+        # reject <集 key> [...] [--reason 理由] [--dry-run]
+        # reject --from 清单 [--reason 理由] [--dry-run]（清单每行 key<TAB>理由，见 audit）
+        _usage = ("用法: python download_tv.py reject <集 key> [...] "
+                  f"[--reason {'|'.join(REJECT_REASON_LABELS)}] [--dry-run]\n"
+                  "      python download_tv.py reject --from 清单文件 [--reason 理由] [--dry-run]")
         _rest = sys.argv[2:]
         _dry = "--dry-run" in _rest
-        _reason = None
-        if "--reason" in _rest:
-            _i = _rest.index("--reason")
-            if _i + 1 >= len(_rest):
-                print("错误: --reason 后面要跟 hardsub / watermark / truncated / gaps")
-                raise SystemExit(2)
-            _reason = _rest[_i + 1]
-            _rest = _rest[:_i] + _rest[_i + 2:]
+        _opts = {}
+        for _flag in ("--reason", "--from"):
+            if _flag in _rest:
+                _i = _rest.index(_flag)
+                if _i + 1 >= len(_rest):
+                    print(f"错误: {_flag} 后面缺参数")
+                    print(_usage)
+                    raise SystemExit(2)
+                _opts[_flag] = _rest[_i + 1]
+                _rest = _rest[:_i] + _rest[_i + 2:]
+        _reason = _opts.get("--reason")
         _keys = [a for a in _rest if a != "--dry-run"]
-        _bad = [a for a in _keys if parse_episode_key(a) is None]
-        if not _keys or _bad:
+        _items = [(k, None) for k in _keys]
+        if "--from" in _opts:
+            if _keys:
+                print("错误: --from 与直接给集 key 不能同时用")
+                raise SystemExit(2)
+            _items = read_reject_list(_opts["--from"])
+        _bad = [k for k, _ in _items if parse_episode_key(k) is None]
+        _bad_reasons = sorted({r for _, r in _items if r and r not in REJECT_REASON_LABELS})
+        if not _items or _bad or _bad_reasons:
             print(f"错误: 需要给出集 key（形如 1396_S01E01）"
-                  f"{'，无法识别 ' + ' '.join(_bad) if _bad else ''}")
-            print("用法: python download_tv.py reject <集 key> [...] "
-                  "[--reason hardsub|watermark|truncated|gaps] [--dry-run]")
+                  f"{'，无法识别 ' + ' '.join(_bad) if _bad else ''}"
+                  f"{'，清单里有不认识的理由 ' + ' '.join(_bad_reasons) if _bad_reasons else ''}")
+            print(_usage)
             raise SystemExit(2)
-        reject_episodes(_keys, reason=_reason, dry_run=_dry)
+        reject_list(_items, reason=_reason, dry_run=_dry)
     else:
         # 沿用既有的裸 sys.argv 分派风格（本文件一直没有引入 argparse）。
         # 两个开关可叠加：--retry-only --retry-dead。
@@ -8284,7 +8564,9 @@ if __name__ == "__main__":
             print("用法: python download_tv.py [--retry-only] [--retry-dead]")
             print("      python download_tv.py reupload")
             print("      python download_tv.py near-miss")
-            print("      python download_tv.py reject <集 key> ... [--reason hardsub|watermark|truncated|gaps] [--dry-run]")
+            print("      python download_tv.py audit [--out 清单路径]")
+            print("      python download_tv.py reject <集 key> ... [--reason hardsub|watermark|truncated|no_audio|gaps] [--dry-run]")
+            print("      python download_tv.py reject --from 清单文件 [--dry-run]")
             raise SystemExit(2)
         if RETRY_ONLY_MODE:
             print(

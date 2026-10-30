@@ -1791,3 +1791,34 @@ def test_captions_is_episode_level_identity_key():
     共用一个 tmdbId，串台的是整季。
     """
     assert "captions" in m._IDENTITY_KEYS
+
+
+# ------------------------------------------------ TMDB 单集时长（2026-10-30，audit 的参考时长）
+
+def test_fetch_seasons_keeps_tmdb_episode_runtimes(monkeypatch):
+    info = {"name": "Show", "first_air_date": "2020-01-01", "status": "Ended",
+            "seasons": [{"season_number": 1}, {"season_number": 2}]}
+    season1 = {"episodes": [{"episode_number": 1, "air_date": None, "runtime": 44},
+                            {"episode_number": 2, "air_date": None, "runtime": None},
+                            {"episode_number": 3, "air_date": None, "runtime": 0}]}
+    monkeypatch.setattr(m, "_tmdb_get", lambda path, params=None: info if params is None else {
+        "season/1": season1, "season/2": _season(2, [1])})
+    out = m.fetch_seasons_from_tmdb(5)
+    assert out["seasons"][0]["runtimes"] == {"1": 44}, "只收正数时长"
+    assert "runtimes" not in out["seasons"][1], "整季都没有时长就不写这个键"
+
+
+def test_process_episode_carries_tmdb_episode_runtime(monkeypatch):
+    _install_fake_session(monkeypatch, PAGE, [{"url": "u1", "tmdbId": "42", "title": "S"}])
+    monkeypatch.setattr(m, "_SERIES_META", {"42": {"runtime_minutes": 60,
+                                                   "episode_runtime_minutes": 1}})
+    monkeypatch.setattr(m, "_EPISODE_RUNTIMES", {("42", 2, 3): 47})
+    status, result = m.process_episode("42", 2, 3)
+    assert status == "ok"
+    assert result["episode_runtime_minutes"] == 47, "集级时长不能被剧级元数据盖掉"
+    assert result["runtime_minutes"] == 60
+    _install_fake_session(monkeypatch, PAGE, [{"url": "u1", "tmdbId": "42", "title": "S"}])
+    monkeypatch.setattr(m, "_SERIES_META", {})
+    monkeypatch.setattr(m, "_EPISODE_RUNTIMES", {})
+    status, other = m.process_episode("42", 2, 3)
+    assert status == "ok" and "episode_runtime_minutes" not in other
