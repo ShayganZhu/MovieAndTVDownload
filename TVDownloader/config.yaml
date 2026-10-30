@@ -12,7 +12,7 @@
 # 【与 MovieDownloader 的差异】
 #   - 元数据/取流/下载的处理单位从“一部电影”变为“一集”：tmdb_id + season + episode。
 #   - 季集结构以 TMDB 为准（取流阶段调 /tv/{id} 展开），IMDB episode 表仅作参考与筛选。
-#   - R2 对象键：tv/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/E{集:02d}.mp4
+#   - R2 对象键：tvs/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/E{集:02d}.mp4
 #     （本地目录同构，meta.json 与 subs/ 字幕同前缀）
 # ============================================================================
 
@@ -432,12 +432,13 @@ download_tv:
   base_dir: "downloads"
   temp_dir: "temp"
   # 本地目录与 R2 对象键共用的根段，两侧严格同构：
-  #   本地  {base_dir}/tv/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/E{集:02d}.mp4
-  #   R2    {s3.prefix}/tv/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/E{集:02d}.mp4
+  #   本地  {base_dir}/tvs/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/E{集:02d}.mp4
+  #   R2    {s3.prefix}/tvs/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/E{集:02d}.mp4
   # 每集独占一个目录，meta.json 与 subs/ 字幕作为旁车资产落在同一目录下，
   # 前端按同前缀一次列举即可拿全；fetch_subtitles.py 也能由 (tid,季,集,年)
   # 纯计算出前缀，不依赖任何日志记录即可判重与补传。
-  folder_prefix: "tv"
+  # 复数形式，与电影侧 movies/ 风格统一（2026-10-30 由 tv 改为 tvs，改时 R2 上还没有 TV 对象）。
+  folder_prefix: "tvs"
   # ---- 旁车资产（meta.json + 字幕）----
   # 尽力而为：写入/上传失败只打印告警，绝不影响整集的下载与上传结果。
   assets:
@@ -887,7 +888,7 @@ download_tv:
   # 上传失败待补传清单，供 `python download_tv.py reupload` 手动补传时精确定位。
   upload_pending_log: "upload_pending.jsonl"
   # ---- S3 兼容对象存储（Cloudflare R2）上传配置 ----
-  # 对象键格式：{prefix}/tv/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/{资产名}
+  # 对象键格式：{prefix}/tvs/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/{资产名}
   #   视频   .../S01/E03/E03.mp4
   #   元信息 .../S01/E03/meta.json
   #   字幕   .../S01/E03/subs/en.srt（由 fetch_subtitles.py 补传）
@@ -899,7 +900,7 @@ download_tv:
     endpoint_url: ""         # 环境变量 R2_ENDPOINT_URL
     region: "auto"           # R2 固定用 auto
     bucket: ""               # 环境变量 R2_BUCKET
-    prefix: ""               # 桶内根前缀（留空）：对象键直接从上面的 folder_prefix（tv/）开始
+    prefix: ""               # 桶内根前缀（留空）：对象键直接从上面的 folder_prefix（tvs/）开始
     access_key: ""           # 环境变量 R2_ACCESS_KEY
     secret_key: ""           # 环境变量 R2_SECRET_KEY
     upload_workers: 16       # 上传并发数

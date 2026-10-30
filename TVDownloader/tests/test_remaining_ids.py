@@ -87,10 +87,10 @@ def test_episodes_are_classified_and_shows_with_open_episodes_are_listed(box):
 
 def test_verify_r2_reports_missing_mismatch_and_r2_only(box):
     r2 = _FakeR2({
-        "tv/2001/1/S01/E01/E01.mp4": 100,
-        "tv/2001/1/S01/E02/E02.mp4": 999,            # 大小与台账不符
-        "tv/2001/1/S00/E01/E01.mp4": 10,             # 台账没记、R2 上有
-        "tv/2001/1/S01/E01/meta.json": 1,
+        "tvs/2001/1/S01/E01/E01.mp4": 100,
+        "tvs/2001/1/S01/E02/E02.mp4": 999,            # 大小与台账不符
+        "tvs/2001/1/S00/E01/E01.mp4": 10,             # 台账没记、R2 上有
+        "tvs/2001/1/S01/E01/meta.json": 1,
     })
     summary, reasons = _reasons(box, verify_r2=True, r2_client=(r2, "b"))
     assert reasons["1_S01E02"] == "r2_size_mismatch"

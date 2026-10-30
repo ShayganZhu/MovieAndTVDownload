@@ -215,10 +215,10 @@ RETRY_DEAD_MODE = False
 RETRY_ONLY_MODE = False
 BASE_DIR = resolve_dir(_CFG.get("base_dir"), "downloads")
 # 本地目录与 R2 对象键共用的根段，使两侧严格同构：
-#   本地  {BASE_DIR}/tv/{year}/{tmdbId}/S{ss}/E{ee}/E{ee}.mp4
-#   R2    {S3_PREFIX}/tv/{year}/{tmdbId}/S{ss}/E{ee}/E{ee}.mp4
-# strip("/") 防止配置写成 "tv/" 或 "/tv" 时拼出双斜杠/前导斜杠。
-FOLDER_PREFIX = (_CFG.get("folder_prefix") or "tv").strip().strip("/")
+#   本地  {BASE_DIR}/tvs/{year}/{tmdbId}/S{ss}/E{ee}/E{ee}.mp4
+#   R2    {S3_PREFIX}/tvs/{year}/{tmdbId}/S{ss}/E{ee}/E{ee}.mp4
+# strip("/") 防止配置写成 "tvs/" 或 "/tvs" 时拼出双斜杠/前导斜杠。
+FOLDER_PREFIX = (_CFG.get("folder_prefix") or "tvs").strip().strip("/")
 
 # ---- 元信息与字幕（旁车资产，与视频同目录）----
 # 两者都是"锦上添花"：获取/写入失败只记日志，绝不影响整集成败。
@@ -2252,7 +2252,7 @@ def build_s3_key(tmdb_id, season, episode, year=None, asset=None):
 
     规则：{S3_PREFIX}/{FOLDER_PREFIX}/{发布年份}/{tmdbId}/S{ss}/E{ee}/{资产名}
     如剧 12345、第 1 季第 3 集、首播年 2000、资产 E03.mp4 ->
-        tv/2000/12345/S01/E03/E03.mp4
+        tvs/2000/12345/S01/E03/E03.mp4
     year 缺失时用 unknown_year 兜底，避免拼出畸形 key。
 
     与旧版的关键差异：**对象键不再含上传日期**。日期段会把同一集分多次上传

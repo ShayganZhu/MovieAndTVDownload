@@ -63,7 +63,7 @@ def sandbox(tmp_path, monkeypatch):
     最直接。R2 模式（生产默认）的专属行为在 remote_sandbox 那组用例里单独锁。
     """
     monkeypatch.setattr(f.dt, "BASE_DIR", str(tmp_path / "downloads"))
-    monkeypatch.setattr(f.dt, "FOLDER_PREFIX", "tv")
+    monkeypatch.setattr(f.dt, "FOLDER_PREFIX", "tvs")
     monkeypatch.setattr(f.dt, "S3_PREFIX", "")
     monkeypatch.setattr(f, "SUBTITLE_LANGUAGES", ["en", "zh"])
     monkeypatch.setattr(f, "SUBTITLE_FORMATS", ["vtt", "srt"])
@@ -90,7 +90,7 @@ def sandbox(tmp_path, monkeypatch):
 def test_subs_dir_sits_next_to_the_video(sandbox):
     """字幕必须落在集目录下的 subs/，与视频、meta.json 同级。"""
     assert f.subs_dir("55", 1, 3, 2000) == os.path.join(
-        f.dt.BASE_DIR, "tv", "2000", "55", "S01", "E03", "subs"
+        f.dt.BASE_DIR, "tvs", "2000", "55", "S01", "E03", "subs"
     )
 
 
@@ -106,8 +106,8 @@ def test_subtitle_s3_key_shares_prefix_with_video(sandbox):
     """R2 侧字幕键必须与视频同前缀 —— 这是前端一次列举拿全的前提。"""
     video = f.dt.build_s3_key("55", 1, 3, 2000)
     sub = f.dt.build_s3_key("55", 1, 3, 2000, f"{f.dt.SUBS_SUBDIR}/en.srt")
-    assert video == "tv/2000/55/S01/E03/E03.mp4"
-    assert sub == "tv/2000/55/S01/E03/subs/en.srt"
+    assert video == "tvs/2000/55/S01/E03/E03.mp4"
+    assert sub == "tvs/2000/55/S01/E03/subs/en.srt"
 
 
 def test_local_mode_skips_deleted_episode_dir(sandbox, monkeypatch):
@@ -564,7 +564,7 @@ def test_remote_existing_languages_come_from_r2(remote_sandbox, monkeypatch):
     （上传成功即删），按本地判重会把每一集都当成缺口重抓。
     """
     remote_sandbox.keys = [
-        "tv/2000/55/S01/E03/subs/en.srt", "tv/2000/55/S01/E03/subs/en.vtt",
+        "tvs/2000/55/S01/E03/subs/en.srt", "tvs/2000/55/S01/E03/subs/en.vtt",
     ]
     asked = []
     monkeypatch.setattr(
@@ -580,8 +580,8 @@ def test_remote_existing_languages_come_from_r2(remote_sandbox, monkeypatch):
 def test_remote_listing_is_scoped_to_this_episode(remote_sandbox, monkeypatch):
     """列举必须严格限定在本集的 subs/ 前缀下，不能串到别的集。"""
     remote_sandbox.keys = [
-        "tv/2000/55/S01/E04/subs/en.srt",   # 邻集，不该算数
-        "tv/2000/55/S01/E03/subs/zh.srt",   # 本集
+        "tvs/2000/55/S01/E04/subs/en.srt",   # 邻集，不该算数
+        "tvs/2000/55/S01/E03/subs/zh.srt",   # 本集
     ]
     names, ok = f._list_remote_subtitles("55", 1, 3, 2000)
     assert ok is True
@@ -619,8 +619,8 @@ def test_remote_uploads_subtitles_and_leaves_no_local_files(
     assert sorted(result["saved"]) == ["en.srt", "en.vtt"]
     keys = sorted(k for _, k in remote_sandbox.uploaded)
     assert keys == [
-        "tv/2000/55/S01/E03/subs/en.srt",
-        "tv/2000/55/S01/E03/subs/en.vtt",
+        "tvs/2000/55/S01/E03/subs/en.srt",
+        "tvs/2000/55/S01/E03/subs/en.vtt",
     ]
     # 临时目录已清空，本地不留残留
     assert not os.path.exists(f.dt.BASE_DIR)
@@ -666,7 +666,7 @@ def test_remote_meta_json_gets_the_new_subtitles(remote_sandbox, monkeypatch):
     assert result["metaUpdated"] is True
     paths = {e["path"] for e in remote_sandbox.meta["subtitles"]}
     assert paths == {"subs/en.srt", "subs/en.vtt"}
-    assert "tv/2000/55/S01/E03/meta.json" in remote_sandbox.put_objects
+    assert "tvs/2000/55/S01/E03/meta.json" in remote_sandbox.put_objects
 
 
 def test_remote_meta_update_does_not_duplicate_entries(remote_sandbox):
@@ -740,8 +740,8 @@ def test_precondition_detector(exc, expected):
 def test_reconcile_meta_repairs_orphaned_files(remote_sandbox, monkeypatch):
     """上次跑在"字幕已传、meta 回写失败"处断掉：这次要能自动对账补记。"""
     remote_sandbox.keys = [
-        "tv/2000/55/S01/E03/subs/en.srt", "tv/2000/55/S01/E03/subs/en.vtt",
-        "tv/2000/55/S01/E03/subs/zh.srt", "tv/2000/55/S01/E03/subs/zh.vtt",
+        "tvs/2000/55/S01/E03/subs/en.srt", "tvs/2000/55/S01/E03/subs/en.vtt",
+        "tvs/2000/55/S01/E03/subs/zh.srt", "tvs/2000/55/S01/E03/subs/zh.vtt",
     ]
     remote_sandbox.meta = {"subtitles": []}
     monkeypatch.setattr(

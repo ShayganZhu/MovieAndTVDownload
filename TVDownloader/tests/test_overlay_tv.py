@@ -108,7 +108,7 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "BASE_DIR", str(tmp_path / "downloads"))
     monkeypatch.setattr(d, "SUCCESS_LOG", str(tmp_path / "success.jsonl"))
     monkeypatch.setattr(d, "FAILED_LOG", str(tmp_path / "failed.jsonl"))
-    monkeypatch.setattr(d, "FOLDER_PREFIX", "tv")
+    monkeypatch.setattr(d, "FOLDER_PREFIX", "tvs")
     monkeypatch.setattr(d, "processing_ids", set())
     return tmp_path
 
@@ -299,7 +299,7 @@ def _pipeline_env(tmp_path, monkeypatch, entries, verdict_of):
         monkeypatch.setattr(d, name, str(tmp_path / filename))
     monkeypatch.setattr(d, "BASE_DIR", str(tmp_path / "downloads"))
     monkeypatch.setattr(d, "TEMP_DIR", str(tmp_path / "temp"))
-    monkeypatch.setattr(d, "FOLDER_PREFIX", "tv")
+    monkeypatch.setattr(d, "FOLDER_PREFIX", "tvs")
     monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
     monkeypatch.setattr(d, "MAX_ROUNDS", 1)
     monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
@@ -469,14 +469,14 @@ def _setup_reject(tmp_path, monkeypatch, fail_delete=False):
     monkeypatch.setattr(d, "INPUT_JSONL", str(tmp_path / "results.jsonl"))
     monkeypatch.setattr(d, "S3_ENABLED", True)
     monkeypatch.setattr(d, "S3_PREFIX", "test")
-    monkeypatch.setattr(d, "FOLDER_PREFIX", "tv")
+    monkeypatch.setattr(d, "FOLDER_PREFIX", "tvs")
     monkeypatch.setattr(d, "is_main_running", lambda: False)
     r2 = _FakeR2({
-        "test/tv/2010/66/S01/E02/E02.mp4": 900_000_000,
-        "test/tv/2010/66/S01/E02/meta.json": 1_000,
-        "test/tv/2010/66/S01/E02/subs/en.vtt": 2_000,
-        "test/tv/2010/66/S01/E03/E03.mp4": 800_000_000,   # 同剧下一集，绝不能误删
-        "test/tv/2011/77/S02/E01/E01.mp4": 700_000_000,
+        "test/tvs/2010/66/S01/E02/E02.mp4": 900_000_000,
+        "test/tvs/2010/66/S01/E02/meta.json": 1_000,
+        "test/tvs/2010/66/S01/E02/subs/en.vtt": 2_000,
+        "test/tvs/2010/66/S01/E03/E03.mp4": 800_000_000,   # 同剧下一集，绝不能误删
+        "test/tvs/2011/77/S02/E01/E01.mp4": 700_000_000,
     }, fail_delete=fail_delete)
     monkeypatch.setattr(d, "get_s3_client", lambda: r2)
     with open(d.SUCCESS_LOG, "w", encoding="utf-8") as fh:
@@ -518,10 +518,10 @@ def test_reject_removes_only_that_episode_and_rejects_only_its_version(tmp_path,
     done, freed = d.reject_episodes(["66_S01E02"])
 
     assert (done, freed) == (1, 900_003_000)
-    assert sorted(r2.deleted) == ["test/tv/2010/66/S01/E02/E02.mp4",
-                                  "test/tv/2010/66/S01/E02/meta.json",
-                                  "test/tv/2010/66/S01/E02/subs/en.vtt"]
-    assert "test/tv/2010/66/S01/E03/E03.mp4" in r2.objects
+    assert sorted(r2.deleted) == ["test/tvs/2010/66/S01/E02/E02.mp4",
+                                  "test/tvs/2010/66/S01/E02/meta.json",
+                                  "test/tvs/2010/66/S01/E02/subs/en.vtt"]
+    assert "test/tvs/2010/66/S01/E03/E03.mp4" in r2.objects
     assert sorted(d.record_episode_key(r) for r in _read_jsonl(d.SUCCESS_LOG)) == [
         "66_S01E03", "77_S02E01"]
     assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == [], "有版本信息时不整集判死"
@@ -557,7 +557,7 @@ def test_reject_dry_run_changes_nothing(tmp_path, monkeypatch, capsys):
     d.reject_episodes(["66_S01E02"], dry_run=True)
     assert r2.deleted == [] and open(d.SUCCESS_LOG, encoding="utf-8").read() == before
     assert _read_jsonl(d.OVERLAY_NODE_REJECT_LOG) == []
-    assert "将删除 test/tv/2010/66/S01/E02/E02.mp4" in capsys.readouterr().out
+    assert "将删除 test/tvs/2010/66/S01/E02/E02.mp4" in capsys.readouterr().out
 
 
 def test_reject_keeps_ledgers_when_r2_delete_fails(tmp_path, monkeypatch, capsys):
@@ -581,7 +581,7 @@ def test_reject_gaps_lets_next_run_redownload(tmp_path, monkeypatch):
     """缺分片：R2 删干净、移出成品，但不判死、不拉黑版本——下次运行照常重下。"""
     r2 = _setup_reject(tmp_path, monkeypatch)
     assert d.reject_episodes(["77_S02E01"], reason="gaps") == (1, 700_000_000)
-    assert r2.deleted == ["test/tv/2011/77/S02/E01/E01.mp4"]
+    assert r2.deleted == ["test/tvs/2011/77/S02/E01/E01.mp4"]
     assert _read_jsonl(d.DOWNLOAD_DEAD_LOG) == [] and _read_jsonl(d.OVERLAY_NODE_REJECT_LOG) == []
     assert "77_S02E01" not in d.load_dead_keys()
     assert [r["stage"] for r in _read_jsonl(d.FAILED_LOG)] == ["gaps_retry"]
@@ -659,8 +659,8 @@ def test_reject_takes_reason_from_record_mode_hit(tmp_path, monkeypatch):
 
     assert d.reject_episodes(["66_S01E03"]) == (1, 800_000_000)
 
-    assert r2.deleted == ["test/tv/2010/66/S01/E03/E03.mp4"]
-    assert "test/tv/2010/66/S01/E02/E02.mp4" in r2.objects, "同剧上一集不动"
+    assert r2.deleted == ["test/tvs/2010/66/S01/E03/E03.mp4"]
+    assert "test/tvs/2010/66/S01/E02/E02.mp4" in r2.objects, "同剧上一集不动"
     rejects = _read_jsonl(d.OVERLAY_NODE_REJECT_LOG)
     assert [(r["episode"], r["node_key"], r["reason"], r["manual"], r["evidence_dir"])
             for r in rejects] == [(3, "vidup|m3u8|" + FINAL, "watermark", True, folder)]

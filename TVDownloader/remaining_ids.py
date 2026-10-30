@@ -112,7 +112,7 @@ def build_paths(base_dir, ids=None, config=None):
     dl = config.get("download_tv") or {}
     fetch = config.get("tv_ids_to_links") or {}
     s3 = dl.get("s3") or {}
-    folder = (dl.get("folder_prefix") or "tv").strip().strip("/")
+    folder = (dl.get("folder_prefix") or "tvs").strip().strip("/")
     return {
         "ids": (base_dir / ids).resolve() if ids else _resolve(base_dir, fetch.get("input"), "ids.txt"),
         "seasons_cache": _resolve(base_dir, fetch.get("seasons_cache"), "seasons_cache.jsonl"),

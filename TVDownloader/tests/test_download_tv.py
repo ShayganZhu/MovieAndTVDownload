@@ -64,7 +64,7 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(tmp_path / "download_dead.jsonl"))
     monkeypatch.setattr(d, "UPLOAD_PENDING_LOG", str(tmp_path / "pending.jsonl"))
     monkeypatch.setattr(d, "MAIN_LOCK_FILE", str(tmp_path / "main.lock"))
-    monkeypatch.setattr(d, "FOLDER_PREFIX", "tv")
+    monkeypatch.setattr(d, "FOLDER_PREFIX", "tvs")
     monkeypatch.setattr(d, "S3_PREFIX", "")
     monkeypatch.setattr(d, "processing_ids", set())
     return tmp_path
@@ -112,10 +112,22 @@ def test_record_episode_key_and_identity():
 
 
 # ---------------------------------------------------------------- R2 key mapping
+def test_shipped_folder_prefix_is_plural_like_movies():
+    """R2 根段用复数 tvs/，与电影侧 movies/ 统一（2026-10-30 由 tv 改名）。"""
+    import yaml
+
+    here = os.path.dirname(d.__file__)
+    tv = yaml.safe_load(open(os.path.join(here, "config.yaml"), encoding="utf-8"))
+    movie = yaml.safe_load(open(os.path.join(here, "..", "MovieDownloader", "config.yaml"),
+                                encoding="utf-8"))
+    assert tv["download_tv"]["folder_prefix"] == "tvs"
+    assert movie["download_movies"]["folder_prefix"] == "movies"
+
+
 def test_build_s3_key_layout(sandbox):
-    assert d.build_s3_key(12345, 1, 3, 2008) == "tv/2008/12345/S01/E03/E03.mp4"
+    assert d.build_s3_key(12345, 1, 3, 2008) == "tvs/2008/12345/S01/E03/E03.mp4"
     assert d.build_s3_key("12345", "0", "12", "2008") == (
-        "tv/2008/12345/S00/E12/E12.mp4"
+        "tvs/2008/12345/S00/E12/E12.mp4"
     )
 
 
@@ -124,7 +136,7 @@ def test_build_s3_key_asset_shares_prefix_with_video(sandbox):
     video = d.build_s3_key(12345, 1, 3, 2008)
     meta = d.build_s3_key(12345, 1, 3, 2008, "meta.json")
     sub = d.build_s3_key(12345, 1, 3, 2008, "subs/en.srt")
-    prefix = "tv/2008/12345/S01/E03"
+    prefix = "tvs/2008/12345/S01/E03"
     assert video == f"{prefix}/E03.mp4"
     assert meta == f"{prefix}/meta.json"
     assert sub == f"{prefix}/subs/en.srt"
@@ -142,12 +154,12 @@ def test_build_s3_key_is_stable_across_days(sandbox, monkeypatch):
 
 
 def test_build_s3_key_year_sanitised_and_prefix(sandbox, monkeypatch):
-    assert d.build_s3_key(1, 1, 1, " 20/08 ").startswith("tv/2008/1/")
-    assert d.build_s3_key(1, 1, 1, None).startswith("tv/unknown_year/1/")
-    assert d.build_s3_key(1, 1, 1, "").startswith("tv/unknown_year/1/")
-    assert d.build_s3_key(1, 1, 1, "n/a").startswith("tv/unknown_year/1/")
+    assert d.build_s3_key(1, 1, 1, " 20/08 ").startswith("tvs/2008/1/")
+    assert d.build_s3_key(1, 1, 1, None).startswith("tvs/unknown_year/1/")
+    assert d.build_s3_key(1, 1, 1, "").startswith("tvs/unknown_year/1/")
+    assert d.build_s3_key(1, 1, 1, "n/a").startswith("tvs/unknown_year/1/")
     monkeypatch.setattr(d, "S3_PREFIX", "bucketroot")
-    assert d.build_s3_key(1, 1, 1, 2008) == "bucketroot/tv/2008/1/S01/E01/E01.mp4"
+    assert d.build_s3_key(1, 1, 1, 2008) == "bucketroot/tvs/2008/1/S01/E01/E01.mp4"
 
 
 @pytest.mark.parametrize("tid,s,e", [
@@ -162,7 +174,7 @@ def test_local_and_remote_layouts_are_isomorphic(sandbox):
     """本地目录与 R2 对象键必须严格同构，否则两侧无法互相换算。"""
     local = d.episode_dir(12345, 1, 3, 2008)
     rel = d.asset_rel_path(12345, 1, 3, 2008)
-    assert rel == "tv/2008/12345/S01/E03"
+    assert rel == "tvs/2008/12345/S01/E03"
     assert local == os.path.join(str(sandbox / "downloads"), *rel.split("/"))
     assert d.build_s3_key(12345, 1, 3, 2008, "meta.json") == f"{rel}/meta.json"
 
@@ -170,7 +182,7 @@ def test_local_and_remote_layouts_are_isomorphic(sandbox):
 # ---------------------------------------------------------------- local layout
 def _put_episode(base, year, tid, season, episode, data=b"x"):
     """在新布局下造一个成品：{base}/tv/{year}/{tid}/S{ss}/E{ee}/E{ee}.mp4。"""
-    folder = base / "tv" / year / tid / f"S{season:02d}" / f"E{episode:02d}"
+    folder = base / "tvs" / year / tid / f"S{season:02d}" / f"E{episode:02d}"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"E{episode:02d}.mp4"
     path.write_bytes(data)
@@ -185,12 +197,12 @@ def test_scan_downloaded_mp4_ids(sandbox):
     # 同一集出现在两个 year 目录下（脏数据）：只报告，不删。
     _put_episode(base, "2009", "100", 1, 1)
     # 旁车资产与非集目录不参与去重判定。
-    ep_dir = base / "tv" / "2008" / "100" / "S01" / "E01"
+    ep_dir = base / "tvs" / "2008" / "100" / "S01" / "E01"
     (ep_dir / "meta.json").write_text("{}", encoding="utf-8")
     (ep_dir / "subs").mkdir()
     (ep_dir / "subs" / "en.srt").write_text("x", encoding="utf-8")
-    (base / "tv" / "2008" / "100" / "Extras").mkdir()
-    (base / "tv" / "2008" / "notanid").mkdir()
+    (base / "tvs" / "2008" / "100" / "Extras").mkdir()
+    (base / "tvs" / "2008" / "notanid").mkdir()
 
     ids, dups = d.scan_downloaded_mp4_ids()
     assert ids == {"100_S01E01", "200_S00E05"}
@@ -198,7 +210,7 @@ def test_scan_downloaded_mp4_ids(sandbox):
     assert len(dups["100_S01E01"]) == 2
     # 0 字节孤儿已被清理。
     assert not (
-        base / "tv" / "2008" / "100" / "S01" / "E02" / "E02.mp4"
+        base / "tvs" / "2008" / "100" / "S01" / "E02" / "E02.mp4"
     ).exists()
 
 
@@ -228,10 +240,10 @@ def test_reconcile_unlogged_downloads_writes_log_and_pending(sandbox, monkeypatc
     r100 = by_key["100_S01E01"]
     assert r100["uploaded"] is False and r100["reconciled"] is True
     assert r100["final_path"] == str(p_unlogged)
-    assert r100["year"] == "2008" and r100["s3_key"] == "tv/2008/100/S01/E01/E01.mp4"
+    assert r100["year"] == "2008" and r100["s3_key"] == "tvs/2008/100/S01/E01/E01.mp4"
     assert r100["provider"] is None       # 归因键齐全、值为 None
     r300 = by_key["300_S02E03"]
-    assert r300["year"] is None and r300["s3_key"] == "tv/unknown_year/300/S02/E03/E03.mp4"
+    assert r300["year"] is None and r300["s3_key"] == "tvs/unknown_year/300/S02/E03/E03.mp4"
 
     pend = _read_jsonl(d.UPLOAD_PENDING_LOG)
     assert {d.record_episode_key(r) for r in pend} == {"100_S01E01", "300_S02E03"}
@@ -279,7 +291,7 @@ def test_reconciled_pending_is_claimed_by_reupload(sandbox, monkeypatch):
     calls = []
     monkeypatch.setattr(d, "upload_to_r2", lambda lp, k: calls.append((lp, k)) or (True, None))
     d.reupload_pending()
-    assert calls == [(str(p), "tv/2008/100/S01/E01/E01.mp4")]
+    assert calls == [(str(p), "tvs/2008/100/S01/E01/E01.mp4")]
     assert not p.exists()
     assert _read_jsonl(d.UPLOAD_PENDING_LOG) == []
     logs = _read_jsonl(d.SUCCESS_LOG)
@@ -299,14 +311,14 @@ def test_move_to_target_folder_uses_episode_dir(sandbox):
     p1 = d.move_to_target_folder(mk("a.mp4"), 1, 1, 1, 2008)
     p2 = d.move_to_target_folder(mk("b.mp4"), 1, 1, 2, 2008)
     p3 = d.move_to_target_folder(mk("c.mp4"), 1, 2, 1, 2008)
-    assert p1 == str(base / "tv" / "2008" / "1" / "S01" / "E01" / "E01.mp4")
-    assert p2 == str(base / "tv" / "2008" / "1" / "S01" / "E02" / "E02.mp4")
-    assert p3 == str(base / "tv" / "2008" / "1" / "S02" / "E01" / "E01.mp4")
+    assert p1 == str(base / "tvs" / "2008" / "1" / "S01" / "E01" / "E01.mp4")
+    assert p2 == str(base / "tvs" / "2008" / "1" / "S01" / "E02" / "E02.mp4")
+    assert p3 == str(base / "tvs" / "2008" / "1" / "S02" / "E01" / "E01.mp4")
 
     # 同一集重复落盘就地覆盖，不额外造目录。
     p1b = d.move_to_target_folder(mk("d.mp4"), 1, 1, 1, 2008)
     assert p1b == p1
-    assert os.listdir(base / "tv" / "2008" / "1" / "S01" / "E01") == ["E01.mp4"]
+    assert os.listdir(base / "tvs" / "2008" / "1" / "S01" / "E01") == ["E01.mp4"]
     assert not (temp / "d.mp4").exists()
 
 
@@ -326,7 +338,7 @@ def test_move_to_target_folder_cleans_partial_on_failure(sandbox, monkeypatch):
     with pytest.raises(OSError):
         d.move_to_target_folder(str(src), 1, 1, 1, 2008)
     assert not (
-        base / "tv" / "2008" / "1" / "S01" / "E01" / "E01.mp4"
+        base / "tvs" / "2008" / "1" / "S01" / "E01" / "E01.mp4"
     ).exists()
 
 
@@ -2564,7 +2576,7 @@ def test_finalize_one_entry_success_and_failure(sandbox, monkeypatch):
     key, ok, info = d.finalize_one_entry(job, processed)
     assert (key, ok) == ("1_S01E01", True)
     assert info["final_path"] == str(
-        sandbox / "downloads" / "tv" / "2001" / "1" / "S01" / "E01" / "E01.mp4"
+        sandbox / "downloads" / "tvs" / "2001" / "1" / "S01" / "E01" / "E01.mp4"
     )
     assert os.path.exists(info["final_path"])
     assert (info["season"], info["episode"], info["year"]) == (1, 1, 2001)
@@ -2596,7 +2608,7 @@ def _success_info(sandbox, key="1_S01E01"):
     season, _, episode = rest.partition("E")
     s, e = int(season), int(episode)
     folder = (
-        sandbox / "downloads" / "tv" / "2001" / tid / f"S{s:02d}" / f"E{e:02d}"
+        sandbox / "downloads" / "tvs" / "2001" / tid / f"S{s:02d}" / f"E{e:02d}"
     )
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"E{e:02d}.mp4"
@@ -2657,7 +2669,7 @@ def test_reupload_carries_file_size_into_success_log(sandbox, monkeypatch):
     info = _success_info(sandbox)
     d.write_pending({
         "tmdbId": "1", "season": 1, "episode": 1, "title": "T", "year": 2001,
-        "local_path": info["final_path"], "s3_key": "tv/2001/1/S01/E01/E01.mp4",
+        "local_path": info["final_path"], "s3_key": "tvs/2001/1/S01/E01/E01.mp4",
         "fail_reason": "boom", "ts": "now",
     })
     d.reupload_pending()
@@ -2702,8 +2714,8 @@ def test_upload_one_entry_success_deletes_local(sandbox, monkeypatch):
 
     key, ok, out = d.upload_one_entry(info)
     assert ok is True
-    video_key = "tv/2001/1/S01/E01/E01.mp4"
-    meta_key = "tv/2001/1/S01/E01/meta.json"
+    video_key = "tvs/2001/1/S01/E01/E01.mp4"
+    meta_key = "tvs/2001/1/S01/E01/meta.json"
     assert uploaded == [(info["final_path"], video_key), (meta_path, meta_key)]
     assert out["asset_keys"] == [meta_key]
     assert not os.path.exists(info["final_path"])
@@ -2782,7 +2794,7 @@ def test_upload_one_entry_sidecar_failure_writes_assets_only_pending(sandbox, mo
     monkeypatch.setattr(d, "upload_to_r2", fake_upload)
     key, ok, out = d.upload_one_entry(info)
     assert ok is True
-    assert out["asset_keys"] == ["tv/2001/1/S01/E01/subs/en.vtt"]
+    assert out["asset_keys"] == ["tvs/2001/1/S01/E01/subs/en.vtt"]
     assert not os.path.exists(info["final_path"])
     assert not os.path.exists(paths["subs/en.vtt"])
     assert os.path.exists(paths["meta.json"])          # 失败资产留在本地
@@ -2795,7 +2807,7 @@ def test_upload_one_entry_sidecar_failure_writes_assets_only_pending(sandbox, mo
     assert pend[0]["failed_assets"] == ["meta.json"]
     assert pend[0]["provider"] == "vidsrc"
     assert pend[0]["local_path"] == info["final_path"]
-    assert pend[0]["s3_key"] == "tv/2001/1/S01/E01/E01.mp4"
+    assert pend[0]["s3_key"] == "tvs/2001/1/S01/E01/E01.mp4"
     assert "meta.json" in pend[0]["fail_reason"]
 
 
@@ -2829,12 +2841,12 @@ def test_reupload_assets_only_success_clears_pending_and_dir(sandbox, monkeypatc
     paths = _write_sidecars(info, subs=("en.vtt", "zh.srt"))
     (sandbox / "success.jsonl").write_text(
         json.dumps({"tmdbId": "1", "season": 1, "episode": 1, "uploaded": True,
-                    "s3_key": "tv/2001/1/S01/E01/E01.mp4"}) + "\n",
+                    "s3_key": "tvs/2001/1/S01/E01/E01.mp4"}) + "\n",
         encoding="utf-8",
     )
     (sandbox / "pending.jsonl").write_text(json.dumps({
         "tmdbId": "1", "season": 1, "episode": 1, "year": 2001, "title": "T",
-        "local_path": info["final_path"], "s3_key": "tv/2001/1/S01/E01/E01.mp4",
+        "local_path": info["final_path"], "s3_key": "tvs/2001/1/S01/E01/E01.mp4",
         "assets_only": True, "failed_assets": ["meta.json"],
         "fail_reason": "旁车资产上传失败: meta.json", "ts": "old",
     }) + "\n", encoding="utf-8")
@@ -2846,9 +2858,9 @@ def test_reupload_assets_only_success_clears_pending_and_dir(sandbox, monkeypatc
 
     # 回扫以目录实况为准：不只补 failed_assets 里的 meta.json，字幕也一并传。
     assert calls == [
-        "tv/2001/1/S01/E01/meta.json",
-        "tv/2001/1/S01/E01/subs/en.vtt",
-        "tv/2001/1/S01/E01/subs/zh.srt",
+        "tvs/2001/1/S01/E01/meta.json",
+        "tvs/2001/1/S01/E01/subs/en.vtt",
+        "tvs/2001/1/S01/E01/subs/zh.srt",
     ]
     assert not any(os.path.exists(p) for p in paths.values())
     assert not os.path.isdir(os.path.dirname(info["final_path"]))
@@ -2871,7 +2883,7 @@ def test_reupload_assets_only_partial_failure_keeps_pending(sandbox, monkeypatch
     paths = _write_sidecars(info, subs=("en.vtt",))
     (sandbox / "pending.jsonl").write_text(json.dumps({
         "tmdbId": "1", "season": 1, "episode": 1, "year": 2001,
-        "local_path": info["final_path"], "s3_key": "tv/2001/1/S01/E01/E01.mp4",
+        "local_path": info["final_path"], "s3_key": "tvs/2001/1/S01/E01/E01.mp4",
         "assets_only": True, "failed_assets": ["meta.json", "subs/en.vtt"],
         "fail_reason": "old", "ts": "old",
     }) + "\n", encoding="utf-8")
@@ -2938,7 +2950,7 @@ def test_reupload_video_ok_but_sidecar_fails_degrades_to_assets_only(sandbox, mo
     assert len(remaining) == 1
     assert remaining[0]["assets_only"] is True
     assert remaining[0]["failed_assets"] == ["meta.json"]
-    assert remaining[0]["s3_key"] == "tv/2001/1/S01/E01/E01.mp4"
+    assert remaining[0]["s3_key"] == "tvs/2001/1/S01/E01/E01.mp4"
     assert remaining[0]["provider"] == "p1"
 
 
@@ -5129,7 +5141,7 @@ def test_reupload_pending_flow(sandbox, monkeypatch, capsys):
 
     # Episode 1: rebuilt key from year, uploaded, local removed, logs reconciled.
     assert calls == [
-        (str(ok_file), "tv/2001/1/S01/E01/E01.mp4"),
+        (str(ok_file), "tvs/2001/1/S01/E01/E01.mp4"),
         (str(bad_file), "2002/2/S01/20260901/E01.mp4"),   # existing s3_key reused
     ]
     assert not ok_file.exists()
