@@ -145,11 +145,12 @@ tv_ids_to_links:
   # vidlink 垫底——它的价值是**兜底覆盖**（独占 798/1278 集）而非画质，
   # 且其失败中 99.1% 是"码率未达门槛"，排前面只会增加无效试错。
   # ⚠️ 别按覆盖率排序：vidlink 覆盖 94% 但画质最差，排前面会系统性拉低成片质量。
-  # videasy 已接入但默认不启用（2026-10-30）：06 号机实测它的流与 vidup / vidfast 同在
-  # sun.finalsignal.top / moon.goldenkite.top，热门剧样本里没见到独占的集，而每集要多花
-  # seed + 各 server 的 sources + dec 共 5–7 个请求（TV 取流本就是瓶颈）。vidup / vidfast 的
-  # 接口再变时可临时加上：providers: [vidup, vidfast, videasy, vidlink]。
-  providers: [vidup, vidfast, vidlink]
+  # videasy 2026-10-30 起长期启用，放在 vidlink 前（画质优先）：06 号机实测它的流与 vidup /
+  # vidfast 同在 sun.finalsignal.top / moon.goldenkite.top，热门剧样本里没见到独占的集，但
+  # vidup / vidfast 临时取不到时能兜底给出 HLS（《双城之战》S01E02：两者连续超时，videasy 照样
+  # 出流，否则只剩画质最差的 vidlink）。代价是每集多 seed + 各 server 的 sources + dec
+  # 共 5–7 个请求；取流吞吐吃紧时可去掉它。
+  providers: [vidup, vidfast, videasy, vidlink]
   # 并发线程数：同时解析多少集。配合住宅代理分散 IP。
   # 无源404不重试，任务为纯IO等待，可拉高并发；电影版 50 实测稳定。
   # 2026-09 全量实跑：50 并发时老剧段（判死需 2 轮 × 5 server）仅 ~72 集/分钟，瓶颈在代理 RTT，

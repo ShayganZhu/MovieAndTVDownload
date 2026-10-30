@@ -1248,7 +1248,8 @@ def _fetch_videasy(session, tid, season, episode):
 
     各 server 按剧名 / 首播年检索，缺剧名时只走第一个 server。seed 每集只取一次、各 server
     复用：seed 接口限流很紧（同一出口 IP 短时间十几次就 429），且有效期 30 秒。
-    默认不在 providers 里（2026-10-30 实测与 vidup / vidfast 同一后端、未见独占），按需启用。
+    2026-10-30 起在 config.yaml 的 providers 里长期启用（排在 vidlink 前）：与 vidup / vidfast
+    同一后端、实测未见独占，但它们临时取不到时能兜底给出 HLS。
     """
     label = _ep_label(tid, season, episode)
     meta = _SERIES_META.get(str(tid), {})
@@ -1312,7 +1313,7 @@ PROVIDERS = {
     "vidup": _fetch_vidup,
     "vidlink": _fetch_vidlink,
     "vidfast": _fetch_vidfast,
-    # 默认不启用（config.yaml providers 里没有它）；需要时加进 providers 或 --providers。
+    # config.yaml 的 providers 里长期启用（2026-10-30，排在 vidlink 前）。
     "videasy": _fetch_videasy,
 }
 

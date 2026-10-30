@@ -382,7 +382,7 @@ def test_videasy_without_a_title_asks_only_the_first_server(monkeypatch):
     assert not any("/miami/" in u for u in session.urls)
 
 
-def test_videasy_is_available_but_not_enabled_by_default():
+def test_videasy_is_enabled_before_vidlink():
     import os
 
     import yaml
@@ -390,4 +390,5 @@ def test_videasy_is_available_but_not_enabled_by_default():
     path = os.path.join(os.path.dirname(m.__file__), "config.yaml")
     cfg = yaml.safe_load(open(path, encoding="utf-8"))["tv_ids_to_links"]
     assert "videasy" in m.PROVIDERS
-    assert "videasy" not in cfg["providers"], "默认不启用：与 vidup/vidfast 同一后端、实测未见独占"
+    assert cfg["providers"] == ["vidup", "vidfast", "videasy", "vidlink"], \
+        "videasy 长期启用、排在 vidlink 前（画质优先）"

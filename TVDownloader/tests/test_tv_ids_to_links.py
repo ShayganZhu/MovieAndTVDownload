@@ -459,7 +459,9 @@ def _install_fake_session(monkeypatch, page_html, streams, servers=None, stream_
       vidlink_resp: 整个 _FakeResp；默认 200 + body null（无源）。
     vidfast（vidfast.vc / enc-vidfast / dec-vidfast / https://y/...）：
       vidfast_page_status: 默认 404（无源）；vidfast_streams 同 streams 语义。
-    默认 vidlink/vidfast 都无源，旧的 vidup 单源用例语义不变。"""
+    videasy（api.wecollege.net seed / {server}/sources，2026-10-30 起默认启用）：
+      seed 正常、各 server 一律 404（无源）。
+    默认 vidlink/vidfast/videasy 都无源，旧的 vidup 单源用例语义不变。"""
     seen = {"page_urls": [], "page_headers": None, "enc_urls": [], "servers_headers": None,
             "vidlink_urls": [], "vidlink_headers": None, "vidfast_page_urls": [], "order": []}
     sites = {
@@ -523,6 +525,11 @@ def _install_fake_session(monkeypatch, page_html, streams, servers=None, stream_
                             "servers": f"{base}/servers", "stream": f"{base}/stream", "token": token}})
                     return _FakeResp(status=400, payload={"status": 400,
                                                           "error": "Expected query: text, stage"})
+            if url.startswith(m.VIDEASY_HOST + "/"):
+                if "/seed?" in url:
+                    seen["order"].append("videasy")
+                    return _FakeResp(payload={"seed": "SEED"})
+                return _FakeResp(status=404)
             if "/enc-vidlink" in url:
                 seen["order"].append("vidlink")
                 return _FakeResp(payload={"status": 200, "result": vidlink_enc})
@@ -591,7 +598,7 @@ def test_process_episode_ok_uses_input_key_and_merges_meta(monkeypatch):
     assert result["urls"][0] == {"url": "u1", "provider": "vidup", "type": "m3u8",
                                  "headers": {}, "quality": None, "size": None}
     # vidup 命中后仍打 vidlink / vidfast 汇总候选（默认都无源，不影响 ok）
-    assert seen["order"] == ["vidup", "vidfast", "vidlink"]
+    assert seen["order"] == ["vidup", "vidfast", "videasy", "vidlink"]
     assert result["title"] == "Show Name"
     assert result["year"] == 2011 and result["original_title"] == "Orig"
 
@@ -909,7 +916,7 @@ def test_process_episode_falls_through_to_vidlink(monkeypatch):
     monkeypatch.setattr(m, "_TMDB_NAMES", {"7": "Name"})
     status, result = m.process_episode("7", 1, 2)
     assert status == "ok"
-    assert seen["order"] == ["vidup", "vidfast", "vidlink"]
+    assert seen["order"] == ["vidup", "vidfast", "videasy", "vidlink"]
     assert seen["vidlink_urls"] == ["https://vidlink.pro/api/b/tv/ENCTID/1/2"]
     assert seen["vidlink_headers"]["Origin"] == "https://vidlink.pro"
     # 画质降序；size 非法为 None；空 url 丢弃；下载头是 okhttp 且不带 Referer
@@ -926,7 +933,7 @@ def test_process_episode_falls_through_to_vidfast(monkeypatch):
                                  vidfast_page_status=200, vidfast_streams=[{"url": "vf1", "title": "VF"}])
     status, result = m.process_episode("1", 1, 1)
     assert status == "ok"
-    assert seen["order"] == ["vidup", "vidfast", "vidlink"]
+    assert seen["order"] == ["vidup", "vidfast", "videasy", "vidlink"]
     assert seen["vidfast_page_urls"] == ["https://vidfast.vc/tv/1/1/1/"]
     assert result["urls"] == [{"url": "vf1", "provider": "vidfast", "type": "m3u8",
                                "headers": {}, "quality": None, "size": None}]
@@ -938,7 +945,7 @@ def test_process_episode_dead_only_when_all_providers_nosource(monkeypatch):
     seen = _install_fake_session(monkeypatch, PAGE, [], page_status=404)
     status, result = m.process_episode("1", 1, 1)
     assert status == "dead" and result is None
-    assert seen["order"] == ["vidup", "vidfast", "vidlink"] * 2
+    assert seen["order"] == ["vidup", "vidfast", "videasy", "vidlink"] * 2
 
 
 def test_process_episode_vidlink_transient_blocks_dead(monkeypatch):
@@ -948,7 +955,7 @@ def test_process_episode_vidlink_transient_blocks_dead(monkeypatch):
                                  vidlink_resp=_FakeResp(status=503))
     status, _ = m.process_episode("1", 1, 1)
     assert status == "retry"
-    assert seen["order"] == ["vidup", "vidfast", "vidlink"] * 2
+    assert seen["order"] == ["vidup", "vidfast", "videasy", "vidlink"] * 2
 
 
 def test_process_episode_vidlink_missing_qualities_is_transient(monkeypatch):
@@ -967,7 +974,7 @@ def test_process_episode_vidlink_404_is_transient(monkeypatch):
     status, _ = m.process_episode("1", 1, 1)
     assert status == "retry"
     # 走的是瞬时重试路径而不是 DEAD_CONFIRM 复探：MAX_RETRIES=1 只跑一轮
-    assert seen["order"] == ["vidup", "vidfast", "vidlink"]
+    assert seen["order"] == ["vidup", "vidfast", "videasy", "vidlink"]
 
 
 def test_process_episode_vidlink_enc_is_url_quoted(monkeypatch):
@@ -1013,7 +1020,7 @@ def test_process_episode_aggregates_all_providers(monkeypatch):
     monkeypatch.setattr(m, "_TMDB_NAMES", {})
     status, result = m.process_episode("1", 1, 1)
     assert status == "ok"
-    assert seen["order"] == ["vidup", "vidfast", "vidlink"]
+    assert seen["order"] == ["vidup", "vidfast", "videasy", "vidlink"]
     assert [(u["provider"], u["url"]) for u in result["urls"]] == [
         ("vidup", "u1"), ("vidup", "https://cdn/480.mp4"),
         ("vidfast", "vf1"),
@@ -1028,7 +1035,7 @@ def test_process_episode_ok_even_if_other_provider_transient(monkeypatch):
                                  vidlink_resp=_FakeResp(status=503))
     status, result = m.process_episode("1", 1, 1)
     assert status == "ok" and _urls(result) == ["u"]
-    assert seen["order"] == ["vidup", "vidfast", "vidlink"]
+    assert seen["order"] == ["vidup", "vidfast", "videasy", "vidlink"]
 
 
 def test_resolve_providers():
