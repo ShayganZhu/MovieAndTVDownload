@@ -394,6 +394,7 @@ def test_shipped_providers_and_dead_confirm():
         "2026-10-30 起移出 videasy：23 号机首轮没有一集只有它有、也没有一集用它下成"
     assert cfg["dead_confirm"] is False and m.DEAD_CONFIRM is False, \
         "TV 全量关闭判死二次确认（用户 2026-10-30 定）"
+    assert cfg["max_workers"] == 200, "取流是下载的上游瓶颈（2026-10-30 23 号机实测）"
 
 
 # ------------------------------------------------------------ 哪些源熔断才阻止判死（2026-10-30）
