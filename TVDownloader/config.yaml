@@ -102,6 +102,8 @@ tv_ids_to_links:
   # 解析失败记录：集级 tmdb_id\tseason\tepisode（真无源）；剧级 tmdb_id\t-\t-（TMDB 404）；
   # 多轮重试耗尽 tmdb_id\tseason\tepisode\tretry-exhausted（下次运行自动重试）
   fail_file: "fail.txt"
+  # 因取流源熔断而推迟的集（tid\tseason\tepisode\t源）；每次运行覆盖写，不计入已处理、下次运行重查。
+  provider_down_file: "provider_down.txt"
   # 季集结构缓存：TMDB /tv/{id} 展开结果，避免多轮/续跑时重复调 API
   # 每行 {tmdbId, name, year, ended, seasons:[{season, episodes, air_dates}]}；
   # air_dates 用于跳过未播集（air_date + air_grace_days 在今天之后，或未完结剧的 TBA 集），下次运行自动再试
@@ -143,6 +145,10 @@ tv_ids_to_links:
   # vidlink 垫底——它的价值是**兜底覆盖**（独占 798/1278 集）而非画质，
   # 且其失败中 99.1% 是"码率未达门槛"，排前面只会增加无效试错。
   # ⚠️ 别按覆盖率排序：vidlink 覆盖 94% 但画质最差，排前面会系统性拉低成片质量。
+  # videasy 已接入但默认不启用（2026-10-30）：06 号机实测它的流与 vidup / vidfast 同在
+  # sun.finalsignal.top / moon.goldenkite.top，热门剧样本里没见到独占的集，而每集要多花
+  # seed + 各 server 的 sources + dec 共 5–7 个请求（TV 取流本就是瓶颈）。vidup / vidfast 的
+  # 接口再变时可临时加上：providers: [vidup, vidfast, videasy, vidlink]。
   providers: [vidup, vidfast, vidlink]
   # 并发线程数：同时解析多少集。配合住宅代理分散 IP。
   # 无源404不重试，任务为纯IO等待，可拉高并发；电影版 50 实测稳定。
@@ -171,6 +177,28 @@ tv_ids_to_links:
   #   - 真无源404 → 永久排除，绝不再抓（注意：是“这一集”无源，不影响同剧其它集）；
   #   - output 直接就是全部轮次成功结果的合并。
   max_rounds: 8
+  # ---- 取流源熔断 / 直连分流（电影侧 7631adb 移植，2026-10-30）----
+  # 某个源整体不可用（第一跳页面 / 接口连续返回 403/451/502/503/52x）时暂停调用它，每隔
+  # probe_interval_minutes 放一集去试探，拿到结果或"无此集"即恢复；超时、429、enc-dec 出错不计数。
+  # 只因它缺席而下不了结论的集记为推迟（不判死、不写 fail.txt），源恢复后放回下一轮，
+  # 跑完仍推迟的写 provider_down_file。电影侧起因：videasy 被 Cloudflare 封禁期间，凡是其余源都说
+  # 无源的片永远判不了死，24 号机 3 小时判死 0 部、约 69% 的取流尝试空转。
+  provider_breaker:
+    enabled: true
+    trip_after: 30              # 连续多少次"整体不可用"才熔断；个别被拉黑的出口凑不满
+    probe_interval_minutes: 10
+  # ---- 直连分流 ----
+  # 代理网关在新加坡（24 号机往返 230ms），经它的请求中位 1.2–5.4 秒、约 8% 在 12 秒内
+  # 超时；直连只要 0.2 秒。2026-10-24 在 24 号机实测：enc-dec.app 直连 40 次全 200、
+  # 未被限流（README 标注限流 40 次/秒）；vidlink 整条链路直连 4/4 部正常（0.3 秒 vs
+  # 走代理 6–8 秒）。vidup.to 对机房 IP 返回 403，仍走代理。
+  # 直连被拒（403/429/限流文案）时同一请求立刻改走代理重发，这一类请求在
+  # fallback_cooldown_minutes 分钟内都走代理；超时不回退（换代理解决不了）。
+  # 判死二次确认那一跳全部走代理，防止只在直连路径上出现的"无此片"把片判死。
+  direct:
+    encdec: true                # enc-dec.app 加解密接口
+    vidlink: true               # vidlink.pro（enc 在 enc-dec，接口在 vidlink.pro）
+    fallback_cooldown_minutes: 10
   # 轮间退避：第 n 轮结束后等待 min(round_backoff*n, round_backoff_max) 秒再进入下一轮，
   # 给代理池换 IP / 源站恢复留时间。若某轮 ≥90% 且 ≥50 集都是瞬时失败（疑似代理或源站整体故障），
   # 直接等待 round_backoff_max。达 max_rounds 仍失败的集写入 fail_file 并标记
@@ -709,6 +737,22 @@ download_tv:
   # 取值权衡：源站故障多是分钟级抖动，间隔太长（如 300s）会在一次运行内白扔上百集；
   #    而复位的代价只有几次必然失败的请求。故默认 15s —— 宁可多试几次，不可漏片。
   host_circuit_cooldown_sec: 15
+  # 熔断等冷却（电影侧 bb5382a 移植）：节点全在熔断中主机上的集先挂起到冷却结束再派，
+  # 不再一次熔断连锁判掉整条排队（电影侧 06 号机 10-27：一次 15 秒熔断判掉 545 部）。
+  # 每集每次运行最多挂起这么多次，用完照常派出去。设 0 关闭。
+  host_circuit_hold_max_per_episode: 20
+  # 派发前链接健康（电影侧 1573d28 / 3120958 移植）：只剩 vidlink 坏链接的集在缓存刷新前
+  # 不派、启动预检也不重取（刷新前重取只会拿回同一条死链接）。
+  link_health:
+    # vidlink 按集缓存链接，约在签名时刻 t= 之后这么久刷新（电影侧 10-25 实测 8/8 换到新链接）。
+    vidlink_cache_roll_hours: 49
+    # url 里 t= 是签名时刻、到点必过期的主机：bcdn4 起 24 小时必 403
+    # （电影侧 10-24 23 号机：24 小时内 24/24 成功、之后 394/394 返回 403）；bcdn 不卡有效期，不列。
+    signed_link_max_age_hours: {bcdn4.hakunaymatata.com: 24}
+    # 长期坏掉的 vidlink 主机：一集只剩这些主机上的节点时等缓存刷新换主机再下。
+    # bcdnxw：电影侧 10-25 全舰队 2840 部下载失败都是它的恒定 429。
+    broken_vidlink_hosts:
+      - bcdnxw.hakunaymatata.com
   # 画质预检样本大小（字节）：整片下载前先取头部这么多字节，用 ffprobe 读 moov
   # 判分辨率/编码/时长，码率 = Range 探测到的总长 × 8 / 时长。判定口径与下完整片
   # 后完全一致，却只花几 MB —— 避免 1~3GB 的整集下完才发现码率不达标而白丢。

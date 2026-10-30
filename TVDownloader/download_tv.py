@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import heapq
 from collections import deque
 from concurrent.futures import (
     FIRST_COMPLETED,
@@ -378,6 +379,29 @@ OVERLAY_NODE_REJECT_LOG = resolve_file(
 # 60s，跑满 10 次约 4 分钟，而实测这类 400/500/502 全是 CDN 回源故障（换 IP 无效、
 # 恢复是小时级），第 3~4 次就能定论，后面纯属空耗并占死下载窗口。
 # 1+2+4 ≈ 7 秒仍足以跨过源站几秒级的真抖动。
+# 派发闸门（电影侧 bb5382a / 1573d28 / 3120958 移植，2026-10-30，见 DispatchScreen）：
+#   - 节点全在熔断中主机上的集：挂起到最早那台冷却结束再派（每集每次运行最多 N 次）；
+#   - 只剩 vidlink 坏链接的集（签名过期 / 长期故障主机）：vidlink 缓存刷新前不派、也不在
+#     启动预检里白做重取——刷新前重取只会拿回同一条死链接。
+_LINK_HEALTH_RAW = _CFG.get("link_health") or {}
+HOST_CIRCUIT_HOLD_MAX_PER_EPISODE = max(
+    0, int(_CFG.get("host_circuit_hold_max_per_episode", 20))
+)
+VIDLINK_CACHE_ROLL_SECONDS = max(
+    0.0, float(_LINK_HEALTH_RAW.get("vidlink_cache_roll_hours", 49))
+) * 3600
+# 长期坏掉的 vidlink 主机：一集只剩这些主机上的节点时，等缓存刷新换主机再下。
+BROKEN_VIDLINK_HOSTS = {
+    str(host).strip().lower()
+    for host in (_LINK_HEALTH_RAW.get("broken_vidlink_hosts") or [])
+    if str(host).strip()
+}
+# url 里 t= 是签名时刻、到点必过期的主机（小时）：bcdn4 起 24 小时必 403。
+SIGNED_LINK_MAX_AGE_SECONDS = {
+    str(host).strip().lower(): float(hours) * 3600
+    for host, hours in (_LINK_HEALTH_RAW.get("signed_link_max_age_hours") or {}).items()
+    if str(host).strip() and float(hours) > 0
+}
 PLAYLIST_RETRY_MAX = int(_CFG.get("playlist_retry_max", 4))
 PLAYLIST_RETRY_BACKOFF = float(_CFG.get("playlist_retry_backoff", 1.0))
 PLAYLIST_RETRY_BACKOFF_MAX = float(_CFG.get("playlist_retry_backoff_max", 60.0))
@@ -5988,6 +6012,22 @@ def _select_stale_entries(entries, label="启动预检"):
     if not stale:
         return [], 0
 
+    # ⓪ 只剩 vidlink 坏链接、缓存还没刷新的集不重取：vidlink 按集缓存链接，刷新前重取
+    #    只会拿回同一条死链接，白烧配额（电影侧 3120958 口径）。到点后的运行照常重取。
+    before = len(stale)
+    stale = [
+        entry for entry in stale
+        if not ((due := vidlink_refresh_due(entry, now)) and due[0] > now)
+    ]
+    if len(stale) < before:
+        print(
+            f"[{label}] 跳过 {before - len(stale)} 集只剩 vidlink 坏链接、缓存还没刷新的"
+            f"（刷新前重取只会拿回同一条）",
+            flush=True,
+        )
+    if not stale:
+        return [], 0
+
     # ① 跳过"上次因画质不达标判死"的集：重取回来还是同样不达标，白烧配额。
     #    TV 侧有源率个位数，这类集在失败总量里占比很高。
     quality_dead = load_quality_dead_keys()
@@ -6148,6 +6188,146 @@ def refresh_stale_entries(entries, refetch_counts):
         flush=True,
     )
     return refreshed
+
+
+def host_circuit_remaining(node):
+    """节点所在主机的熔断还要冷却多少秒；没熔断（或已到点）返回 None。
+
+    m3u8 节点看分片熔断，mp4 节点看直链熔断——与下载侧跳过节点的口径一致。
+    只读：到点也不在这里复位，复位留给下载线程第一次问到该主机时做（半开）。
+    """
+    host = _host_of(node.get("url"))
+    if not host:
+        return None
+    if node.get("type") == "mp4":
+        lock, tripped = _mp4_host_lock, _mp4_host_tripped
+    else:
+        lock, tripped = _hls_host_lock, _hls_host_tripped
+    with lock:
+        next_retry = tripped.get(host)
+    if next_retry is None:
+        return None
+    remaining = next_retry - time.monotonic()
+    return remaining if remaining > 0 else None
+
+
+def _signed_at(url):
+    """直链 url 里的签名时刻（查询参数 t=，秒）；没有或解析不了返回 None。"""
+    match = re.search(r"[?&]t=(\d{9,11})(?:&|$)", str(url or ""))
+    return int(match.group(1)) if match else None
+
+
+def vidlink_refresh_due(entry, now=None):
+    """这一集是否只剩 vidlink 坏链接；是则返回 (vidlink 缓存预计刷新的时刻, 说明)，否则 None。
+
+    "坏"只认实测过的两条（宁可漏判，不可误判——漏判只是多试一次，误判是少下一集）：
+      - 签名主机（bcdn4）：url 里 t= 起过了 signed_link_max_age 必 403；
+      - 长期故障主机（broken_vidlink_hosts，如 bcdnxw 恒 429）。
+    还有任一个别的节点（HLS，或没坏的 vidlink）就返回 None，照常派发。
+    vidlink 按集缓存链接，约在签名时刻 + vidlink_cache_roll 之后刷新；算不出刷新时刻时
+    返回 (now, ...)：按"该刷新了"处理，交给正常流程。
+    """
+    now = time.time() if now is None else now
+    nodes = _entry_nodes(entry)
+    if not nodes or any(node.get("provider") != "vidlink" for node in nodes):
+        return None
+    reasons, rolls = [], []
+    for node in nodes:
+        host = _host_of(node["url"])
+        signed = _signed_at(node["url"])
+        max_age = SIGNED_LINK_MAX_AGE_SECONDS.get(host)
+        if host in BROKEN_VIDLINK_HOSTS:
+            reasons.append(f"{host} 长期故障")
+        elif max_age and signed and now - signed >= max_age:
+            reasons.append(f"签名已 {(now - signed) / 3600:.1f} 小时（{host} {max_age / 3600:.0f} 小时过期）")
+        else:
+            return None
+        if signed:
+            rolls.append(signed + VIDLINK_CACHE_ROLL_SECONDS)
+    due = min(rolls) if rolls else now
+    return due, "；".join(dict.fromkeys(reasons))
+
+
+class DispatchScreen:
+    """派发闸门（电影侧 HostCapGate 的熔断等冷却 + vidlink 缓存挂起，2026-10-30 按 TV 精简移植）。
+
+    套在每轮来源最外层（NodeRetrySource 之外），只由主循环线程调用。两件事：
+
+    1. **熔断等冷却**：节点全在熔断中主机上的集，挂起到最早那台冷却结束再派。
+       派出去也只会在下载里当场按熔断失败、槽位一空又派下一集，一次熔断能连锁判掉整条
+       排队（电影侧 06 号机 10-27：一次 15 秒的 finalsignal 熔断判掉 545 部）。还有任一
+       节点的主机没熔断就照常派。每集每次运行最多挂起 HOST_CIRCUIT_HOLD_MAX_PER_EPISODE 次，
+       用完照常派出去。
+    2. **vidlink 缓存刷新前不派**：只剩 vidlink 坏链接的集（见 vidlink_refresh_due），
+       缓存刷新时刻没到就不派——下载必然失败、重取又只会拿回同一条。记一笔可重试的失败
+       （不带"需重新取流"标记，免得重取闭环白跑），下次运行到点后照常处理。
+
+    来源报 done 时还有挂起冷却中的集就报 wait，冷却到点再派出去。
+    """
+
+    def __init__(self, on_skip=None, clock=time.monotonic, wall=time.time):
+        self._on_skip = on_skip or (lambda entry, reason: None)
+        self._clock = clock
+        self._wall = wall
+        self._source = None
+        self._cooling = []
+        self._seq = 0
+        self._cool_counts = {}
+        self.held = 0
+        self.skipped = 0
+
+    def set_source(self, source):
+        self._source = source
+
+    def poll(self):
+        while True:
+            now = self._clock()
+            if self._cooling and self._cooling[0][0] <= now:
+                _due, _seq, entry = heapq.heappop(self._cooling)
+            else:
+                state, entry = self._source.poll()
+                if state == "done" and self._cooling:
+                    return "wait", None
+                if state != "item":
+                    return state, entry
+            if self._skip_if_vidlink_not_refreshed(entry):
+                continue
+            if self._hold_if_host_tripped(entry, now):
+                continue
+            return "item", entry
+
+    def _skip_if_vidlink_not_refreshed(self, entry):
+        verdict = vidlink_refresh_due(entry, self._wall())
+        if verdict is None or verdict[0] <= self._wall():
+            return False
+        due, reason = verdict
+        when = time.strftime("%m-%d %H:%M", time.gmtime(due))
+        self.skipped += 1
+        self._on_skip(entry, f"{reason}；vidlink 缓存预计 {when} UTC 刷新，本轮等不到，本次不下载")
+        return True
+
+    def _hold_if_host_tripped(self, entry, now):
+        if HOST_CIRCUIT_HOLD_MAX_PER_EPISODE <= 0:
+            return False
+        nodes = _entry_nodes(entry)
+        if not nodes:
+            return False
+        remaining = [host_circuit_remaining(node) for node in nodes]
+        if any(r is None for r in remaining):
+            return False
+        key = record_episode_key(entry)
+        held = self._cool_counts.get(key, 0)
+        if held >= HOST_CIRCUIT_HOLD_MAX_PER_EPISODE:
+            return False
+        wait = min(remaining)
+        self._cool_counts[key] = held + 1
+        self._seq += 1
+        heapq.heappush(self._cooling, (now + wait, self._seq, entry))
+        self.held += 1
+        hosts = "、".join(dict.fromkeys(_host_of(node["url"]) for node in nodes))
+        print(f"  [熔断等冷却] {key}: 节点所在主机 {hosts} 熔断中，{wait:.0f}s 后再派发"
+              f"（第 {held + 1}/{HOST_CIRCUIT_HOLD_MAX_PER_EPISODE} 次）", flush=True)
+        return True
 
 
 class NodeRetrySource:
@@ -6689,6 +6869,19 @@ def _run_pipeline():
         print(f"{REJECT_REASON_LABELS.get(stage, stage)}判死: {key}: "
               f"全部 {len(rejects)} 个版本都已检出", flush=True)
 
+    def _dispatch_skip(entry, reason):
+        """派发闸门判"本轮不派"的集：记一笔可重试的下载失败（不带需重取标记），下次运行照常处理。"""
+        write_log(FAILED_LOG, {
+            **_entry_identity(entry),
+            "urls": entry.get("urls", []),
+            "error": reason,
+            "retriable": True,
+            "stage": "download",
+        })
+        print(f"  [未下载] {record_episode_key(entry)}: {reason}", flush=True)
+
+    dispatch_screen = DispatchScreen(on_skip=_dispatch_skip)
+
     # 硬字幕/水印换节点重下的重投入口（每轮套在来源外面）。
     node_retry = (
         NodeRetrySource(
@@ -7111,6 +7304,9 @@ def _run_pipeline():
             if node_retry is not None:
                 node_retry.set_source(batch_source)
                 batch_source = node_retry
+            # 派发闸门（熔断等冷却 + vidlink 缓存挂起）：套在最外层，重投的集也要过它。
+            dispatch_screen.set_source(batch_source)
+            batch_source = dispatch_screen
             if MULTI_ROUND_ENABLED and MAX_ROUNDS > 1:
                 print(
                     f"\n===== 下载轮次 {round_no}/{MAX_ROUNDS}："

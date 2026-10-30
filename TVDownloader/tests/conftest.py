@@ -45,3 +45,15 @@ def _isolate_hardsub_check(tmp_path, monkeypatch):
                         str(tmp_path / "overlay_node_rejects.jsonl"))
     monkeypatch.setattr(d, "_overlay_node_rejects", None)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_fetch_health(monkeypatch):
+    """取流源熔断器与直连线路是全进程共用的单例：每个用例换一份新的，
+    免得上一个用例攒下的连续失败计数、熔断或直连冷却串到下一个用例（与电影侧同口径）。"""
+    t = sys.modules.get("tv_ids_to_links")
+    if t is not None:
+        monkeypatch.setattr(t, "PROVIDER_BREAKER", t.ProviderBreaker())
+        monkeypatch.setattr(t, "ENCDEC_ROUTE", t._DirectRoute("enc-dec", t.ENCDEC_ROUTE.enabled))
+        monkeypatch.setattr(t, "VIDLINK_ROUTE", t._DirectRoute("vidlink", t.VIDLINK_ROUTE.enabled))
+    yield
