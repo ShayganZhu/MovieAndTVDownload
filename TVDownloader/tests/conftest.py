@@ -38,6 +38,10 @@ def _isolate_hardsub_check(tmp_path, monkeypatch):
         yield
         return
     monkeypatch.setattr(d, "HARDSUB_CHECK_ENABLED", False)
+    # 按主机限流（host_limits）默认关掉：许多用例的节点就在 sun.finalsignal.top 上，
+    # 不关的话会去拼真实的住宅代理、按名额排队。需要它的用例自行打开。
+    monkeypatch.setattr(d, "HOST_LIMITS", {})
+    monkeypatch.setattr(d, "HOST_CONNECTIONS", d.HostConnections(limits={}))
     monkeypatch.setattr(d, "HARDSUB_SCAN_LOG", str(tmp_path / "hardsub_scan.jsonl"))
     monkeypatch.setattr(d, "HARDSUB_EVIDENCE_DIR", str(tmp_path / "hardsub_evidence"))
     monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(tmp_path / "download_dead.jsonl"))

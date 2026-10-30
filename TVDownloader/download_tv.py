@@ -19,6 +19,7 @@ import threading
 import time
 import heapq
 from collections import Counter, deque
+from contextlib import contextmanager
 from concurrent.futures import (
     FIRST_COMPLETED,
     CancelledError,
@@ -420,6 +421,25 @@ PLAYLIST_500_EXPIRED_AFTER_SECONDS = {
     for host, minutes in (_LINK_HEALTH_RAW.get("playlist_500_expired_after_minutes") or {}).items()
     if str(host).strip() and float(minutes) > 0
 }
+# 按 CDN 主机限流（2026-10-30，23 号机实测，见 config.yaml host_limits）：sun.finalsignal.top 按
+# 客户端 IP 限流，单机一个 IP 只能从它拿到 ~50 Mbps，连接开多了成片回 502。
+#   max_episodes       同时在下这台主机的集数上限（按条目的第一个节点算），满了的集在派发闸门里
+#                      排队、不占下载槽位，其余槽位留给别的主机（vidlink 的 mp4）；0 = 不限
+#   direct_connections 分片直连的连接上限（不出 502 的量）；0 = 不限（也不走代理）
+#   proxy_connections  直连名额满了之后经代理的连接上限；0 = 不走代理、等直连名额
+#   proxy              residential = 取流那套住宅代理（tv_ids_to_links.proxy + .env 的账号）；
+#                      env:变量名 = 从 .env / 环境变量读代理 URL（含账号的 URL 别写进配置）
+HOST_LIMITS = {}
+for _host, _limit in (_CFG.get("host_limits") or {}).items():
+    _limit = _limit or {}
+    HOST_LIMITS[str(_host).strip().lower()] = {
+        "max_episodes": max(0, int(_limit.get("max_episodes") or 0)),
+        "direct": max(0, int(_limit.get("direct_connections") or 0)),
+        "proxy": max(0, int(_limit.get("proxy_connections") or 0)),
+        "proxy_spec": str(_limit.get("proxy") or "residential").strip(),
+    }
+# 派发闸门里因主机集数上限而排队的集最多这么多；满了就不再从来源往外拿（保住反压）。
+MAX_PARKED_EPISODES = max(1, int(_CFG.get("max_parked_episodes", 20000)))
 PLAYLIST_RETRY_MAX = int(_CFG.get("playlist_retry_max", 4))
 PLAYLIST_RETRY_BACKOFF = float(_CFG.get("playlist_retry_backoff", 1.0))
 PLAYLIST_RETRY_BACKOFF_MAX = float(_CFG.get("playlist_retry_backoff_max", 60.0))
@@ -3307,6 +3327,92 @@ class _Segment403Tracker:
             )
 
 
+def _download_proxy_url(spec):
+    """host_limits 的 proxy 写法 → 代理 URL；拼不出来（没配账号等）返回 None。"""
+    spec = (spec or "").strip()
+    if spec.startswith("env:"):
+        return (os.environ.get(spec[4:].strip()) or "").strip() or None
+    if spec != "residential":
+        return spec or None
+    config_path = Path(__file__).with_name("config.yaml")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            proxy = ((yaml.safe_load(f) or {}).get("tv_ids_to_links") or {}).get("proxy") or {}
+    except OSError:
+        return None
+    user = os.environ.get("PROXY_USER", "").strip() or (proxy.get("user") or "").strip()
+    password = os.environ.get("PROXY_PASSWORD", "").strip() or (proxy.get("password") or "").strip()
+    host = (proxy.get("host") or "").strip()
+    ports = list(proxy.get("port_range") or [])
+    if not (proxy.get("enabled", True) and user and password and host and ports):
+        return None
+    return f"http://{user}:{password}@{host}:{random.randint(int(ports[0]), int(ports[-1]))}"
+
+
+class HostConnections:
+    """限流主机（HOST_LIMITS）的分片连接名额：先用直连名额，满了用代理名额，都满就等。
+
+    只管 HLS 分片请求（download_single_segment）：一集的分片下载有 segment_concurrency 个线程，
+    每个请求发出前拿一个名额、请求结束（不论成败）就还，退避等待期间不占名额。
+    代理拼不出来（没配账号）时只用直连名额，首次打一行告警。线程安全。
+    """
+
+    def __init__(self, limits=None, proxy_url=None):
+        self._limits = HOST_LIMITS if limits is None else limits
+        self._proxy_url = proxy_url or _download_proxy_url
+        self._cond = threading.Condition()
+        self._in_use = Counter()
+        self._proxies = {}
+        self.served = Counter()
+
+    def _proxy_for(self, host, limit):
+        if host not in self._proxies:
+            url = self._proxy_url(limit["proxy_spec"]) if limit["proxy"] else None
+            self._proxies[host] = {"http": url, "https": url} if url else None
+            if limit["proxy"] and not url:
+                print(f"⚠️ {host} 的代理分流没配好（proxy: {limit['proxy_spec']}），只用直连名额",
+                      flush=True)
+        return self._proxies[host]
+
+    @contextmanager
+    def connection(self, url):
+        """with 块内是一次请求：返回要用的 proxies（直连时为 None）。"""
+        host = _host_of(url)
+        limit = self._limits.get(host)
+        if not limit or not limit["direct"]:
+            yield None
+            return
+        with self._cond:
+            while True:
+                proxies = None
+                if self._in_use[(host, "direct")] < limit["direct"]:
+                    route = "direct"
+                elif (limit["proxy"] and self._in_use[(host, "proxy")] < limit["proxy"]
+                      and self._proxy_for(host, limit)):
+                    route, proxies = "proxy", self._proxy_for(host, limit)
+                else:
+                    if interrupted.is_set():
+                        raise DownloadInterrupted(f"等 {host} 连接名额时{_INTERRUPTED_ERROR}")
+                    self._cond.wait(1.0)
+                    continue
+                self._in_use[(host, route)] += 1
+                self.served[route] += 1
+                break
+        try:
+            yield proxies
+        finally:
+            with self._cond:
+                self._in_use[(host, route)] -= 1
+                self._cond.notify()
+
+    def summary(self):
+        direct, proxy = self.served["direct"], self.served["proxy"]
+        return f"限流主机分片请求：直连 {direct} 次、经代理 {proxy} 次" if direct or proxy else ""
+
+
+HOST_CONNECTIONS = HostConnections()
+
+
 def download_single_segment(url, index, retry_max, delay, headers=None,
                             forbidden_tracker=None):
     """下载单个 HLS 分片，失败按指数退避重试 retry_max 次。
@@ -3337,10 +3443,12 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
         _raise_if_hls_host_tripped(url, f"分片 {index + 1}")
         try:
             # 外层已经负责精确重试次数，因此这里关闭额外应用层重试。
-            content = request_with_retry(
-                "GET", url, retries=1, as_text=False, timeout=60,
-                headers=headers,
-            )
+            # 限流主机（finalsignal）先占一个直连 / 代理名额，请求结束就还（见 HostConnections）。
+            with HOST_CONNECTIONS.connection(url) as proxies:
+                content = request_with_retry(
+                    "GET", url, retries=1, as_text=False, timeout=60,
+                    headers=headers, **({"proxies": proxies} if proxies else {}),
+                )
             validate_segment_content(content, url)
             _hls_host_record_result(url, 200)
             if forbidden_tracker is not None:
@@ -6403,23 +6511,36 @@ class DispatchScreen:
        缓存刷新时刻没到就不派——下载必然失败、重取又只会拿回同一条。记一笔可重试的失败
        （不带"需重新取流"标记，免得重取闭环白跑），下次运行到点后照常处理。
 
-    来源报 done 时还有挂起冷却中的集就报 wait，冷却到点再派出去。
-    冷却中的集最多 max_held 个（默认 DOWNLOAD_QUEUE_DEPTH）：满了就报 wait、不再从来源往外拿。
-    没有这道上限的话，主机熔断期间一次 poll 会把来源整条拖进冷却堆——单独跑时是整轮存量
-    （实测 2 万集一次拿空、刷 2 万行日志），pipeline 模式下会抽空取流侧的有界队列、反压失效。
+    3. **按主机限集数**（HOST_LIMITS 的 max_episodes，2026-10-30）：第一个节点在限流主机上的集，
+       这台主机在下的集数满了就排队（FIFO），不占下载槽位；别的集照常派。主循环在每集下载
+       结束时调 release()，空出名额就先派排队的。
+
+    来源报 done 时还有挂起冷却中 / 排队的集就报 wait，到点 / 有名额再派出去。
+    冷却中的集最多 max_held 个（默认 DOWNLOAD_QUEUE_DEPTH）、排队的最多 max_parked 个：满了就报
+    wait、不再从来源往外拿。没有这道上限的话，主机熔断期间一次 poll 会把来源整条拖进冷却堆——
+    单独跑时是整轮存量（实测 2 万集一次拿空、刷 2 万行日志），pipeline 模式下会抽空取流侧的
+    有界队列、反压失效。
     """
 
-    def __init__(self, on_skip=None, clock=time.monotonic, wall=time.time, max_held=None):
+    def __init__(self, on_skip=None, clock=time.monotonic, wall=time.time, max_held=None,
+                 limits=None, max_parked=None):
         self._on_skip = on_skip or (lambda entry, reason: None)
         self._clock = clock
         self._wall = wall
         self._max_held = max(1, int(max_held if max_held is not None else DOWNLOAD_QUEUE_DEPTH))
+        self._limits = HOST_LIMITS if limits is None else limits
+        self._max_parked = max(1, int(max_parked if max_parked is not None else MAX_PARKED_EPISODES))
         self._source = None
         self._cooling = []
         self._seq = 0
         self._cool_counts = {}
+        self._parked = {}            # 主机 -> 排队的集（FIFO）
+        self._parked_total = 0
+        self._lane_busy = Counter()  # 主机 -> 在下的集数
+        self._lane_of = {}           # id(条目) -> 占着名额的主机（release 时按它还）
         self.held = 0
         self.skipped = 0
+        self.parked = 0
 
     def set_source(self, source):
         self._source = source
@@ -6427,14 +6548,17 @@ class DispatchScreen:
     def poll(self):
         while True:
             now = self._clock()
-            if self._cooling and self._cooling[0][0] <= now:
+            entry = self._unpark()
+            if entry is not None:
+                pass
+            elif self._cooling and self._cooling[0][0] <= now:
                 _due, _seq, entry = heapq.heappop(self._cooling)
-            elif len(self._cooling) >= self._max_held:
-                # 冷却堆满了：先不从来源往外拿，等冷却到点再说（保住来源的反压）。
+            elif len(self._cooling) >= self._max_held or self._parked_total >= self._max_parked:
+                # 冷却堆 / 排队满了：先不从来源往外拿，等到点 / 有名额再说（保住来源的反压）。
                 return "wait", None
             else:
                 state, entry = self._source.poll()
-                if state == "done" and self._cooling:
+                if state == "done" and (self._cooling or self._parked_total):
                     return "wait", None
                 if state != "item":
                     return state, entry
@@ -6442,7 +6566,50 @@ class DispatchScreen:
                 continue
             if self._hold_if_host_tripped(entry, now):
                 continue
+            if self._park_if_lane_full(entry):
+                continue
+            self._occupy(entry)
             return "item", entry
+
+    def release(self, entry):
+        """主循环：这一集的下载阶段结束了（成败都算），还它占的主机名额。"""
+        host = self._lane_of.pop(id(entry), None)
+        if host is not None:
+            self._lane_busy[host] -= 1
+
+    def _lane_host(self, entry):
+        nodes = _entry_nodes(entry)
+        if not nodes:
+            return None
+        host = _host_of(nodes[0]["url"])
+        limit = self._limits.get(host)
+        return host if limit and limit["max_episodes"] else None
+
+    def _occupy(self, entry):
+        host = self._lane_host(entry)
+        if host is not None:
+            self._lane_busy[host] += 1
+            self._lane_of[id(entry)] = host
+
+    def _park_if_lane_full(self, entry):
+        host = self._lane_host(entry)
+        if host is None or self._lane_busy[host] < self._limits[host]["max_episodes"]:
+            return False
+        self._parked.setdefault(host, deque()).append(entry)
+        self._parked_total += 1
+        self.parked += 1
+        if self.parked == 1 or self.parked % 500 == 0:
+            print(f"  [主机限流排队] {record_episode_key(entry)}: {host} 已有 "
+                  f"{self._lane_busy[host]} 集在下，排队等名额（当前排队 {self._parked_total} 集，"
+                  f"累计 {self.parked} 集次）", flush=True)
+        return True
+
+    def _unpark(self):
+        for host, queue_ in self._parked.items():
+            if queue_ and self._lane_busy[host] < self._limits[host]["max_episodes"]:
+                self._parked_total -= 1
+                return queue_.popleft()
+        return None
 
     def _skip_if_vidlink_not_refreshed(self, entry):
         verdict = vidlink_refresh_due(entry, self._wall())
@@ -7189,6 +7356,8 @@ def _run_pipeline():
 
         if stage == "download":
             entry = download_future_to_entry.pop(future)
+            # 下载阶段结束（成败都算）：还这一集占的限流主机名额，排队的集才派得出去。
+            dispatch_screen.release(entry)
             ident = _entry_identity(entry)
             try:
                 label, download_success, info = future.result()
@@ -7753,6 +7922,12 @@ def _run_pipeline():
             f"三级流水线全部完成：转封装 {stats['conversions']} 集，"
             f"上传 {stats['uploads']} 集。"
         )
+        host_summary = HOST_CONNECTIONS.summary()
+        if host_summary or dispatch_screen.parked:
+            print("；".join(x for x in (
+                host_summary,
+                f"因主机集数上限排队 {dispatch_screen.parked} 集次" if dispatch_screen.parked else "",
+            ) if x))
 
         # 硬字幕/水印比例：每集都检测（完整台账见 scan_log）。
         if overlay_stats["checked"]:

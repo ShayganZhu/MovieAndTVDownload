@@ -137,7 +137,7 @@ def test_shipped_media_audit_config():
     assert cfg["media_audit"] == {
         "min_runtime_ratio": 0.5, "max_runtime_ratio": 2.5, "min_source_ratio": 0.95,
         "min_seconds_without_reference": 300, "output": "audit_flagged.tsv"}
-    assert cfg["segment_concurrency"] == 8
+    assert cfg["segment_concurrency"] == 16, "总连接数改由 host_limits 管"
     assert cfg["m3u8_host_circuit_threshold"] == 30
 
 
