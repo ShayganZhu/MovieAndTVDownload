@@ -152,9 +152,64 @@ def test_shipped_host_limits():
 
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
                               encoding="utf-8"))["download_tv"]
-    assert cfg["host_limits"] == {FINAL: {"max_episodes": 16, "direct_connections": 48,
-                                          "proxy_connections": 200, "proxy": "residential"}}
+    assert cfg["host_limits"] == {"finalsignal.top": {"max_episodes": 48, "direct_connections": 200,
+                                                      "proxy_connections": 600, "proxy": "residential"}}
+    # 集数上限必须给别的主机留出槽位，否则 finalsignal 的慢集占满全部槽位、vidlink 排不上。
+    assert cfg["max_workers"] - cfg["host_limits"]["finalsignal.top"]["max_episodes"] >= 16
+    assert cfg["download_queue_depth"] > cfg["max_workers"]
     assert cfg["max_parked_episodes"] == 20000
+
+
+# ------------------------------------------------------------ 键写父域：换子域名不会绕过限流（2026-10-31）
+
+PARENT = {"finalsignal.top": {"max_episodes": 2, "direct": 2, "proxy": 0, "proxy_spec": "residential"}}
+
+
+@pytest.mark.parametrize("host, table, expected", [
+    ("sun1.finalsignal.top", PARENT, "finalsignal.top"),
+    ("a.b.finalsignal.top", PARENT, "finalsignal.top"),
+    ("finalsignal.top", PARENT, "finalsignal.top"),
+    ("sun.finalsignal.top", {**PARENT, FINAL: {}}, FINAL),       # 精确匹配优先
+    ("notfinalsignal.top", PARENT, None),                        # 只认完整的域名标签
+    ("sun1.finalsignal.top.evil.com", PARENT, None),
+    ("top", PARENT, None),
+    ("", PARENT, None),
+])
+def test_host_rule_key(host, table, expected):
+    assert d._host_rule_key(host, table) == expected
+
+
+def test_subdomains_share_one_connection_budget():
+    conns = d.HostConnections(limits=PARENT, proxy_url=lambda spec: None)
+    entered = threading.Event()
+    done = []
+
+    def third():
+        entered.set()
+        with conns.connection("https://sun.finalsignal.top/c.ts"):
+            done.append(True)
+
+    with conns.connection("https://sun1.finalsignal.top/a.ts"), conns.connection("https://sun2.finalsignal.top/b.ts"):
+        t = threading.Thread(target=third)
+        t.start()
+        entered.wait(5)
+        time.sleep(0.2)
+        assert not done, "sun / sun1 / sun2 共用 2 条直连名额，第 3 条要等"
+    t.join(5)
+    assert done == [True]
+    assert conns.served == {"direct": 3}
+
+
+def test_subdomains_share_one_episode_lane():
+    screen = d.DispatchScreen(limits=PARENT)
+    a = ep(5, 1, [hls(5, 1, "sun.finalsignal.top")])
+    b = ep(5, 2, [hls(5, 2, "sun1.finalsignal.top")])
+    c = ep(5, 3, [hls(5, 3, "sun2.finalsignal.top")])
+    screen.set_source(Src([a, b, c]))
+    assert [screen.poll()[1] for _ in range(2)] == [a, b]
+    assert screen.poll() == ("wait", None), "三个子域共用 2 集的上限"
+    screen.release(b)
+    assert screen.poll() == ("item", c)
 
 
 # ------------------------------------------------------------ 主循环端到端：名额按集归还，排队的集当轮下完

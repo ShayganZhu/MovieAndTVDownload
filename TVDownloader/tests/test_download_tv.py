@@ -6887,7 +6887,20 @@ def test_shipped_playlist_500_rule_covers_finalsignal():
 
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
                               encoding="utf-8"))["download_tv"]
-    assert cfg["link_health"]["playlist_500_expired_after_minutes"] == {FINAL_HOST: 150}
+    assert cfg["link_health"]["playlist_500_expired_after_minutes"] == {"finalsignal.top": 150}
+
+
+def test_playlist_500_rule_covers_every_finalsignal_subdomain(monkeypatch):
+    """新链接换到 sun1 / sun2 后，写父域的规则照样按过期处理。"""
+    monkeypatch.setattr(d, "PLAYLIST_500_EXPIRED_AFTER_SECONDS", {"finalsignal.top": 150 * 60})
+    response = type("R", (), {"status_code": 500})()
+    cause = requests.HTTPError(response=response)
+    exc = RuntimeError("播放列表失败")
+    exc.__cause__ = cause
+    old = 151 * 60
+    for host in ("sun.finalsignal.top", "sun1.finalsignal.top", "sun2.finalsignal.top"):
+        assert d._NEEDS_REFETCH_MARKER in str(d._playlist_500_as_expired(exc, f"https://{host}/m.m3u8", old))
+    assert d._playlist_500_as_expired(exc, "https://moon.goldenkite.top/m.m3u8", old) is None
 
 
 # --------------------------------- 分片 HTTP 400：短重试，整条流都 400 就整集收手转重取（2026-10-31）

@@ -517,12 +517,17 @@ download_tv:
   #    hakunaymatata 源站后，直连/住宅代理/家宽三个不相干出口**同时**收到源站
   #    nginx 的 429（TTFB 3~34s），35 分钟 0 集完成、网卡仅 8MB/s。说明压的是
   #    源站全局配额而非单 IP，代理池无解 → max_workers 回 32、mp4_concurrency 回 16。
-  max_workers: 32          # 同时下载的集数
+  # 🔴 2026-10-31 由 32 提到 64：host_limits 把 finalsignal 同时下载的集数提到 48，槽位不跟着加的话
+  #    它会占满全部槽位，vidlink 的 mp4 排不上。64 = finalsignal 48 + 其余主机 16（与之前留给
+  #    其余主机的 16 个相同）。⚠️ finalsignal 没有排队的集时，这 64 个槽位可能全给 mp4，
+  #    64 × mp4_concurrency 16 = 1024 条连到 hakunaymatata（上面记录过 ~1400 条时它全局 429），
+  #    真遇到 429 再调小。
+  max_workers: 64          # 同时下载的集数
   # 主循环同时持有的“下载 future”上限（分批投递深度），必须 > max_workers。
   # 一次性把整轮几万集全部 submit 会让 wait(FIRST_COMPLETED) 每次都对全部
   # 未完成 future 挂/摘 waiter，主循环退化成 O(N²)；分批后 wait 规模恒定。
   # 留空/不配时默认 max_workers × 2。
-  download_queue_depth: 64
+  download_queue_depth: 128
   # 流式来源（pipeline.py：取流↔下载同进程重叠）下，「在途任务已排空但取流
   # 还没产出新集」时的轮询间隔（秒）。只有这一种情况才会 sleep —— 此刻主循环
   # 无事可做，不让出 CPU 就是 100% 空转。
@@ -573,7 +578,7 @@ download_tv:
   # 🔴 同日曾降到 8（32 × 8 = 256 条）：23 号机重启后积压的集一起开下，二十多集 × 16 ≈ 三百多条
   #    连接打到 finalsignal，13 分钟分片回 502 共 4,664 次、主机熔断 48 次，134 集下载失败 123 集。
   #    降到 8 后仍有 256 条直连，37 分钟 502 一万九千多次、只下完 2 集。
-  # 🔴 同日改回 16：打到 finalsignal 的总连接数改由 host_limits 管（直连 48 条 + 经代理 200 条），
+  # 🔴 同日改回 16：打到 finalsignal 的总连接数改由 host_limits 管（数值见 host_limits），
   #    每集多开几条只是在名额里排队，不会多打出 502；每集下得更快、temp 里压的半成品更少。
   segment_concurrency: 16
   # 画质探测与分片重试
@@ -765,7 +770,11 @@ download_tv:
   # sun.finalsignal.top（vidup / vidfast 的 HLS 都在这台）按客户端 IP 限流：同一时刻 19 号机 48 条
   # 直连 0 次 502、23 号机 256 条直连 502 一万九千多次；一个 IP 合计只能拿到 ~50 Mbps，单连接
   # 2~2.6 Mbps。经住宅代理每条连接换一个出口、不吃这道限流，但慢（单连接 ~0.7 Mbps、首字节
-  # ~5 秒、约 18% 超时或断线；200 条合计 ~47 Mbps）。故：
+  # ~5 秒、约 18% 超时或断线；200 条合计 ~47 Mbps）。
+  # 2026-10-31 06 号机（空闲 IP）复测，上面的 ~50 Mbps 和"按 IP 限流"存疑（当时没按路径分）：
+  # /b3f8c21a/ 路径 60 秒直连 48 条 185 Mbps、200 条 494 Mbps（502 仅 5 次），经代理 200 条 122 Mbps、
+  # 600 条 299 Mbps（错误约 3%）。502 / 400 几乎全在 /fine/ 路径，与连接数和出口 IP 都无关：
+  # 单连接低频探 15 条 /fine/ 链接，9 条一个分片都拿不到。故：
   #   - 直连只开不出 502 的量（direct_connections），超出的经代理（proxy_connections）；
   #   - 同时在下这台主机的集数封顶（max_episodes，按条目第一个节点算），满了的集在派发闸门里
   #     排队、不占下载槽位——否则 32 个槽位全被它的慢集占满，vidlink 的 mp4（别的主机、快）
@@ -773,10 +782,16 @@ download_tv:
   # proxy：residential = 取流那套住宅代理；env:变量名 = 从 .env 读代理 URL（换 IPv6 等别的代理用，
   # 含账号的 URL 不要写进本文件）。设 direct_connections: 0 即整段不限。
   host_limits:
-    sun.finalsignal.top:
-      max_episodes: 16
-      direct_connections: 48
-      proxy_connections: 200
+    # 🔴 2026-10-31 键由 sun.finalsignal.top 改为父域：新链接已换到 sun1 / sun2（同一批 Cloudflare IP），
+    #    写精确主机名时这里的名额对它们全不生效。现在全部子域共用这一份名额。
+    finalsignal.top:
+      # 2026-10-31 max_episodes 16 → 48、proxy_connections 200 → 600、direct_connections 48 → 200
+      # （用户定，住宅代理已无其它任务）：每台实际只从这台主机拿到 20~43 Mbps，排队涨到 1,700~2,000 集。
+      # 48 集 × 每集 16 条 = 768 条 < 200 + 600 名额，集数封顶时代理最多用到 568 条。
+      # 直连 200 只有 06 号机 60 秒实测撑着，502 猛涨就退回 48。
+      max_episodes: 48
+      direct_connections: 200
+      proxy_connections: 600
       proxy: residential
   # 派发闸门里因主机集数上限排队的集最多这么多，满了就不再从来源往外拿（取流随之降速）。
   max_parked_episodes: 20000
@@ -830,7 +845,8 @@ download_tv:
     # vidup / videasy 链接约 3 小时后播放列表开始回 500，不挂重取标记的话这一集本次运行永远换不到
     # 新链接（重启后的存量、等过主机熔断冷却的集都会碰上）。必须带年龄门槛：过载时新链接也会
     # 偶发 500，一律判过期会把可重试的瞬时失败变成当轮放弃。只看播放列表，分片 500 仍是瞬时错误。
-    playlist_500_expired_after_minutes: {sun.finalsignal.top: 150}
+    # 键可写父域：finalsignal.top 管 sun / sun1 / sun2 等全部子域（新链接已换到 sun1 / sun2）。
+    playlist_500_expired_after_minutes: {finalsignal.top: 150}
   # 画质预检样本大小（字节）：整片下载前先取头部这么多字节，用 ffprobe 读 moov
   # 判分辨率/编码/时长，码率 = Range 探测到的总长 × 8 / 时长。判定口径与下完整片
   # 后完全一致，却只花几 MB —— 避免 1~3GB 的整集下完才发现码率不达标而白丢。

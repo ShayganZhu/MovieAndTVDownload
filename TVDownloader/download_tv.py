@@ -431,6 +431,7 @@ PLAYLIST_500_EXPIRED_AFTER_SECONDS = {
 }
 # 按 CDN 主机限流（2026-10-30，23 号机实测，见 config.yaml host_limits）：sun.finalsignal.top 按
 # 客户端 IP 限流，单机一个 IP 只能从它拿到 ~50 Mbps，连接开多了成片回 502。
+# 键可以写父域（见 _host_rule_key）：finalsignal.top 管 sun / sun1 / sun2 等全部子域，共用一份名额。
 #   max_episodes       同时在下这台主机的集数上限（按条目的第一个节点算），满了的集在派发闸门里
 #                      排队、不占下载槽位，其余槽位留给别的主机（vidlink 的 mp4）；0 = 不限
 #   direct_connections 分片直连的连接上限（不出 502 的量）；0 = 不限（也不走代理）
@@ -3014,6 +3015,24 @@ def link_age_seconds(entry, now=None):
     return (now or time.time()) - fetched_at
 
 
+def _host_rule_key(host, table):
+    """host 在按主机配置的表里对应的键：精确匹配，否则按父域匹配；没有就返回 None。
+
+    2026-10-31：vidup / vidfast 的新链接从 sun.finalsignal.top 换到了 sun1 / sun2（同一批 Cloudflare
+    IP），只写精确主机名的规则一换名就悄悄失效，所以键写父域 finalsignal.top。
+    """
+    if not host:
+        return None
+    if host in table:
+        return host
+    labels = host.split(".")
+    for i in range(1, len(labels) - 1):
+        parent = ".".join(labels[i:])
+        if parent in table:
+            return parent
+    return None
+
+
 def _playlist_500_as_expired(exc, url, link_age):
     """播放列表请求的 HTTP 500 该不该按签名过期处理；该就返回补挂了重取标记的新异常。
 
@@ -3030,7 +3049,8 @@ def _playlist_500_as_expired(exc, url, link_age):
     if isinstance(exc, DownloadInterrupted):
         return None
     host = _host_of(url)
-    after = PLAYLIST_500_EXPIRED_AFTER_SECONDS.get(host, 0)
+    after = PLAYLIST_500_EXPIRED_AFTER_SECONDS.get(
+        _host_rule_key(host, PLAYLIST_500_EXPIRED_AFTER_SECONDS), 0)
     if (
         after > 0 and link_age is not None and link_age >= after
         and _status_of(exc.__cause__) == 500
@@ -3466,7 +3486,7 @@ class HostConnections:
     @contextmanager
     def connection(self, url):
         """with 块内是一次请求：返回要用的 proxies（直连时为 None）。"""
-        host = _host_of(url)
+        host = _host_rule_key(_host_of(url), self._limits)   # 同一条规则下的子域共用名额
         limit = self._limits.get(host)
         if not limit or not limit["direct"]:
             yield None
@@ -6689,7 +6709,7 @@ class DispatchScreen:
         nodes = _entry_nodes(entry)
         if not nodes:
             return None
-        host = _host_of(nodes[0]["url"])
+        host = _host_rule_key(_host_of(nodes[0]["url"]), self._limits)
         limit = self._limits.get(host)
         return host if limit and limit["max_episodes"] else None
 
