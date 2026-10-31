@@ -153,7 +153,9 @@ def test_shipped_host_limits():
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
                               encoding="utf-8"))["download_tv"]
     assert cfg["host_limits"] == {"finalsignal.top": {"max_episodes": 48, "direct_connections": 200,
-                                                      "proxy_connections": 600, "proxy": "residential"}}
+                                                      "proxy_connections": 600, "proxy": "residential",
+                                                      "path_max_episodes": {"/fine/": 16}}}
+    assert d._parse_host_limits(cfg["host_limits"])["finalsignal.top"]["path_max_episodes"] == {"/fine/": 16}
     # 集数上限必须给别的主机留出槽位，否则 finalsignal 的慢集占满全部槽位、vidlink 排不上。
     assert cfg["max_workers"] - cfg["host_limits"]["finalsignal.top"]["max_episodes"] >= 16
     assert cfg["download_queue_depth"] > cfg["max_workers"]
@@ -212,6 +214,76 @@ def test_subdomains_share_one_episode_lane():
     assert screen.poll() == ("item", c)
 
 
+# ------------------------------------------------------------ 路径单独封顶：/fine/ 占不满名额（2026-10-31）
+
+CAPPED = {"finalsignal.top": {"max_episodes": 3, "direct": 2, "proxy": 0, "proxy_spec": "residential",
+                              "path_max_episodes": {"/fine/": 1}}}
+
+
+def fine(tid, episode, host="sun1.finalsignal.top"):
+    return ep(tid, episode, [{"url": f"https://{host}/fine/s/{tid}-{episode}/master.m3u8",
+                              "provider": "vidfast", "type": "m3u8"}])
+
+
+def good(tid, episode, host="sun1.finalsignal.top"):
+    return ep(tid, episode, [hls(tid, episode, host)])
+
+
+def test_capped_path_queues_without_blocking_other_paths():
+    screen = d.DispatchScreen(limits=CAPPED)
+    a, b, c = fine(6, 1), fine(6, 2), good(6, 3)
+    screen.set_source(Src([a, b, c]))
+    assert [screen.poll()[1] for _ in range(2)] == [a, c], "第 2 集 /fine/ 排队，别的路径照常派"
+    assert screen.poll() == ("wait", None)
+    screen.release(c)
+    assert screen.poll() == ("wait", None), "空出的名额不是 /fine/ 的"
+    screen.release(a)
+    assert screen.poll() == ("item", b)
+    screen.release(b)
+    assert screen.poll() == ("done", None)
+
+
+def test_capped_path_shares_the_host_budget_and_is_served_first():
+    screen = d.DispatchScreen(limits=CAPPED)
+    x, y, z, w, f = good(7, 1), good(7, 2), good(7, 3), good(7, 4), fine(7, 5)
+    screen.set_source(Src([x, y, z, w, f]))
+    assert [screen.poll()[1] for _ in range(3)] == [x, y, z]
+    assert screen.poll() == ("wait", None), "主机上限 3 集用满，/fine/ 有余量也要等"
+    screen.release(x)
+    assert screen.poll() == ("item", f), "/fine/ 先派，否则会被别的路径一直挡在外面"
+    screen.release(y)
+    assert screen.poll() == ("item", w)
+
+
+def test_path_cap_matches_on_the_first_node_and_ignores_other_paths():
+    screen = d.DispatchScreen(limits=CAPPED)
+    assert screen._lane_key(fine(8, 1)) == ("finalsignal.top", "/fine/")
+    assert screen._lane_key(good(8, 2)) == ("finalsignal.top", None)
+    assert screen._lane_key(ep(8, 3, [hls(8, 3), fine(8, 3)["urls"][0]])) == ("finalsignal.top", None)
+    assert screen._lane_key(ep(8, 4, [{"url": "https://sun1.finalsignal.top/x/fine/m.m3u8",
+                                       "provider": "vidup", "type": "m3u8"}])) == ("finalsignal.top", None)
+    assert screen._lane_key(ep(8, 5, [mp4(8, 5)])) is None
+
+
+def test_parse_host_limits_drops_non_positive_path_caps():
+    parsed = d._parse_host_limits({"A.Top": {"max_episodes": 4, "direct_connections": 2,
+                                             "path_max_episodes": {"/fine/": 16, "/off/": 0}}})
+    assert parsed["a.top"]["path_max_episodes"] == {"/fine/": 16}
+    assert d._parse_host_limits({"a.top": None})["a.top"]["path_max_episodes"] == {}
+    assert d._parse_host_limits(None) == {}
+
+
+@pytest.mark.parametrize("url, expected", [
+    ("https://a.top/fine/s/x.m3u8?t=1", "/fine/s/x.m3u8"),
+    ("https://a.top/", "/"),
+    ("https://a.top", ""),
+    ("not a url", ""),
+    (None, ""),
+])
+def test_path_of(url, expected):
+    assert d._path_of(url) == expected
+
+
 # ------------------------------------------------------------ 主循环端到端：名额按集归还，排队的集当轮下完
 
 def test_main_loop_releases_lane_slots_and_finishes_parked_episodes(tmp_path, monkeypatch):
@@ -227,3 +299,17 @@ def test_main_loop_releases_lane_slots_and_finishes_parked_episodes(tmp_path, mo
     d._run_pipeline()
 
     assert sorted(uploads) == ["95_S01E01", "95_S01E02", "95_S01E03", "95_S01E04", "96_S01E01"]
+
+
+def test_main_loop_finishes_episodes_queued_behind_a_path_cap(tmp_path, monkeypatch):
+    """🔴 /fine/ 的名额同样要按集归还，否则封顶之后排队的 /fine/ 永远派不出去。"""
+    from test_overlay_tv import _pipeline_env
+
+    monkeypatch.setattr(d, "HOST_LIMITS", CAPPED)
+    entries = [{**fine(97, i), "title": "x"} for i in range(1, 5)]
+    entries += [{**good(98, i), "title": "y"} for i in range(1, 4)]
+    downloaded, uploads = _pipeline_env(tmp_path, monkeypatch, entries, lambda url: ())
+
+    d._run_pipeline()
+
+    assert sorted(uploads) == [f"97_S01E0{i}" for i in range(1, 5)] + [f"98_S01E0{i}" for i in range(1, 4)]

@@ -438,15 +438,26 @@ PLAYLIST_500_EXPIRED_AFTER_SECONDS = {
 #   proxy_connections  直连名额满了之后经代理的连接上限；0 = 不走代理、等直连名额
 #   proxy              residential = 取流那套住宅代理（tv_ids_to_links.proxy + .env 的账号）；
 #                      env:变量名 = 从 .env / 环境变量读代理 URL（含账号的 URL 别写进配置）
-HOST_LIMITS = {}
-for _host, _limit in (_CFG.get("host_limits") or {}).items():
-    _limit = _limit or {}
-    HOST_LIMITS[str(_host).strip().lower()] = {
-        "max_episodes": max(0, int(_limit.get("max_episodes") or 0)),
-        "direct": max(0, int(_limit.get("direct_connections") or 0)),
-        "proxy": max(0, int(_limit.get("proxy_connections") or 0)),
-        "proxy_spec": str(_limit.get("proxy") or "residential").strip(),
-    }
+#   path_max_episodes  {路径前缀: 集数}：在 max_episodes 之内，这些路径单独封顶（2026-10-31，/fine/ 的
+#                      分片大量 400 / 502，不封顶会占满名额）；max_episodes 为 0 时不起作用
+def _parse_host_limits(raw):
+    limits = {}
+    for host, limit in (raw or {}).items():
+        limit = limit or {}
+        limits[str(host).strip().lower()] = {
+            "max_episodes": max(0, int(limit.get("max_episodes") or 0)),
+            "direct": max(0, int(limit.get("direct_connections") or 0)),
+            "proxy": max(0, int(limit.get("proxy_connections") or 0)),
+            "proxy_spec": str(limit.get("proxy") or "residential").strip(),
+            "path_max_episodes": {
+                str(prefix): int(cap)
+                for prefix, cap in (limit.get("path_max_episodes") or {}).items() if int(cap) > 0
+            },
+        }
+    return limits
+
+
+HOST_LIMITS = _parse_host_limits(_CFG.get("host_limits"))
 # 派发闸门里因主机集数上限而排队的集最多这么多；满了就不再从来源往外拿（保住反压）。
 MAX_PARKED_EPISODES = max(1, int(_CFG.get("max_parked_episodes", 20000)))
 PLAYLIST_RETRY_MAX = int(_CFG.get("playlist_retry_max", 4))
@@ -842,6 +853,14 @@ HOST_CIRCUIT_COOLDOWN_SEC = max(
 )
 # 熔断文案。⚠️ 有意**不**加入 _PERMANENT_FAILURE_MARKERS（见上第三条边界）。
 _MP4_HOST_BLOCKED_MARKER = "直链主机疑似故障已熔断"
+
+
+def _path_of(url):
+    """取 url 的路径（不含查询串）；解析不出返回空串。"""
+    try:
+        return "/" + str(url).split("://", 1)[1].split("/", 1)[1].split("?", 1)[0]
+    except (IndexError, AttributeError):
+        return ""
 
 
 def _host_of(url):
@@ -6641,7 +6660,8 @@ class DispatchScreen:
 
     3. **按主机限集数**（HOST_LIMITS 的 max_episodes，2026-10-30）：第一个节点在限流主机上的集，
        这台主机在下的集数满了就排队（FIFO），不占下载槽位；别的集照常派。主循环在每集下载
-       结束时调 release()，空出名额就先派排队的。
+       结束时调 release()，空出名额就先派排队的。path_max_episodes 里的路径再单独封顶，
+       各排各的队，封顶的路径排满了也不挡同主机别的路径。
 
     来源报 done 时还有挂起冷却中 / 排队的集就报 wait，到点 / 有名额再派出去。
     冷却中的集最多 max_held 个（默认 DOWNLOAD_QUEUE_DEPTH）、排队的最多 max_parked 个：满了就报
@@ -6662,10 +6682,10 @@ class DispatchScreen:
         self._cooling = []
         self._seq = 0
         self._cool_counts = {}
-        self._parked = {}            # 主机 -> 排队的集（FIFO）
+        self._parked = {}            # (主机, 路径前缀或 None) -> 排队的集（FIFO）
         self._parked_total = 0
-        self._lane_busy = Counter()  # 主机 -> 在下的集数
-        self._lane_of = {}           # id(条目) -> 占着名额的主机（release 时按它还）
+        self._lane_busy = Counter()  # 主机、(主机, 路径前缀或 None) -> 在下的集数
+        self._lane_of = {}           # id(条目) -> 占着名额的 (主机, 路径前缀或 None)（release 时按它还）
         self.held = 0
         self.skipped = 0
         self.parked = 0
@@ -6701,40 +6721,61 @@ class DispatchScreen:
 
     def release(self, entry):
         """主循环：这一集的下载阶段结束了（成败都算），还它占的主机名额。"""
-        host = self._lane_of.pop(id(entry), None)
-        if host is not None:
-            self._lane_busy[host] -= 1
+        lane = self._lane_of.pop(id(entry), None)
+        if lane is not None:
+            self._lane_busy[lane[0]] -= 1
+            self._lane_busy[lane] -= 1
 
-    def _lane_host(self, entry):
+    def _lane_key(self, entry):
+        """条目占的名额 (主机, 路径前缀或 None)；不受集数上限的集返回 None。"""
         nodes = _entry_nodes(entry)
         if not nodes:
             return None
-        host = _host_rule_key(_host_of(nodes[0]["url"]), self._limits)
+        url = nodes[0]["url"]
+        host = _host_rule_key(_host_of(url), self._limits)
         limit = self._limits.get(host)
-        return host if limit and limit["max_episodes"] else None
+        if not limit or not limit["max_episodes"]:
+            return None
+        path = _path_of(url)
+        for prefix in limit.get("path_max_episodes") or ():
+            if path.startswith(prefix):
+                return host, prefix
+        return host, None
+
+    def _lane_has_room(self, lane):
+        host, prefix = lane
+        limit = self._limits[host]
+        if self._lane_busy[host] >= limit["max_episodes"]:
+            return False
+        return prefix is None or self._lane_busy[lane] < limit["path_max_episodes"][prefix]
 
     def _occupy(self, entry):
-        host = self._lane_host(entry)
-        if host is not None:
-            self._lane_busy[host] += 1
-            self._lane_of[id(entry)] = host
+        lane = self._lane_key(entry)
+        if lane is not None:
+            self._lane_busy[lane[0]] += 1
+            self._lane_busy[lane] += 1
+            self._lane_of[id(entry)] = lane
 
     def _park_if_lane_full(self, entry):
-        host = self._lane_host(entry)
-        if host is None or self._lane_busy[host] < self._limits[host]["max_episodes"]:
+        lane = self._lane_key(entry)
+        if lane is None or self._lane_has_room(lane):
             return False
-        self._parked.setdefault(host, deque()).append(entry)
+        self._parked.setdefault(lane, deque()).append(entry)
         self._parked_total += 1
         self.parked += 1
         if self.parked == 1 or self.parked % 500 == 0:
+            host, prefix = lane
+            detail = f"（其中 {prefix} {self._lane_busy[lane]} 集）" if prefix else ""
             print(f"  [主机限流排队] {record_episode_key(entry)}: {host} 已有 "
-                  f"{self._lane_busy[host]} 集在下，排队等名额（当前排队 {self._parked_total} 集，"
+                  f"{self._lane_busy[host]} 集在下{detail}，排队等名额（当前排队 {self._parked_total} 集，"
                   f"累计 {self.parked} 集次）", flush=True)
         return True
 
     def _unpark(self):
-        for host, queue_ in self._parked.items():
-            if queue_ and self._lane_busy[host] < self._limits[host]["max_episodes"]:
+        # 单独封顶的路径先派：它们占不满名额，排在后面的话会被别的集一直挡在外面。
+        for lane in sorted(self._parked, key=lambda lane: lane[1] is None):
+            queue_ = self._parked[lane]
+            if queue_ and self._lane_has_room(lane):
                 self._parked_total -= 1
                 return queue_.popleft()
         return None

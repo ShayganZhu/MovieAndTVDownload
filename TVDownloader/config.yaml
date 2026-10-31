@@ -793,6 +793,10 @@ download_tv:
       direct_connections: 200
       proxy_connections: 600
       proxy: residential
+      # 2026-10-31（用户定）/fine/ 路径单独封顶 16 集：它的分片大量 400 / 502，与连接数和出口 IP 都无关，
+      # 重启后 19、24 号机在下的 finalsignal 几乎全是它。封顶后其余 32 个名额留给别的路径。
+      path_max_episodes:
+        /fine/: 16
   # 派发闸门里因主机集数上限排队的集最多这么多，满了就不再从来源往外拿（取流随之降速）。
   max_parked_episodes: 20000
   # 🔴 2026-10-30 由 8 提到 30：sun.finalsignal.top 过载时会成片回 502（连接一多就有），8 次连续
