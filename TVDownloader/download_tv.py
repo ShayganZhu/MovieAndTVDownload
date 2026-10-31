@@ -2395,6 +2395,79 @@ def write_pending(record):
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def remove_video_pending_records(keys):
+    """从 upload_pending_log 删掉这些集的"视频待补传"记录（assets_only 的保留：那是视频已
+    进 R2、旁车资产还没传全，仍要交给 reupload）。tmp + os.replace 原子重写，与 write_pending 互斥。"""
+    key_set = {str(k) for k in keys}
+    if not key_set or not os.path.exists(UPLOAD_PENDING_LOG):
+        return
+    with pending_lock:
+        kept = []
+        with open(UPLOAD_PENDING_LOG, encoding="utf-8") as file:
+            for line in file:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    kept.append(line)
+                    continue
+                if record_episode_key(record) in key_set and not record.get("assets_only"):
+                    continue
+                kept.append(line if line.endswith("\n") else line + "\n")
+        tmp_path = UPLOAD_PENDING_LOG + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            file.writelines(kept)
+        os.replace(tmp_path, UPLOAD_PENDING_LOG)
+
+
+def find_stranded_uploads(disk_ids, skip_ids=()):
+    """磁盘上有成品、却没有上传成功记录的集，整理成上传任务（success_info）。电影侧 21244bf 移植。
+
+    来路（S3 开启时）：
+      - 优雅停止时在途 / 排队的转封装：收尾会把它们转完、移进 downloads/，但上传槽位等待中的
+        集一收到中断就降级成 pending（2026-10-31 23 号机重启后一次留下 494 集、801 GB）；
+      - kill -9 / OOM / 断电打在"成品已落地、上传未完成"之间（启动巡检会补写 uploaded:false）；
+      - 上传失败或槽位超时降级（uploaded:false + pending）。
+    它们都在磁盘扫描的跳过集里（不会重下），而 pending 只在一整轮正常跑完时才自动补传——
+    全量一轮要跑好几天，不在这里接走就一直躺在本地。
+    以 success.jsonl 里这一集的最后一条记录为准：已是 uploaded:true 的、skip_ids（判死）里的、
+    本地文件已不在的都跳过。
+    """
+    candidates = {str(k) for k in disk_ids} - {str(k) for k in skip_ids}
+    if not candidates or not os.path.exists(SUCCESS_LOG):
+        return []
+    latest = _latest_by_key(SUCCESS_LOG)
+    jobs = []
+    for key in sorted(candidates):
+        record = latest.get(key)
+        if not record or record.get("uploaded"):
+            continue
+        path = record.get("final_path") or ""
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size <= 0:
+            continue
+        job = {k: v for k, v in record.items() if k not in ("uploaded", "s3_key", "asset_keys")}
+        job.update(final_path=path, stranded=True)
+        jobs.append(job)
+    return jobs
+
+
+def _upload_stranded(info):
+    """补传一集滞留成品（上传线程里跑）：成功后把它的视频 pending 与 FAILED_LOG 里的上传失败行
+    一并清掉，与 reupload 同口径（否则收尾补传还会再传一遍、上传失败统计也对不上）。
+    台账收尾失败只告警——视频已经进了 R2，这只是记账。"""
+    key, ok, record = upload_one_entry(info)
+    if ok and record.get("uploaded"):
+        try:
+            remove_video_pending_records([key])
+            remove_upload_failures_from_log([key])
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [{key}] ⚠️ 滞留成品补传成功，但清理旧台账失败: {exc}", flush=True)
+    return key, ok, record
+
+
 # provider 归因字段。集中定义避免各写入点漏抄其中一个。
 # 成品实测字段（见 probe_media / finalize_one_entry），audit 筛查时长不符 / 无音轨全靠它们。
 _MEDIA_KEYS = ("duration_seconds", "audio_streams", "video_streams",
@@ -7073,6 +7146,17 @@ def _run_pipeline():
     # --retry-dead 时按当前门槛逐条复判，够格的放回重试队列。
     dead_ids = load_dead_keys(dead_record_passes_now if RETRY_DEAD_MODE else None)
     processed_ids = logged_ids | disk_ids | dead_ids
+    # 磁盘上有成品、却没有上传成功记录的集（来路见 find_stranded_uploads）：它们在跳过集里
+    # 不会重下，在这里直接接进上传阶段，与新转封装的成品共用上传槽位。判死的绝不补传。
+    stranded_uploads = []
+    if S3_ENABLED:
+        try:
+            stranded_uploads = find_stranded_uploads(disk_ids, skip_ids=dead_ids)
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ 查找滞留成品失败，已忽略（收尾补传仍会处理）: {exc}", flush=True)
+        if stranded_uploads:
+            print(f"发现 {len(stranded_uploads)} 集成品已在本地、但没有上传成功记录"
+                  f"（上次中断 / 崩溃 / 上传降级留下），本次直接补传", flush=True)
     print(
         f"成功日志中有 {len(logged_ids)} 个 ID，"
         f"目标目录中有 {len(disk_ids)} 个已下载 ID，"
@@ -7613,6 +7697,37 @@ def _run_pipeline():
             ThreadPoolExecutor(max_workers=CONVERT_WORKERS) as conversion_executor, \
             ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as upload_executor:
 
+        stranded_queue = deque(stranded_uploads)
+
+        def submit_stranded_uploads(block=False):
+            """把滞留成品逐个交给上传池，与转封装产出的新成品共用同一套反压（upload_semaphore）。
+
+            主循环里只做非阻塞投递：上传槽位被占满就留到下次，绝不为补传卡住下载与转封装。
+            收尾排空时才允许阻塞等槽位，等满 UPLOAD_SLOT_WAIT_TIMEOUT 仍拿不到就放弃——
+            成品仍在本地、仍无上传记录，下次启动会再被找出来，不丢。中断后不再投递新的。
+            """
+            while stranded_queue and not interrupted.is_set():
+                if block:
+                    acquired = upload_semaphore.acquire(timeout=UPLOAD_SLOT_WAIT_TIMEOUT)
+                else:
+                    acquired = upload_semaphore.acquire(blocking=False)
+                if not acquired:
+                    return
+                info = stranded_queue.popleft()
+                try:
+                    upload_future = upload_executor.submit(_upload_stranded, info)
+                except Exception as exc:  # noqa: BLE001
+                    upload_semaphore.release()
+                    print(f"滞留成品上传提交失败: {record_episode_key(info)}: {exc}", flush=True)
+                    continue
+                upload_future.add_done_callback(lambda _f: upload_semaphore.release())
+                upload_future_to_entry[upload_future] = info
+                stage_of[upload_future] = "upload"
+                pending.add(upload_future)
+                stats["uploads"] += 1
+
+        submit_stranded_uploads()
+
         current_batch = entries
         # 每集被就地重取过几次（集级 key → 次数），跨预检与后续轮次共用同一本账，
         # 防"取流-过期-重取"反复空转。
@@ -7719,6 +7834,8 @@ def _run_pipeline():
             while round_download_futures or not source_exhausted:
                 # 先把等槽位的上传尽力提交/降级掉（非阻塞），再决定怎么等。
                 flush_upload_waiting()
+                # 滞留成品：上传槽位一有空就补投（非阻塞，排在新转封装的成品之后）。
+                submit_stranded_uploads()
                 if not pending:
                     # 仅流式来源会走到这里：`round_download_futures ⊆ pending`
                     # （两者的 add/discard 严格成对），故 pending 空即本轮无在途
@@ -7923,17 +8040,28 @@ def _run_pipeline():
         # 多轮下载结束，但 pending 里可能还有末轮的转封装/上传在途，upload_waiting
         # 里也可能还有等槽位的集 -> 显式排空，确保所有失败/成功记录都在循环内被
         # 处理（而非交给 with 退出时静默等待）。
-        if pending or upload_waiting:
+        if pending or upload_waiting or stranded_queue:
             print(
                 f"\n下载轮次结束，等待剩余 {len(pending) + len(upload_waiting)} "
-                "个转封装/上传任务完成...",
+                "个转封装/上传任务完成"
+                + (f"，另有 {len(stranded_queue)} 集滞留成品待补传" if stranded_queue else "")
+                + "...",
                 flush=True,
             )
-        while pending or upload_waiting:
+        while pending or upload_waiting or (stranded_queue and not interrupted.is_set()):
             # 先把等槽位的集推进去：槽位由 pending 里的上传完成后释放，
             # 所以 flush 必须和收割交替进行；超时/中断的会在这里降级出队。
             flush_upload_waiting()
+            # 下载侧已收工，滞留成品可以等槽位了；但还有在途任务时仍用非阻塞，
+            # 阻塞会把已完成 future 的结论处理一并拖住。
+            submit_stranded_uploads(block=not pending and not upload_waiting)
             if not pending:
+                if stranded_queue and not upload_waiting and not interrupted.is_set():
+                    # 已无在途上传占用槽位却等满超时仍没拿到（理论上不会发生）：不死等，
+                    # 成品仍在本地、仍无上传记录，下次启动会再被找出来。
+                    print(f"⚠️ 上传槽位迟迟拿不到，{len(stranded_queue)} 集滞留成品留待下次运行补传",
+                          flush=True)
+                    break
                 # 只剩 upload_waiting 且槽位仍满（不可能——槽位只被 pending
                 # 里的上传占用；除非测试/外部预占了信号量），定时醒来再试，
                 # 直到 flush 把它们按超时降级掉，不能对空集合 wait()。
