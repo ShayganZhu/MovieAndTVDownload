@@ -311,6 +311,14 @@ _SEG_403_RECENT_OK_SECONDS = 60.0
 # 返回 m3u8 的不在此列：那是链接本身指错了，重试必然复现。seg_html_retry_max 设 0 即回到旧行为。
 SEG_HTML_RETRY_MAX = max(0, int(_CFG.get("seg_html_retry_max", 8)))
 SEG_HTML_RETRY_DELAY = float(_CFG.get("seg_html_retry_delay", 1))
+# HLS 分片 HTTP 400（2026-10-31，三台夜间实测）：sun.finalsignal.top 上 /fine/s/… 这类分片一旦回 400
+# 就永远是 400——19 号机 4 万多次 400 重试，第 1~19 次各约 3,100 次，等于次次失败；碰上的集每个分片
+# 都要死磕 seg_retry_max=20 次（指数退避，一片十几分钟），最后按缺片率过高判失败，期间一直占着
+# finalsignal 的名额。现在与 403 共用本集的 _Segment403Tracker：同集别的分片还在正常下时按
+# seg_400_retry_delay 起短退避重试至多 seg_400_retry_max 次；本集一直没有分片成功、被拒已攒够时
+# 判这条流失效，download_segments 当场整集收手并挂"需重新取流"标记，交给重取换一组新链接。
+SEG_400_RETRY_MAX = max(0, int(_CFG.get("seg_400_retry_max", 2)))
+SEG_400_RETRY_DELAY = float(_CFG.get("seg_400_retry_delay", 1))
 # 采样阶段的分片重试预算，与正片**分层**。
 #
 # 采样只是为了测码率/分辨率来决定"这条候选流要不要"，探不到就换下一条流即可，
@@ -3315,8 +3323,16 @@ class _Segment403Tracker:
             self._last_ok = self._clock()
             self._forbidden_since_ok = 0
 
+    def stream_rejected(self):
+        """被拒已攒够、且最近没有分片成功：整条流判失效（download_segments 据此整集收手）。"""
+        with self._lock:
+            return self._forbidden_since_ok >= self._expired_after and not (
+                self._last_ok is not None
+                and self._clock() - self._last_ok <= self._recent_ok_seconds
+            )
+
     def record_rejected(self):
-        """记一次分片被拒（403 / HTML 页），返回这次是否按临时风控重试（False = 判失效）。"""
+        """记一次分片被拒（403 / HTML 页 / 400），返回这次是否按临时风控重试（False = 判失效）。"""
         with self._lock:
             self._forbidden_since_ok += 1
             if self._forbidden_since_ok < self._expired_after:
@@ -3432,7 +3448,7 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
     要把剩余重试跑完（最坏 20×60s），进程要拖十几分钟才退得掉——见该事件的注释。
     """
     last_error = None
-    rejected_retries = {"403": 0, "html": 0}
+    rejected_retries = {"403": 0, "html": 0, "400": 0}
     for attempt in range(1, retry_max + 1):
         # 已中断：不再发起新请求。抛错让上层按"这一分片失败"处理，
         # 整集随之失败并被记为可重试，下次运行重下即可。
@@ -3474,6 +3490,8 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
             # 下面的确定性短路。判别器每次被拒都要记，所以放在次数检查之前。
             if status == 403:
                 rejected = ("403", SEG_403_RETRY_MAX, SEG_403_RETRY_DELAY, "HTTP 403")
+            elif status == 400:
+                rejected = ("400", SEG_400_RETRY_MAX, SEG_400_RETRY_DELAY, "HTTP 400")
             elif isinstance(exc, SegmentNotMediaError) and exc.kind == "html":
                 rejected = ("html", SEG_HTML_RETRY_MAX, SEG_HTML_RETRY_DELAY,
                             f"返回 HTML 页面（{exc.summary}）")
@@ -3505,6 +3523,8 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
             if (
                 attempt == retry_max
                 or is_permanent_http_failure(exc)
+                # 400：短重试用完或整集判失效就放弃，不再按 seg_retry_max 死磕（见 SEG_400_RETRY_MAX）。
+                or status == 400
                 # 源站返回 m3u8，或整集都回 HTML（无效源）/ HTML 重试用完：重试无意义。
                 or "服务器返回的不是视频分片" in message
             ):
@@ -3661,6 +3681,21 @@ def download_segments(
                     except Exception as exc:
                         done_buffer[index] = None
                         failed_indices.append(index)
+                        # 整条流都回 400（一直没有分片成功）：这条流已失效，整集收手、交给重取，
+                        # 不再把剩下的分片挨个试一遍（见 SEG_400_RETRY_MAX）。
+                        if (
+                            circuit_exc is None
+                            and _status_in_chain(exc) == 400
+                            and forbidden_tracker.stream_rejected()
+                        ):
+                            circuit_exc = RuntimeError(
+                                f"分片持续 HTTP 400（{_host_of(segment_urls[index])}，这条流已失效），"
+                                f"{_NEEDS_REFETCH_MARKER}: {segment_urls[index]}"
+                            )
+                            print(f"    {circuit_exc}", flush=True)
+                            for pending in list(future_to_index):
+                                pending.cancel()
+                            continue
                         # 中断后在途分片成批"已取消"，整集随后按中断上抛，逐条打出来只是刷屏。
                         if not interrupted.is_set():
                             print(

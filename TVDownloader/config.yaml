@@ -551,7 +551,10 @@ download_tv:
     queue_maxsize: 512
   # 独立的 FFmpeg 转封装线程数。转封装是 `ffmpeg -c copy` 纯 IO 拷贝，并发过高
   # 只会在同一块盘上互抢 IO，吞吐不升反降。
-  convert_workers: 8
+  # 🔴 2026-10-31 由 8 提到 16：每集转封装后还要做硬字幕/水印 OCR（60 帧），这一步才是大头。
+  #    23 号机夜里下行 ~900 Mbps，626 集下完了在排队等转封装、temp 积到 780 GB，而 CPU 还空着 45%、
+  #    磁盘几乎不忙——卡在线程数上。
+  convert_workers: 16
   # 单集同时下载的分片数。
   #
   # 🔴 2026-09-14 由 64 降到 16，与电影侧对齐。它是**每集各开一个**
@@ -603,6 +606,13 @@ download_tv:
   # 日志会带上页面标题（或正文开头）和字节数，便于确认源站回的是什么页。设 0 回到旧行为。
   seg_html_retry_max: 8
   seg_html_retry_delay: 1
+  # 分片 HTTP 400（2026-10-31，三台夜间实测）：finalsignal 上 /fine/s/… 这类分片一旦回 400 就永远是 400
+  # （19 号机 4 万多次重试，第 1~19 次各约 3,100 次），旧逻辑每片死磕 seg_retry_max=20 次、一片十几分钟，
+  # 碰上的集占着 finalsignal 名额好几个小时。现在与 403 共用本集的判别器：别的分片还在正常下时按
+  # seg_400_retry_delay 起短退避重试至多 seg_400_retry_max 次；本集一直没有分片成功、被拒攒够
+  # seg_403_expired_after 次就判这条流失效，整集收手并挂"需重新取流"，交给重取换新链接。
+  seg_400_retry_max: 2
+  seg_400_retry_delay: 1
   # playlist 的 403 先按临时风控短间隔重试（电影侧 2026-10-27 实测后移植）：finalsignal /r6/ 的 master / media
   # playlist 与分片一样随机回 Cloudflare 403（电影侧 06 号机 4 小时：347 部片整片失败、158 条流采样出局，
   # 全被当成签名过期转重取）。从 playlist_403_retry_delay 秒起指数退避重试至多 playlist_403_retry_max

@@ -6888,3 +6888,94 @@ def test_shipped_playlist_500_rule_covers_finalsignal():
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
                               encoding="utf-8"))["download_tv"]
     assert cfg["link_health"]["playlist_500_expired_after_minutes"] == {FINAL_HOST: 150}
+
+
+# --------------------------------- 分片 HTTP 400：短重试，整条流都 400 就整集收手转重取（2026-10-31）
+
+def _seg_400(url):
+    """与 request_with_retry 抛出的 400 同形：RuntimeError，状态码在 __cause__ 上。"""
+    cause = d.requests.HTTPError("400 Client Error: Bad Request", response=_FakeResp(400))
+    try:
+        raise RuntimeError(f"请求失败: {url}; {cause}") from cause
+    except RuntimeError as exc:
+        return exc
+
+
+@pytest.fixture
+def seg_400_env(monkeypatch, seg_403_env):
+    monkeypatch.setattr(d, "SEG_400_RETRY_DELAY", 0.001)
+    monkeypatch.setattr(d, "SEG_400_RETRY_MAX", 2)
+
+
+def test_segment_400_is_not_hammered_20_times(monkeypatch, seg_400_env):
+    """🔴 19 号机实测：/fine/s/ 分片一旦 400 就永远 400，旧逻辑每片死磕 20 次。现在最多 1 + 2 次。"""
+    calls = []
+
+    def always_400(method, u, **kw):
+        calls.append(1)
+        raise _seg_400(u)
+
+    monkeypatch.setattr(d, "request_with_retry", always_400)
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()                     # 同集别的分片正常：按临时问题短重试
+    with pytest.raises(RuntimeError, match="重试 3 次后仍失败"):
+        d.download_single_segment("https://sun.finalsignal.top/fine/s/x.css", 0, 20, 1,
+                                  forbidden_tracker=tracker)
+    assert len(calls) == 3
+
+
+def test_segment_400_recovers_when_it_was_transient(monkeypatch, seg_400_env):
+    calls = []
+
+    def once_400(method, u, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise _seg_400(u)
+        return b"\x47" * 100
+
+    monkeypatch.setattr(d, "request_with_retry", once_400)
+    tracker = d._Segment403Tracker()
+    tracker.record_ok()
+    assert d.download_single_segment("https://sun.finalsignal.top/fine/s/x.css", 0, 20, 1,
+                                     forbidden_tracker=tracker) == b"\x47" * 100
+
+
+def test_whole_stream_400_aborts_the_episode_and_asks_for_refetch(monkeypatch, seg_400_env, tmp_path):
+    """🔴 整条流都 400（一个分片都没成功）：判失效、当场整集收手，挂需重取标记；
+    剩下的分片不再挨个去试（旧逻辑一集几百片 × 20 次，占着 finalsignal 名额好几个小时）。"""
+    monkeypatch.setattr(d, "SEG_403_EXPIRED_AFTER", 3)
+    seen = {}
+
+    def always_400(method, u, **kw):
+        seen[u] = seen.get(u, 0) + 1
+        raise _seg_400(u)
+
+    monkeypatch.setattr(d, "request_with_retry", always_400)
+    urls = [f"https://sun.finalsignal.top/fine/s/{i}.css" for i in range(200)]
+    with pytest.raises(RuntimeError, match="分片持续 HTTP 400") as ei:
+        d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=2)
+    assert d._NEEDS_REFETCH_MARKER in str(ei.value)
+    assert len(seen) < 10, f"只该试了开头几片，实际试了 {len(seen)} 片"
+
+
+def test_scattered_400_does_not_abort_the_episode(monkeypatch, seg_400_env, tmp_path):
+    monkeypatch.setattr(d, "SEG_403_EXPIRED_AFTER", 3)
+
+    def mostly_ok(method, u, **kw):
+        if u.endswith("/7.css"):
+            raise _seg_400(u)
+        return b"\x47" + u.encode()
+
+    monkeypatch.setattr(d, "request_with_retry", mostly_ok)
+    urls = [f"https://sun.finalsignal.top/fine/s/{i}.css" for i in range(20)]
+    _, failed, _ = d.download_segments(urls, str(tmp_path / "out.ts"), concurrency=2)
+    assert failed == [7], "零散的 400 只丢那一片，整集照常"
+
+
+def test_shipped_seg_400_and_convert_workers():
+    import yaml
+
+    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
+                              encoding="utf-8"))["download_tv"]
+    assert (cfg["seg_400_retry_max"], cfg["seg_400_retry_delay"]) == (2, 1)
+    assert cfg["convert_workers"] == 16
