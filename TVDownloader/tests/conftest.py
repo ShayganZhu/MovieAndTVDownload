@@ -38,6 +38,9 @@ def _isolate_hardsub_check(tmp_path, monkeypatch):
         yield
         return
     monkeypatch.setattr(d, "HARDSUB_CHECK_ENABLED", False)
+    # 检测默认在线程里跑：打桩的 detect_overlays 传不进子进程。
+    monkeypatch.setattr(d, "HARDSUB_OCR_PROCESSES", 0)
+    monkeypatch.setattr(d, "CONVERSION_JOURNAL", str(tmp_path / "conversion_jobs.jsonl"))
     # 按主机限流（host_limits）默认关掉：许多用例的节点就在 sun.finalsignal.top 上，
     # 不关的话会去拼真实的住宅代理、按名额排队。需要它的用例自行打开。
     monkeypatch.setattr(d, "HOST_LIMITS", {})

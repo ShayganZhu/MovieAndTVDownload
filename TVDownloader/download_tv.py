@@ -8,6 +8,7 @@ import functools
 import hashlib
 import os
 import math
+import multiprocessing
 import random
 import re
 import statistics
@@ -23,10 +24,12 @@ from contextlib import contextmanager
 from concurrent.futures import (
     FIRST_COMPLETED,
     CancelledError,
+    ProcessPoolExecutor,
     ThreadPoolExecutor,
     as_completed,
     wait,
 )
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -171,6 +174,9 @@ AUTO_REUPLOAD_ENABLED = bool(
 # 两个独立的下载态状态文件（区别于 SUCCESS_LOG/FAILED_LOG）。
 DOWNLOAD_OK_LOG = resolve_file(_CFG.get("download_ok_log"), "download_ok.jsonl")
 DOWNLOAD_FAIL_LOG = resolve_file(_CFG.get("download_fail_log"), "download_fail.jsonl")
+# 转封装任务的落盘记录（2026-11-01）：下完进转封装队列时追加一条，重启时凭它接着转，
+# 不再把已经下好的 ts 清掉重下（见 load_resumable_conversions）。
+CONVERSION_JOURNAL = resolve_file(_CFG.get("conversion_journal"), "conversion_jobs.jsonl")
 # 【画质判死账本】累计追加，记"因画质被确定性判死"的集 + 当时的判定依据。
 # 启动时并入跳过集，避免每次重跑都把注定失败的集重新采样、重新判死一遍。
 #
@@ -274,6 +280,9 @@ STREAM_IDLE_POLL_SECONDS = max(
 # 默认 8：转封装是 `ffmpeg -c copy` 纯 IO 拷贝，并发过高只会在同一块盘上
 # 互抢 IO，吞吐不升反降（兜底值原为 16，与 config.yaml 的 8 不一致，已对齐）。
 CONVERT_WORKERS = _CFG.get("convert_workers", 8)
+# 转封装队列（排队 + 在转）的集数上限，到了就先不派新下载；0 = 不限（2026-11-01）。
+# 转封装慢于下载时队列只会越堆越长，白占 temp，换不来任何吞吐。
+MAX_PENDING_CONVERSIONS = max(0, int(_CFG.get("max_pending_conversions", 200)))
 # 单部影片同时下载的分片数。
 # 默认 16（2026-09-14 由 64 下调，与电影侧对齐）：这是**每集各开一个**
 # ThreadPoolExecutor，故全局连接数 = MAX_WORKERS × 本值。64 会让 2048 条连接
@@ -371,6 +380,10 @@ HARDSUB_MIN_TEXT_SCORE = float(_HARDSUB_CFG.get("min_text_score", 0.8))
 # 画面里的场景字做不到这一点，故可以用更低的占比门槛把它们抓出来。
 HARDSUB_MIN_ALIGNED_RATIO = float(_HARDSUB_CFG.get("min_aligned_hit_ratio", 0.08))
 HARDSUB_OCR_THREADS = max(1, int(_HARDSUB_CFG.get("ocr_threads", 2)))
+# 检测放到独立进程跑（2026-11-01）；0 = 在转封装线程里跑（见 _detect_overlays_isolated）。
+HARDSUB_OCR_PROCESSES = max(0, int(_HARDSUB_CFG.get("ocr_processes", 16)))
+# 只解最近的关键帧：更快，但抽到的帧变了，结论也会变（见 config.yaml keyframe_seek）。
+HARDSUB_KEYFRAME_SEEK = bool(_HARDSUB_CFG.get("keyframe_seek", False))
 HARDSUB_SCAN_LOG = resolve_file(_HARDSUB_CFG.get("scan_log"), "hardsub_scan.jsonl")
 HARDSUB_EVIDENCE_DIR = resolve_dir(_HARDSUB_CFG.get("evidence_dir"), "hardsub_evidence")
 # 检出硬字幕/水印后先换这一集还没试过的节点重下，所有节点都检出才整集判死。
@@ -2587,16 +2600,75 @@ def remove_file(path):
             pass
 
 
-def clean_temp_directory():
+def clean_temp_directory(keep=()):
+    """清掉上次运行留下的临时文件；keep 里的路径（等着接着转封装的 ts）不动。"""
     os.makedirs(TEMP_DIR, exist_ok=True)
+    keep = set(keep)
     for name in os.listdir(TEMP_DIR):
         path = os.path.join(TEMP_DIR, name)
-        if not os.path.isfile(path):
+        if path in keep or not os.path.isfile(path):
             continue
         if name.startswith(("sample_", "temp_", "mp4sample_")) and name.endswith(
             (".ts", ".mp4")
         ):
             remove_file(path)
+
+
+def journal_conversion_job(job):
+    """下完、进转封装队列前落一条记录。ts_size 用来认出"还是当时那个完整的 ts"。
+
+    写失败只影响这一集重启后能否接着转（write_log 不抛异常），不影响本次运行。
+    """
+    try:
+        ts_size = os.path.getsize(job.get("final_ts") or "")
+    except (OSError, TypeError):
+        return
+    write_log(CONVERSION_JOURNAL, {**job, "ts_size": ts_size})
+
+
+def load_resumable_conversions():
+    """上次运行下完、还没转封装的集：取每集最后一条记录，ts 还在且大小对得上才算。
+
+    转封装结束（成败都算）时 finalize_one_entry 会删 ts，所以 ts 还在 = 没转完；大小不对
+    是后来又重下到一半的文件，不能拿来转。只认 TEMP_DIR 下的路径。
+    """
+    latest = {}
+    try:
+        with open(CONVERSION_JOURNAL, "r", encoding="utf-8") as file:
+            for line in file:
+                try:
+                    job = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(job, dict) and job.get("normalized_id"):
+                    latest[job["normalized_id"]] = job
+    except OSError:
+        return []
+    resumable = []
+    for job in latest.values():
+        final_ts = job.get("final_ts")
+        if (not isinstance(final_ts, str) or os.path.dirname(final_ts) != TEMP_DIR
+                or not isinstance(job.get("entry"), dict)):
+            continue
+        try:
+            if os.path.getsize(final_ts) == job.get("ts_size"):
+                resumable.append(job)
+        except OSError:
+            continue
+    return resumable
+
+
+def rewrite_conversion_journal(jobs):
+    """启动时压缩：只留还要接着转的集，已转完的记录不再带着。失败只告警。"""
+    tmp_path = f"{CONVERSION_JOURNAL}.tmp"
+    try:
+        with log_lock:
+            with open(tmp_path, "w", encoding="utf-8") as file:
+                for job in jobs:
+                    file.write(json.dumps(job, ensure_ascii=False) + "\n")
+            os.replace(tmp_path, CONVERSION_JOURNAL)
+    except OSError as exc:
+        print(f"⚠️ 压缩 {CONVERSION_JOURNAL} 失败（已忽略）: {exc}", flush=True)
 
 
 def clean_stale_log_tmp():
@@ -5221,8 +5293,10 @@ def _grab_frame(path, timestamp):
     import cv2
     import numpy as np
 
+    seek = ["-skip_frame", "nokey", "-noaccurate_seek"] if HARDSUB_KEYFRAME_SEEK else []
+    # -threads 1：只解一帧用不上多线程。06 号机 16 路并发实测吞吐 9.2 → 10.1 帧/秒、CPU 66% → 49%。
     command = [
-        "ffmpeg", "-v", "error", "-ss", f"{timestamp:.3f}", "-i", path,
+        "ffmpeg", "-v", "error", "-threads", "1", *seek, "-ss", f"{timestamp:.3f}", "-i", path,
         "-frames:v", "1", "-vf", f"scale={_OVERLAY_FRAME_WIDTH}:-2",
         "-f", "image2pipe", "-c:v", "bmp", "-",
     ]
@@ -5860,6 +5934,62 @@ def plan_overlay_retry(conversion_job, scan):
     return remaining
 
 
+_overlay_pool_lock = threading.Lock()
+_overlay_pool_instance = None
+
+
+def _overlay_worker_init(parent_pid):
+    """检测子进程启动时调用：Ctrl+C 由主进程统一收尾；主进程没了就跟着退，不留孤儿。"""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    def _watch_parent():
+        while os.getppid() == parent_pid:
+            time.sleep(5)
+        os._exit(0)
+
+    threading.Thread(target=_watch_parent, daemon=True).start()
+
+
+def _overlay_pool():
+    """检测进程池（首次用到才建）；HARDSUB_OCR_PROCESSES 为 0 时返回 None。
+
+    用 spawn：主进程有上千个线程，fork 不安全。
+    """
+    global _overlay_pool_instance
+    if HARDSUB_OCR_PROCESSES <= 0:
+        return None
+    with _overlay_pool_lock:
+        if _overlay_pool_instance is None:
+            _overlay_pool_instance = ProcessPoolExecutor(
+                max_workers=HARDSUB_OCR_PROCESSES,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_overlay_worker_init,
+                initargs=(os.getpid(),),
+            )
+        return _overlay_pool_instance
+
+
+def _detect_overlays_isolated(path):
+    """在独立进程里跑 detect_overlays，转封装线程只等结果。
+
+    2026-11-01 实测：同样 60 帧，单独跑约 33 秒一集，在下载主进程（上千个线程）的转封装线程里
+    要占约 193 秒，CPU 还空着一半，转封装因此成了全流程的瓶颈。子进程挂掉时这一集改在
+    本线程检测，下一集重建进程池。
+    """
+    global _overlay_pool_instance
+    pool = _overlay_pool()
+    if pool is None:
+        return detect_overlays(path)
+    try:
+        return pool.submit(detect_overlays, path).result()
+    except BrokenProcessPool as exc:
+        with _overlay_pool_lock:
+            if _overlay_pool_instance is pool:
+                _overlay_pool_instance = None
+        print(f"⚠️ 检测子进程异常退出，这一集改在主进程检测: {exc}", flush=True)
+        return detect_overlays(path)
+
+
 def inspect_overlays(ident, title, path, node=None):
     """检测硬字幕/水印。返回 (应删除这个版本的理由列表, 扫描结果)；理由为空 = 照常交付。
 
@@ -5872,7 +6002,7 @@ def inspect_overlays(ident, title, path, node=None):
         return [], {}
     key = record_episode_key(ident)
     try:
-        scan, evidence = detect_overlays(path)
+        scan, evidence = _detect_overlays_isolated(path)
     except Exception as exc:  # noqa: BLE001 - 检测故障不能变成丢集
         scan, evidence = {"verdict": "unknown", "reasons": [], "error": str(exc)}, []
 
@@ -5938,6 +6068,13 @@ def finalize_one_entry(conversion_job, processed_ids):
     cleanup_paths = conversion_job["cleanup_paths"]
     completed = False
     overlay_dead = False
+
+    if interrupted.is_set():
+        # 排到时已经收到停止信号：ts 留着，下次启动按 CONVERSION_JOURNAL 接着转。没有这一步
+        # 的话，停机要等整条队列转完（队列长时要几个小时）。
+        with processing_lock:
+            processing_ids.discard(normalized_id)
+        return normalized_id, False, {"error": _INTERRUPTED_ERROR}
 
     try:
         print(f"  [{normalized_id}] 开始转封装为 MP4...", flush=True)
@@ -7189,7 +7326,8 @@ def main():
 
 
 def _run_pipeline():
-    clean_temp_directory()
+    resumable_conversions = load_resumable_conversions()
+    clean_temp_directory(keep=[job["final_ts"] for job in resumable_conversions])
     clean_stale_log_tmp()
     print("已清理 temp 目录中的旧临时文件")
     _reset_overlay_stats()
@@ -7207,6 +7345,17 @@ def _run_pipeline():
     # --retry-dead 时按当前门槛逐条复判，够格的放回重试队列。
     dead_ids = load_dead_keys(dead_record_passes_now if RETRY_DEAD_MODE else None)
     processed_ids = logged_ids | disk_ids | dead_ids
+    # 下完了、还没转封装的集（上次中断留下）：接着转，不重下。已经有结论的集不再转。
+    for job in resumable_conversions:
+        if job["normalized_id"] in processed_ids:
+            remove_file(job["final_ts"])
+    resumable_conversions = [job for job in resumable_conversions
+                             if job["normalized_id"] not in processed_ids]
+    rewrite_conversion_journal(resumable_conversions)
+    resumable_ids = {job["normalized_id"] for job in resumable_conversions}
+    if resumable_conversions:
+        print(f"发现 {len(resumable_conversions)} 集已下完、还没转封装（上次中断留下），"
+              f"本次接着转，不重下", flush=True)
     # 磁盘上有成品、却没有上传成功记录的集（来路见 find_stranded_uploads）：它们在跳过集里
     # 不会重下，在这里直接接进上传阶段，与新转封装的成品共用上传槽位。判死的绝不补传。
     stranded_uploads = []
@@ -7277,7 +7426,7 @@ def _run_pipeline():
             # 在此直接计数跳过，避免残缺输入放大成等量的失败记录与日志噪声。
             invalid_input_count += 1
             continue
-        if normalized_id in processed_ids:
+        if normalized_id in processed_ids or normalized_id in resumable_ids:
             # 已成功处理过：与其提交进线程池再由 process_one_entry 逐个跳过
             # （每集一次调度 + 一次锁竞争），不如读入阶段直接滤掉。第二次
             # 全量重跑时 success.jsonl 已有数万条，这里能省下等量的空转。
@@ -7558,6 +7707,7 @@ def _run_pipeline():
                     "node_type": info.get("node_type"),
                     "node_index": info.get("node_index"),
                 })
+                journal_conversion_job(info)
                 # submit 若抛异常（如线程池已 shutdown），finalize 永不执行 →
                 # processing_ids 锁与临时文件会永久泄漏。故兜底：失败即释放 ID 锁、
                 # 清理已交接的临时文件，并当作转封装失败记录（与 upload submit 对称）。
@@ -7789,6 +7939,37 @@ def _run_pipeline():
 
         submit_stranded_uploads()
 
+        # 接着转上次留下的 ts：占着 processing_ids，来源再送来这一集时按"处理中"跳过。
+        for job in resumable_conversions:
+            with processing_lock:
+                processing_ids.add(job["normalized_id"])
+            conversion_future = conversion_executor.submit(
+                finalize_one_entry, job, processed_ids
+            )
+            conversion_future_to_entry[conversion_future] = job["entry"]
+            stage_of[conversion_future] = "conversion"
+            pending.add(conversion_future)
+            stats["conversions"] += 1
+
+        conversion_gate_closed = False
+
+        def conversion_backlog_full():
+            """转封装队列到上限就先不派新下载（MAX_PENDING_CONVERSIONS）。回落一成才重新放行，
+            免得每转完一集就开关一次。"""
+            nonlocal conversion_gate_closed
+            if MAX_PENDING_CONVERSIONS <= 0:
+                return False
+            backlog = len(conversion_future_to_entry)
+            if conversion_gate_closed:
+                resume_at = MAX_PENDING_CONVERSIONS - max(1, MAX_PENDING_CONVERSIONS // 10)
+                if backlog <= resume_at:
+                    conversion_gate_closed = False
+                    print(f"[转封装队列] 回落到 {backlog} 集，恢复派发新下载", flush=True)
+            elif backlog >= MAX_PENDING_CONVERSIONS:
+                conversion_gate_closed = True
+                print(f"[转封装队列] 已有 {backlog} 集，暂停派发新下载", flush=True)
+            return conversion_gate_closed
+
         current_batch = entries
         # 每集被就地重取过几次（集级 key → 次数），跨预检与后续轮次共用同一本账，
         # 防"取流-过期-重取"反复空转。
@@ -7867,6 +8048,9 @@ def _run_pipeline():
                 while len(round_download_futures) < DOWNLOAD_QUEUE_DEPTH:
                     if source_exhausted:
                         return True
+                    if conversion_backlog_full():
+                        source_waiting = True
+                        return False
                     state, entry = batch_source.poll()
                     if state == "done":
                         source_exhausted = True
