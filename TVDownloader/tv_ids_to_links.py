@@ -661,6 +661,12 @@ _PROVIDER_ENTRY = {"vidup": "page", "vidfast": "page", "videasy": "videasy-seed"
 _OUTAGE_STATUSES = frozenset({403, 451, 502, 503}) | frozenset(range(520, 531))
 
 
+class FakeLinksOnly(NoSource):
+    """给了链接的 server 全是假链接。熔断器和重试都按 NoSource 算（源站正常作答、重试没用），
+    但不算无源的证据：workers.dev 是源站一段时间的故障（2026-11-01 01~14 时），同样只有假链接的
+    集过后再问约 38% 拿到真链接。process_episode 把它记为推迟，下次运行重查。"""
+
+
 class ProviderDown(Exception):
     """该源正处于熔断中，本次没有调用它。既不是无源证据，也不该触发重试。"""
 
@@ -1088,6 +1094,8 @@ def _parse_captions(items, where="", headers=None):
 
 
 FAKE_LINK_BODY = "未找到"
+# 推迟名单里代表"只拿到假链接"的标记（provider_down.txt 第 4 列）。不是真的源，熔断器也不认识它。
+FAKE_LINK_MARK = "假链接"
 
 
 def _is_fake_node(item):
@@ -1111,8 +1119,8 @@ def _link_says_not_found(url, site):
 def _drop_fake_links(urls, site, label):
     """验证假链接主机上的节点（2026-11-01）：404 的丢掉，其余标 link_checked 留着。返回 (留下的, 丢了几个)。
 
-    vidup / vidfast 对一批没片的集也给 workers.dev 链接，新旧链接换请求头和指纹全是 404
-    "未找到 1"。不拦的话这些集算"有链接"，永远下载失败、也进不了无源台账。
+    vidup / vidfast 有时段只给 workers.dev 链接（2026-11-01 01~14 时），新旧链接换请求头和指纹全是
+    404 "未找到 1"。不拦的话这些集算"有链接"，永远下载失败。
     每条验证一次而不是按主机直接丢：万一它哪天真能用了，不会悄悄漏掉一个源。
     """
     kept = []
@@ -1270,9 +1278,10 @@ def _fetch_vidup_like(session, site, api_name, tid, season, episode):
         return urls, result_title, result_captions
     if stream_404 == len(servers_decrypted):
         raise NoSource(f"all {stream_404} {api_name} servers returned 404 for {label}")
-    # 给了链接的 server 全是假链接：等同这些 server 无此集。还有 server 出错就不能下结论。
+    # 给了链接的 server 全是假链接、其余都 404：这家没有可用链接，但不算无源证据（见 FakeLinksOnly）。
+    # 还有 server 出错就照常按瞬时重试。
     if faked and stream_404 + answered == len(servers_decrypted):
-        raise NoSource(f"{api_name}: {stream_404} servers returned 404, {answered} gave fake links for {label}")
+        raise FakeLinksOnly(f"{api_name}: {stream_404} servers returned 404, {answered} gave fake links for {label}")
     raise Exception(f"All {api_name} servers failed for {label}. Last error: {last_server_error}")
 
 
@@ -1487,7 +1496,8 @@ def process_episode(tid, season, episode, providers=None, stop_event=None):
       - "retry"    瞬时错误换 IP 重试 MAX_RETRIES 次仍失败 → 下一轮重跑
       - "deferred" 被调用的源都说无此集，但有源正处于熔断、没问到 → 附
                    {tmdbId, season, episode, providers}，不重试、不判死，另记名单，
-                   等那个源恢复后再查（见 ProviderBreaker，电影侧 7631adb 移植）
+                   等那个源恢复后再查（见 ProviderBreaker，电影侧 7631adb 移植）；
+                   只拿到假链接的集同样记推迟，providers 为 [FAKE_LINK_MARK]，下次运行重查
 
     stop_event（可选，pipeline 模式用）：每次尝试开跑前检查，已置位则立即返回
     ("retry", None)——不再发起新请求、也不再走判死确认。一集最多 4 次尝试 × 3 源
@@ -1534,12 +1544,16 @@ def process_episode(tid, season, episode, providers=None, stop_event=None):
                 down_providers = []
                 # 不阻止判死的源（videasy）出的错：不算瞬时错误，等同没问到（见下方判定）。
                 nonblocking_errors = []
+                fake_providers = []
                 for name in providers:
                     try:
                         provider_urls, provider_title, provider_captions = \
                             _call_provider(name, net, tid, season, episode)
                     except ProviderDown:
                         down_providers.append(name)
+                        continue
+                    except FakeLinksOnly:
+                        fake_providers.append(name)
                         continue
                     except NoSource as e:
                         nosource_errors.append(f"{name}: {e}")
@@ -1605,6 +1619,11 @@ def process_episode(tid, season, episode, providers=None, stop_event=None):
 
                 if transient_errors:
                     raise Exception(f"All providers failed for {label}: {transient_errors}")
+                if fake_providers:
+                    # 只拿到假链接：不写 fail.txt（那是永久排除），也不重试（短时间内再问还是假的）。
+                    print(f"  [只有假链接] {label}: {'、'.join(fake_providers)}，下次运行重查")
+                    return "deferred", {"tmdbId": str(tid), "season": int(season),
+                                        "episode": int(episode), "providers": [FAKE_LINK_MARK]}
                 if nonblocking_errors and not nosource_errors and not down_providers:
                     # 只问了不阻止判死的源、而且它们都出错了：谁也没答过，不能判死。
                     raise Exception(f"All providers failed for {label}: {nonblocking_errors}")
@@ -1648,7 +1667,7 @@ def process_episode(tid, season, episode, providers=None, stop_event=None):
 def _load_ok_keys(results_file):
     """results.jsonl 中已成功的 (tid, season, episode) 集合。
 
-    只有假链接的行不算成功：这些集会被重新取流，有真链接就下，没有就进 fail.txt。
+    只有假链接的行不算成功：这些集会被重新取流，有真链接就下，全家 404 才进 fail.txt。
     """
     ok = set()
     if results_file.exists():
@@ -1935,7 +1954,7 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True,
                     retry_items.append(item)
                 else:
                     deferred_out[(str(tid), int(s), int(e))] = names
-                print(f"⏸  DEFERRED: {label}（{'、'.join(names)} 熔断中）")
+                print(f"⏸  DEFERRED: {label}（{'、'.join(names)}{'' if FAKE_LINK_MARK in names else ' 熔断中'}）")
             else:
                 if write_dead:
                     with open(fail_file, 'a', encoding='utf-8') as f:
@@ -2172,8 +2191,10 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
             raise SystemExit(2)
 
         # 推迟的集里，熔断中的源都已恢复的放回下一轮重查（不等下次运行）。
+        # 只拿到假链接的集留到下次运行：轮间隔只有几分钟，再问还是假的，白占取流线程。
         recovered = [key for key, names in deferred.items()
-                     if not any(PROVIDER_BREAKER.is_down(n) for n in names)]
+                     if FAKE_LINK_MARK not in names
+                     and not any(PROVIDER_BREAKER.is_down(n) for n in names)]
         for key in recovered:
             deferred.pop(key)
         if recovered:
@@ -2236,7 +2257,7 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
         if deferred or provider_down_file.exists():
             write_provider_down(provider_down_file, deferred)
         if deferred:
-            print(f"\n==> {len(deferred)} 集因源熔断推迟，写入 {provider_down_file.name}"
+            print(f"\n==> {len(deferred)} 集因源熔断或只有假链接推迟，写入 {provider_down_file.name}"
                   f"（不计入已处理，下次运行重查）。")
     print(f"\nAll done. 共跑 {round_no} 轮，结果已合并写入 {results_file}")
 

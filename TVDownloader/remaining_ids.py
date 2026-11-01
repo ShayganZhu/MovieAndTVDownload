@@ -60,7 +60,7 @@ REASONS = {
     "download_failed": "取到过链接，下载失败",
     "links_not_downloaded": "取到过链接，还没下载过",
     "no_source": "确认无源（fail.txt）",
-    "provider_down": "有取流源熔断、其余源无此集，待它恢复后再查（provider_down.txt）",
+    "provider_down": "有取流源熔断或只给了假链接、其余源无此集，下次运行再查（provider_down.txt）",
     "fetch_unresolved": "取流多轮仍是瞬时错误（fail.txt 标 retry-exhausted）",
     "not_fetched": "还没取到链接（没轮到 / 取流瞬时失败）",
 }

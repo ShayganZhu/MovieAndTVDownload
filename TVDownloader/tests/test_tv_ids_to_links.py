@@ -635,14 +635,55 @@ def test_fetch_gives_real_nodes_when_only_some_links_are_fake(monkeypatch, fake_
     assert status == "ok" and _urls(result) == ["https://sun.finalsignal.top/x.m3u8"]
 
 
-def test_episode_with_only_fake_links_is_no_source(monkeypatch, fake_links):
-    """🔴 server 全是 404 或假链接：等同无源。否则这些集永远算"有链接"、永远下载失败。"""
+def test_episode_with_only_fake_links_is_deferred_not_dead(monkeypatch, fake_links):
+    """🔴 假链接是源站一段时间的故障，不是无源证据：记推迟、下次运行重查，绝不能进 fail.txt。"""
     monkeypatch.setattr(m, "DEAD_CONFIRM", False)
     _install_fake_session(monkeypatch, PAGE, [{"url": FAKE_URL}],
                           servers=[{"name": "a", "data": "d0"}, {"name": "b", "data": "d1"}],
                           stream_status={"d1": 404})
     status, result = m.process_episode(1, 1, 1, providers=["vidup"])
-    assert status == "dead" and result is None
+    assert status == "deferred"
+    assert result == {"tmdbId": "1", "season": 1, "episode": 1, "providers": [m.FAKE_LINK_MARK]}
+
+
+def test_fake_links_from_one_source_and_null_from_another_is_still_deferred(monkeypatch, fake_links):
+    monkeypatch.setattr(m, "DEAD_CONFIRM", False)
+    _install_fake_session(monkeypatch, PAGE, [{"url": FAKE_URL}])
+    status, _result = m.process_episode(1, 1, 1, providers=["vidup", "vidlink"])
+    assert status == "deferred", "vidlink 说无此集也不能下无源的结论"
+
+
+def test_fake_links_with_real_links_from_another_source_are_ok(monkeypatch, fake_links):
+    _install_fake_session(monkeypatch, PAGE, [{"url": FAKE_URL}], vidlink_resp=_FakeResp(payload=VIDLINK_OK))
+    status, result = m.process_episode(1, 1, 1, providers=["vidup", "vidlink"])
+    assert status == "ok" and all("workers.dev" not in url for url in _urls(result))
+
+
+def test_deferred_fake_episode_is_not_written_to_fail_and_not_reasked_next_round(tmp_path, monkeypatch, capsys):
+    """🔴 全链路：推迟的集不进 fail.txt、不在下一轮空转，落 provider_down.txt，下次运行不算已处理。"""
+    results, fail, down = tmp_path / "results.jsonl", tmp_path / "fail.txt", tmp_path / "provider_down.txt"
+    asked = []
+
+    def process(tid, s, e, stop_event=None):
+        asked.append((tid, s, e))
+        if e == 1:
+            return "deferred", {"tmdbId": tid, "season": s, "episode": e, "providers": [m.FAKE_LINK_MARK]}
+        if len(asked) <= 2:
+            return "retry", None        # 第 2 集瞬时失败：逼出第二轮
+        return "dead", None
+
+    monkeypatch.setattr(m, "process_episode", process)
+    deferred = {}
+    retry = m.run_batch([("9", 1, 1), ("9", 1, 2)], results, fail, 1, deferred_out=deferred)
+    assert retry == [("9", 1, 2)]
+    assert deferred == {("9", 1, 1): [m.FAKE_LINK_MARK]}
+    assert not fail.exists() or "9\t1\t1" not in fail.read_text(encoding="utf-8")
+    assert "假链接）" in capsys.readouterr().out
+    # 轮末判定：假链接标记不会被当成"源已恢复"放回下一轮
+    assert not m.PROVIDER_BREAKER.is_down(m.FAKE_LINK_MARK)
+    m.write_provider_down(down, deferred)
+    assert down.read_text(encoding="utf-8") == f"9\t1\t1\t{m.FAKE_LINK_MARK}\n"
+    assert ("9", 1, 1) not in m.load_processed(results, fail)[0]
 
 
 def test_fake_links_with_a_failing_server_are_not_no_source(monkeypatch, fake_links):

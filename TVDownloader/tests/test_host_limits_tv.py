@@ -152,10 +152,10 @@ def test_shipped_host_limits():
 
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
                               encoding="utf-8"))["download_tv"]
-    assert cfg["host_limits"] == {"finalsignal.top": {"max_episodes": 48, "direct_connections": 200,
+    assert cfg["host_limits"] == {"finalsignal.top": {"max_episodes": 16, "direct_connections": 200,
                                                       "proxy_connections": 600, "proxy": "residential",
-                                                      "path_max_episodes": {"/fine/": 16}}}
-    assert d._parse_host_limits(cfg["host_limits"])["finalsignal.top"]["path_max_episodes"] == {"/fine/": 16}
+                                                      "path_max_episodes": {"/fine/": 8}}}
+    assert d._parse_host_limits(cfg["host_limits"])["finalsignal.top"]["path_max_episodes"] == {"/fine/": 8}
     # 集数上限必须给别的主机留出槽位，否则 finalsignal 的慢集占满全部槽位、vidlink 排不上。
     assert cfg["max_workers"] - cfg["host_limits"]["finalsignal.top"]["max_episodes"] >= 16
     assert cfg["download_queue_depth"] > cfg["max_workers"]
