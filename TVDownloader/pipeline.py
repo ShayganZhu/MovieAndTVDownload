@@ -226,6 +226,19 @@ class QueueEntrySource:
         return "done", None
 
 
+class _RefetchPools:
+    """让来源同时消费普通重取和到期重取两个线程池的结果。"""
+
+    def __init__(self, *pools):
+        self._pools = pools
+
+    def collect(self):
+        return [entry for pool in self._pools for entry in pool.collect()]
+
+    def pending_count(self):
+        return sum(pool.pending_count() for pool in self._pools)
+
+
 class FetchWorker:
     """在后台线程里跑取流主流程，产出实时推入队列。
 
@@ -368,9 +381,12 @@ class AsyncRefetcher:
     消费，下次启动也能按 fetched_at 择新直接用上。
     """
 
-    def __init__(self, workers, stop_event, providers=None, halted=None):
+    def __init__(self, workers, stop_event, providers=None, halted=None, report_misses=False):
         self._in = queue.Queue()
         self._done = queue.Queue()
+        # report_misses（到期重取用）：没换到链接的条目放这里，由 collect_missed 交还调用方
+        # 再排期。必须先于在途计数递减放入，道理同 _done。
+        self._missed = queue.Queue() if report_misses else None
         self._stop = stop_event
         # 取流侧致命退出标志（FetchWorker.halted）。置位后 dispatch 一律拒收：
         # 主取流已因熔断/配置错误跑不下去，重取用的是同一套代码与代理池，
@@ -449,6 +465,20 @@ class AsyncRefetcher:
             except queue.Empty:
                 return out
 
+    def collect_missed(self):
+        """取走目前没换到链接的条目（report_misses 时）。绝不阻塞。"""
+        out = []
+        while self._missed is not None:
+            try:
+                out.append(self._missed.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def _note_miss(self, entry):
+        if self._missed is not None:
+            self._missed.put(entry)
+
     def pending_count(self):
         """还有多少条在途。主循环靠它决定"还要不要再等一会儿"。"""
         with self._lock:
@@ -467,6 +497,7 @@ class AsyncRefetcher:
             except Exception as exc:  # noqa: BLE001
                 label = downloader.record_episode_key(entry) or entry.get("tmdbId")
                 print(f"  [重取异常] {label}: {exc}", flush=True)
+                self._note_miss(entry)
             finally:
                 key = downloader.record_episode_key(entry)
                 with self._lock:
@@ -494,10 +525,12 @@ class AsyncRefetcher:
             # 单集重取失败绝不能带塌整批；SystemExit 一并兜住
             # （取流侧用它做配置校验），但不拦 KeyboardInterrupt。
             print(f"  [重取失败] {key}: {exc}", flush=True)
+            self._note_miss(entry)
             return
         if status != "ok" or not result or not result.get("urls"):
             # dead（源站确认无此集）与 retry（瞬时错误耗尽）都救不回来。
             print(f"  [重取无果] {key}: {status}", flush=True)
+            self._note_miss(entry)
             return
         # 落盘，与取流侧行为一致（追加写，下游按 fetched_at 择新）。
         # 即使本次运行没消费到，下次启动也能用上。
@@ -597,6 +630,26 @@ def main():
               f"每集最多 {downloader.AUTO_REFETCH_MAX_PER_EPISODE} 次）",
               flush=True)
 
+    # 到期重取：只剩 vidlink 坏链接的集到缓存刷新时刻只问 vidlink（约 1 秒一集，问全部源要
+    # 48 秒），由 DispatchScreen 限速投递。--providers 里没有 vidlink 时不启用。
+    due_refetcher = None
+    real_due_hook = downloader.due_refetch_hook
+    if (downloader.AUTO_REFETCH_ENABLED and downloader.DUE_REFETCH_ENABLED
+            and (not refetch_providers or "vidlink" in refetch_providers)):
+        due_refetcher = AsyncRefetcher(
+            downloader.DUE_REFETCH_WORKERS, worker._stop,
+            providers=["vidlink"], halted=worker.halted, report_misses=True,
+        )
+        due_refetcher.start()
+        downloader.due_refetch_hook = due_refetcher
+        print(f"到期重取已启用（{downloader.DUE_REFETCH_WORKERS} 个线程，只问 vidlink，"
+              f"每分钟最多 {downloader.DUE_REFETCH_PER_MINUTE:g} 集，"
+              f"每集最多 {downloader.DUE_REFETCH_MAX_PER_EPISODE} 次）", flush=True)
+    source_refetcher = (
+        _RefetchPools(*(pool for pool in (refetcher, due_refetcher) if pool is not None))
+        if refetcher is not None or due_refetcher is not None else None
+    )
+
     def _is_busy(key):
         # 该集的旧链接还在下载线程里 → 新链接先压着，等它退出处理态再投，
         # 否则会被 process_one_entry 判成"重复条目正在处理"直接丢掉。
@@ -611,7 +664,7 @@ def main():
             # 但投递顺序是 重取结果 > 实时队列 > 存量：队列里的直链最新鲜，
             # 且队列满会让取流侧超时丢条目，不能让大存量把它们挤掉。
             holder["source"] = QueueEntrySource(
-                q, backlog=entries, refetcher=refetcher, is_busy=_is_busy
+                q, backlog=entries, refetcher=source_refetcher, is_busy=_is_busy
             )
             if holder["source"].backlog_total:
                 print(
@@ -636,6 +689,7 @@ def main():
     finally:
         downloader.ListEntrySource = real_list_source
         downloader.async_refetch_hook = real_hook
+        downloader.due_refetch_hook = real_due_hook
         # 到这里 downloader.main() 已返回（正常收尾或 Ctrl+C 后收尾完毕），
         # 取流线程通常早已放完哨兵在待命态，shutdown 是瞬时的。
         # 默认 30s 只是兜底：仅当取流正阻塞在满队列的 put 上才会用到，
@@ -644,12 +698,12 @@ def main():
         # ⚠️ 收尾统计必须在 finally 里：Ctrl+C 时它才是最该被看到的东西
         # （跑了多久、取到多少、下了多少、有多少留给下次）。
         # 放在 try 之外的话，中断路径会整段跳过，用户只看到一个光秃秃的 traceback。
-        _print_summary(worker, holder["source"], refetcher, started, interrupted)
+        _print_summary(worker, holder["source"], refetcher, started, interrupted, due_refetcher)
 
     return 130 if interrupted else 0
 
 
-def _print_summary(worker, source, refetcher, started, interrupted=False):
+def _print_summary(worker, source, refetcher, started, interrupted=False, due_refetcher=None):
     delivered = source.delivered if source else 0
     elapsed = time.time() - started
     print("\n" + "=" * 70)
@@ -676,6 +730,9 @@ def _print_summary(worker, source, refetcher, started, interrupted=False):
                  if getattr(refetcher, "skipped_halted", 0) else "")
               + (f"（{stranded} 集未及回收，已落盘 results.jsonl，"
                  f"下次运行自动使用）" if stranded > 0 else ""))
+    if due_refetcher is not None and due_refetcher.dispatched:
+        print(f"[pipeline] 到期重取：投递 {due_refetcher.dispatched} 次，"
+              f"拿到链接 {due_refetcher.revived} 次（链接可能仍在坏主机上，会按新的刷新时刻再排）")
     if worker.error is not None:
         print(f"⚠️ 取流侧曾异常终止：{worker.error}")
         print("   已取到的集仍已下载；重跑本命令可继续未完成的部分。")

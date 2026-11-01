@@ -43,6 +43,7 @@ import time
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # 未完成原因（--report 的 reason 字段与汇总表都用这些）。顺序 = 汇总表的显示顺序。
 REASONS = {
@@ -131,6 +132,9 @@ def build_paths(base_dir, ids=None, config=None):
         "s3_config": s3,
         "include_specials": bool(fetch.get("include_specials", True)),
         "air_grace_days": int(fetch.get("air_grace_days", 5) or 0),
+        "fake_link_hosts": tuple(str(host).strip().lower() for host in
+                                 ((dl.get("link_health") or {}).get("fake_link_hosts") or [])
+                                 if str(host).strip()),
     }
 
 
@@ -192,6 +196,35 @@ def _keys_by_regex(paths):
                 parts = [rx.search(line) for rx in _KEY_FIELDS_RE.values()]
                 if all(parts):
                     found.add(episode_key(*(p.group(1) for p in parts)))
+    return found
+
+
+def _is_fake_node(item, fake_hosts):
+    """没验证过的假链接节点（口径同 download_tv._is_fake_node）。"""
+    if not isinstance(item, dict) or item.get("link_checked"):
+        return False
+    host = (urlsplit(str(item.get("url") or "")).hostname or "").lower()
+    return any(host == fake or host.endswith("." + fake) for fake in fake_hosts)
+
+
+def _keys_with_links(path, fake_hosts):
+    """results.jsonl 里取到过真链接的集：只有假链接的行不算（取流侧会重新判定这些集）。"""
+    found = set()
+    if not path.exists():
+        return found
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            parts = [rx.search(line) for rx in _KEY_FIELDS_RE.values()]
+            if not all(parts):
+                continue
+            if any(host in line for host in fake_hosts):
+                try:
+                    urls = json.loads(line).get("urls")
+                except json.JSONDecodeError:
+                    urls = None
+                if urls and all(_is_fake_node(item, fake_hosts) for item in urls):
+                    continue
+            found.add(episode_key(*(p.group(1) for p in parts)))
     return found
 
 
@@ -271,7 +304,7 @@ def load_ledgers(paths):
         "uploaded": uploaded,
         "downloaded": downloaded,
         "dead": dead,
-        "results": _keys_by_regex([paths["results"]]),
+        "results": _keys_with_links(paths["results"], paths.get("fake_link_hosts") or ()),
         "failed": _keys_by_regex(failed_paths),
         "fail": fail_eps,
         "fail_shows": fail_shows,

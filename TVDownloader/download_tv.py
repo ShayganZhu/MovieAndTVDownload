@@ -155,6 +155,9 @@ AUTO_REFETCH_TIMEOUT = max(
 #   整个前提是"主循环一步都不阻塞"，故那条路在 pipeline 模式下不能走。
 #   而不走它、又没有异步路径的话，pipeline 模式下过期直链**当次运行零自愈**。
 async_refetch_hook = None
+# 到期重取的线程池（pipeline 模式由 pipeline.py 注入，只问 vidlink）。None = 单独跑下载，
+# DispatchScreen 退回"到点照常派发、启动预检换链接"的旧行为。
+due_refetch_hook = None
 # 【仅 pipeline.py】轮末投出异步重取后，等待结果回来的上限（秒）。
 # 投完必须等一等再判"还有没有集要重投"——否则会认为没有、直接收尾，
 # 重取成功的新链接就没有任何轮次去消费它。期间每秒收一次，在途清零即提前
@@ -436,6 +439,23 @@ SIGNED_LINK_MAX_AGE_SECONDS = {
     for host, hours in (_LINK_HEALTH_RAW.get("signed_link_max_age_hours") or {}).items()
     if str(host).strip() and float(hours) > 0
 }
+# 到期重取（2026-11-01，见 DispatchScreen）：只剩 vidlink 坏链接的集到缓存刷新时刻自动只问 vidlink
+# 重取，新链接当次运行就下。没有这条路时，到点的集只能靠启动预检（每次启动每台 500 集）换链接，
+# 其余拿旧链接去下必然失败（bcdnxw 的 429 不带需重取标记），全舰队 5.7 万集会永远卡住。
+_DUE_REFETCH_CFG = _LINK_HEALTH_RAW.get("due_refetch") or {}
+DUE_REFETCH_ENABLED = bool(_DUE_REFETCH_CFG.get("enabled", True))
+DUE_REFETCH_WORKERS = max(1, int(_DUE_REFETCH_CFG.get("workers", 16)))
+DUE_REFETCH_PER_MINUTE = max(1.0, float(_DUE_REFETCH_CFG.get("max_per_minute", 60)))
+DUE_REFETCH_MAX_PER_EPISODE = max(1, int(_DUE_REFETCH_CFG.get("max_per_episode", 4)))
+DUE_REFETCH_RETRY_SECONDS = max(60.0, float(_DUE_REFETCH_CFG.get("retry_minutes", 360)) * 60)
+DUE_REFETCH_MAX_WAIT_SECONDS = max(0.0, float(_DUE_REFETCH_CFG.get("max_wait_hours", 60)) * 3600)
+# 假链接主机（2026-11-01）：这些主机上没验证过的节点一律不算节点。取流时会逐条验证（见
+# tv_ids_to_links._drop_fake_links），验证过的带 link_checked；存量行没验证过，读入时去掉。
+FAKE_LINK_HOSTS = tuple(
+    str(host).strip().lower()
+    for host in (_LINK_HEALTH_RAW.get("fake_link_hosts") or [])
+    if str(host).strip()
+)
 # 签名过期时播放列表回 500 的主机：链接满这么久（秒）后的 500 按过期处理（见 _playlist_500_as_expired）。
 PLAYLIST_500_EXPIRED_AFTER_SECONDS = {
     str(host).strip().lower(): float(minutes) * 60
@@ -5888,6 +5908,30 @@ def _entry_nodes(entry):
     ]
 
 
+def _is_fake_node(item):
+    """没验证过的假链接节点（主机在 FAKE_LINK_HOSTS 且没有 link_checked）。"""
+    if not isinstance(item, dict) or item.get("link_checked"):
+        return False
+    host = _host_of(item.get("url"))
+    return any(host == fake or host.endswith("." + fake) for fake in FAKE_LINK_HOSTS)
+
+
+def drop_fake_nodes(entry):
+    """去掉 results.jsonl 存量行里没验证过的假链接节点。返回 (条目, 去掉了几个节点)。
+
+    workers.dev 全舰队 15,371 集带这种节点、27,100 集成品没有一集来自它，新旧链接换请求头和
+    指纹也全是 404（2026-11-01）。留着不但白试一次，还会让只剩 vidlink 坏链接的集躲过
+    vidlink_refresh_due。一个节点都不剩的集由取流侧重新判定（_load_ok_keys 不算它已处理）。
+    """
+    raw = entry.get("urls") or []
+    kept = [item for item in raw if not _is_fake_node(item)]
+    if len(kept) == len(raw):
+        return entry, 0
+    stripped = dict(entry)
+    stripped["urls"] = kept
+    return stripped, len(raw) - len(kept)
+
+
 def strip_rejected_nodes(entry):
     """去掉这一集已检出硬字幕/水印的版本。返回 (条目, 去掉了几个节点)。
 
@@ -6547,10 +6591,12 @@ def _select_stale_entries(entries, label="启动预检"):
 
     # ⓪ 只剩 vidlink 坏链接、缓存还没刷新的集不重取：vidlink 按集缓存链接，刷新前重取
     #    只会拿回同一条死链接，白烧配额（电影侧 3120958 口径）。到点后的运行照常重取。
+    #    装了到期重取时到点的集也不在这里占名额：DispatchScreen 会只问 vidlink 重取它们。
     before = len(stale)
     stale = [
         entry for entry in stale
-        if not ((due := vidlink_refresh_due(entry, now)) and due[0] > now)
+        if not ((due := vidlink_refresh_due(entry, now))
+                and (due_refetch_hook is not None or due[0] > now))
     ]
     if len(stale) < before:
         print(
@@ -6794,6 +6840,10 @@ class DispatchScreen:
     2. **vidlink 缓存刷新前不派**：只剩 vidlink 坏链接的集（见 vidlink_refresh_due），
        缓存刷新时刻没到就不派——下载必然失败、重取又只会拿回同一条。记一笔可重试的失败
        （不带"需重新取流"标记，免得重取闭环白跑），下次运行到点后照常处理。
+       pipeline 模式（装了 due_refetch_hook）：不丢给下次运行，挂到刷新时刻，到点只问 vidlink
+       重取，新链接从来源回来再过一遍闸门。还是坏链接就按新的刷新时刻再挂（链接没变则隔
+       DUE_REFETCH_RETRY_SECONDS 再问），每集每次运行最多 DUE_REFETCH_MAX_PER_EPISODE 次。
+       来源报 done 后最多再等 DUE_REFETCH_MAX_WAIT_SECONDS，剩下的留给下次运行。
 
     3. **按主机限集数**（HOST_LIMITS 的 max_episodes，2026-10-30）：第一个节点在限流主机上的集，
        这台主机在下的集数满了就排队（FIFO），不占下载槽位；别的集照常派。主循环在每集下载
@@ -6823,9 +6873,19 @@ class DispatchScreen:
         self._parked_total = 0
         self._lane_busy = Counter()  # 主机、(主机, 路径前缀或 None) -> 在下的集数
         self._lane_of = {}           # id(条目) -> 占着名额的 (主机, 路径前缀或 None)（release 时按它还）
+        self._due = []               # (到点时刻（墙钟）, 序号, 条目)：等 vidlink 缓存刷新的集
+        self._due_counts = {}        # 集 key -> 本次运行已重取几次
+        self._due_last = {}          # 集 key -> 上次投递重取的时刻（墙钟）
+        self._due_noted = set()      # 本次运行已记过失败行的集，只记一次
+        self._due_deadline = None    # 来源取空后最多等到这个时刻
+        self._due_burst = float(DUE_REFETCH_WORKERS * 2)
+        self._due_tokens = self._due_burst
+        self._due_refilled = self._clock()
         self.held = 0
         self.skipped = 0
         self.parked = 0
+        self.due_sent = 0
+        self.due_gave_up = 0
 
     def set_source(self, source):
         self._source = source
@@ -6833,6 +6893,7 @@ class DispatchScreen:
     def poll(self):
         while True:
             now = self._clock()
+            self._pump_due()
             entry = self._unpark()
             if entry is not None:
                 pass
@@ -6843,8 +6904,10 @@ class DispatchScreen:
                 return "wait", None
             else:
                 state, entry = self._source.poll()
-                if state == "done" and (self._cooling or self._parked_total):
-                    return "wait", None
+                if state == "done":
+                    self._pump_due()    # 来源报 done 时重取已全部回来，失败的这里才归位
+                    if self._cooling or self._parked_total or self._waiting_for_due():
+                        return "wait", None
                 if state != "item":
                     return state, entry
             if self._skip_if_vidlink_not_refreshed(entry):
@@ -6919,13 +6982,87 @@ class DispatchScreen:
 
     def _skip_if_vidlink_not_refreshed(self, entry):
         verdict = vidlink_refresh_due(entry, self._wall())
-        if verdict is None or verdict[0] <= self._wall():
+        if verdict is None:
             return False
         due, reason = verdict
+        if due_refetch_hook is not None:
+            return self._hold_for_refresh(entry, due, reason)
+        if due <= self._wall():
+            return False
         when = time.strftime("%m-%d %H:%M", time.gmtime(due))
         self.skipped += 1
         self._on_skip(entry, f"{reason}；vidlink 缓存预计 {when} UTC 刷新，本轮等不到，本次不下载")
         return True
+
+    def _hold_for_refresh(self, entry, due, reason):
+        key = record_episode_key(entry)
+        used = self._due_counts.get(key, 0)
+        if used >= DUE_REFETCH_MAX_PER_EPISODE:
+            self.due_gave_up += 1
+            self._on_skip(entry, f"{reason}；本次运行已重取 {used} 次仍只有坏链接，下次运行再试")
+            return True
+        # 重取回来链接没变（刷新时刻没往后挪）：隔一段时间再问，不原地空转。
+        last = self._due_last.get(key)
+        self._push_due(max(due, last + DUE_REFETCH_RETRY_SECONDS) if last is not None else due, entry)
+        if key not in self._due_noted:
+            self._due_noted.add(key)
+            self.skipped += 1
+            when = time.strftime("%m-%d %H:%M", time.gmtime(due))
+            self._on_skip(entry, f"{reason}；vidlink 缓存预计 {when} UTC 刷新，到点自动重取，本次不下载")
+        return True
+
+    def _push_due(self, at, entry):
+        self._seq += 1
+        heapq.heappush(self._due, (at, self._seq, entry))
+
+    def _pump_due(self):
+        """收回重取失败的集，把到点的集限速投给 due_refetch_hook。绝不阻塞。"""
+        hook = due_refetch_hook
+        if hook is None:
+            return
+        wall = self._wall()
+        for entry in hook.collect_missed():
+            key = record_episode_key(entry)
+            if self._due_counts.get(key, 0) >= DUE_REFETCH_MAX_PER_EPISODE:
+                self.due_gave_up += 1
+                self._on_skip(entry, "vidlink 到期重取次数用完仍没换到链接，下次运行再试")
+            else:
+                self._push_due(wall + DUE_REFETCH_RETRY_SECONDS, entry)
+        if not self._due or self._due[0][0] > wall:
+            return
+        now = self._clock()
+        self._due_tokens = min(self._due_burst, self._due_tokens
+                               + (now - self._due_refilled) * DUE_REFETCH_PER_MINUTE / 60)
+        self._due_refilled = now
+        while (self._due and self._due[0][0] <= wall and self._due_tokens >= 1
+               and hook.pending_count() < DUE_REFETCH_WORKERS * 2):
+            _at, _seq, entry = heapq.heappop(self._due)
+            if not hook.dispatch([entry]):
+                continue    # 取流侧已终止：这一集留给下次运行
+            key = record_episode_key(entry)
+            self._due_tokens -= 1
+            self._due_counts[key] = self._due_counts.get(key, 0) + 1
+            self._due_last[key] = wall
+            self.due_sent += 1
+            if self.due_sent == 1 or self.due_sent % 500 == 0:
+                print(f"  [到期重取] 累计投递 {self.due_sent} 次，还有 {len(self._due)} 集在等"
+                      f"（只问 vidlink，每分钟最多 {DUE_REFETCH_PER_MINUTE:g} 集）", flush=True)
+
+    def _waiting_for_due(self):
+        """来源取空后是否还要等到期重取。等够 DUE_REFETCH_MAX_WAIT_SECONDS 就放手。"""
+        if not self._due:
+            return False
+        wall = self._wall()
+        if self._due_deadline is None:
+            self._due_deadline = wall + DUE_REFETCH_MAX_WAIT_SECONDS
+            print(f"[到期重取] 其余的集都处理完了，还有 {len(self._due)} 集在等 vidlink 缓存刷新，"
+                  f"最多再等 {DUE_REFETCH_MAX_WAIT_SECONDS / 3600:g} 小时", flush=True)
+        if wall < self._due_deadline:
+            return True
+        print(f"[到期重取] 等够了，剩下 {len(self._due)} 集留给下次运行", flush=True)
+        self.due_gave_up += len(self._due)
+        self._due.clear()
+        return False
 
     def _hold_if_host_tripped(self, entry, now):
         if HOST_CIRCUIT_HOLD_MAX_PER_EPISODE <= 0:
@@ -7405,6 +7542,7 @@ def _run_pipeline():
     duplicate_input_count = 0
     invalid_input_count = 0
     skipped_processed_count = 0
+    fake_only_count = 0
     input_lines = []
     if os.path.exists(INPUT_JSONL):
         with open(INPUT_JSONL, "r", encoding="utf-8") as file:
@@ -7432,6 +7570,11 @@ def _run_pipeline():
             # 全量重跑时 success.jsonl 已有数万条，这里能省下等量的空转。
             skipped_processed_count += 1
             continue
+        entry, fake_removed = drop_fake_nodes(entry)
+        if fake_removed and not entry["urls"]:
+            # 这一行只有假链接，不当它取到过链接（同集更早的真链接行不被它顶掉）。
+            fake_only_count += 1
+            continue
         previous = by_key.get(normalized_id)
         if previous is not None:
             duplicate_input_count += 1
@@ -7454,6 +7597,7 @@ def _run_pipeline():
         f"跳过 {skipped_processed_count} 个已处理集、"
         f"{duplicate_input_count} 个重复集（同集取 fetched_at 最新的一条）、"
         f"{invalid_input_count} 个缺少身份字段的条目"
+        + (f"、{fake_only_count} 行只有假链接（交给取流侧重新判定）" if fake_only_count else "")
     )
 
     ignored_errors = {
@@ -8336,6 +8480,9 @@ def _run_pipeline():
                 host_summary,
                 f"因主机集数上限排队 {dispatch_screen.parked} 集次" if dispatch_screen.parked else "",
             ) if x))
+        if dispatch_screen.due_sent or dispatch_screen.due_gave_up:
+            print(f"到期重取：投递 {dispatch_screen.due_sent} 次，"
+                  f"{dispatch_screen.due_gave_up} 集次留给下次运行。")
 
         # 硬字幕/水印比例：每集都检测（完整台账见 scan_log）。
         if overlay_stats["checked"]:

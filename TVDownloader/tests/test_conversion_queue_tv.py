@@ -163,6 +163,86 @@ def test_run_drops_resumable_ts_of_episode_that_already_has_a_verdict(tmp_path, 
     assert d.load_resumable_conversions() == []
 
 
+# ------------------------------------------------------------ 假链接与到期重取（端到端）
+
+def test_run_drops_fake_nodes_and_skips_fake_only_rows(tmp_path, monkeypatch, capsys):
+    fake = "https://a.b.workers.dev/video.m3u8?q=1"
+    fresh = int(time.time())
+    monkeypatch.setattr(d, "FAKE_LINK_HOSTS", ("workers.dev",))
+    entries = [
+        {"tmdbId": "95", "season": 1, "episode": 1, "title": "x",
+         "urls": [{"url": fake, "provider": "vidup", "type": "m3u8"}, hls("95", 1)]},
+        {"tmdbId": "95", "season": 1, "episode": 2, "title": "x",
+         "urls": [{"url": fake, "provider": "vidup", "type": "m3u8"}]},
+        # 同集：较新的一行只有假链接，不能顶掉较早的真链接
+        {"tmdbId": "95", "season": 1, "episode": 3, "title": "x", "fetched_at": fresh, "urls": [hls("95", 3)]},
+        {"tmdbId": "95", "season": 1, "episode": 3, "title": "x", "fetched_at": fresh + 1,
+         "urls": [{"url": fake, "provider": "vidup", "type": "m3u8"}]},
+    ]
+    downloaded, _uploads = _pipeline_env(tmp_path, monkeypatch, entries, lambda url: ())
+    monkeypatch.setattr(d, "detect_overlays", lambda p: (_scan(), []))
+
+    d._run_pipeline()
+
+    assert sorted(key for key, _ in downloaded) == ["95_S01E01", "95_S01E03"]
+    assert all("workers.dev" not in url for _, url in downloaded)
+    assert "2 行只有假链接" in capsys.readouterr().out
+
+
+def test_run_refetches_due_episode_with_vidlink_and_downloads_new_link(tmp_path, monkeypatch):
+    """🔴 端到端：bcdnxw 的集过了刷新点，当次运行只问 vidlink 换链接，再用新链接下载。"""
+    import queue
+
+    import pipeline as p
+
+    signed = int(time.time()) - 50 * 3600
+    bad = {"url": f"https://bcdnxw.hakunaymatata.com/r/a.mp4?sign=x&t={signed}", "provider": "vidlink", "type": "mp4"}
+    good = {"url": f"https://hcdn3.hakunaymatata.com/r/a.mp4?sign=y&t={int(time.time())}",
+            "provider": "vidlink", "type": "mp4"}
+    entries = [{"tmdbId": "96", "season": 1, "episode": 1, "title": "x", "urls": [bad]},
+               {"tmdbId": "96", "season": 1, "episode": 2, "title": "x", "urls": [bad]}]
+    downloaded, uploads = _pipeline_env(tmp_path, monkeypatch, entries, lambda url: ())
+    monkeypatch.setattr(d, "detect_overlays", lambda p_: (_scan(), []))
+    monkeypatch.setattr(d, "BROKEN_VIDLINK_HOSTS", {"bcdnxw.hakunaymatata.com"})
+    monkeypatch.setattr(d, "VIDLINK_CACHE_ROLL_SECONDS", 49 * 3600)
+    monkeypatch.setattr(d, "DUE_REFETCH_RETRY_SECONDS", 3600.0)
+    monkeypatch.setattr(d, "DUE_REFETCH_MAX_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(d, "STREAM_IDLE_POLL_SECONDS", 0.01)
+
+    asked = []
+
+    class Fetcher:
+        append_result = staticmethod(lambda path, result: None)
+
+        @staticmethod
+        def process_episode(tid, season, episode, providers=None, stop_event=None):
+            asked.append((episode, providers))
+            if episode == 1:
+                return "ok", {"tmdbId": tid, "season": season, "episode": episode,
+                              "urls": [good], "fetched_at": int(time.time())}
+            return "dead", None
+
+    monkeypatch.setattr(p, "fetcher", Fetcher)
+    stop = threading.Event()
+    pool = p.AsyncRefetcher(2, stop, providers=["vidlink"], report_misses=True)
+    pool.start()
+    monkeypatch.setattr(d, "due_refetch_hook", pool)
+    q = queue.Queue()
+    q.put(p._SENTINEL)
+    monkeypatch.setattr(d, "ListEntrySource", lambda items: p.QueueEntrySource(
+        q, backlog=items, refetcher=p._RefetchPools(pool),
+        is_busy=lambda key: key in d.processing_ids))
+
+    try:
+        d._run_pipeline()
+    finally:
+        stop.set()
+
+    assert sorted(asked) == [(1, ["vidlink"]), (2, ["vidlink"])], "只问 vidlink"
+    assert downloaded == [("96_S01E01", good["url"])], "没换到链接的集不拿死链接去下"
+    assert "96_S01E01" in uploads and "96_S01E02" not in uploads
+
+
 # ------------------------------------------------------------ 队列封顶
 
 def test_downloads_pause_while_conversion_queue_is_full_and_everything_still_finishes(

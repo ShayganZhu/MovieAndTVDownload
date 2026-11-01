@@ -524,6 +524,44 @@ def test_async_refetcher_revives_and_persists(monkeypatch, tmp_path):
     assert out.exists() and "new" in out.read_text(encoding="utf-8")
 
 
+def test_async_refetcher_reports_misses_only_when_asked(monkeypatch, tmp_path):
+    """到期重取要把没换到链接的集要回来再排期；普通重取照旧丢弃，不攒着。"""
+    monkeypatch.setattr(p, "fetcher", _FakeFetcher({"7_S01E03": _ok_result("7", 1, 3)}))
+    monkeypatch.setattr(p.downloader, "INPUT_JSONL", str(tmp_path / "results.jsonl"))
+    stop = threading.Event()
+    due = p.AsyncRefetcher(1, stop, report_misses=True)
+    plain = p.AsyncRefetcher(1, stop)
+    due.start()
+    plain.start()
+    try:
+        assert due.dispatch([_ep("7", 1, 3), _ep("7", 1, 4)]) == 2
+        assert plain.dispatch([_ep("7", 1, 5)]) == 1
+        assert _drain(due) and _drain(plain)
+        missed = due.collect_missed()
+        assert [e["episode"] for e in missed] == [4]
+        assert due.collect_missed() == [], "取走就没了"
+        assert [e["episode"] for e in due.collect()] == [3]
+        assert plain.collect_missed() == []
+    finally:
+        stop.set()
+
+
+def test_refetch_pools_merge_results_and_pending():
+    class Pool:
+        def __init__(self, items, pending):
+            self.items, self.pending = items, pending
+
+        def collect(self):
+            return self.items
+
+        def pending_count(self):
+            return self.pending
+
+    pools = p._RefetchPools(Pool([1], 2), Pool([2, 3], 1))
+    assert pools.collect() == [1, 2, 3]
+    assert pools.pending_count() == 3
+
+
 def test_async_refetcher_persists_via_fetcher_append_result(monkeypatch, tmp_path):
     """🔴 A3：重取落盘必须走 fetcher.append_result（与 run_batch 共用同一把锁），
     绝不能走 downloader.write_log（另一把锁）——两路写手不串行会交错出半行 JSON。"""

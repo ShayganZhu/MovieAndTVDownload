@@ -64,6 +64,25 @@ def _reasons(tmp_path, **kw):
     return summary, {row.get("key") or row["tmdbId"]: row["reason"] for row in rows}
 
 
+def test_fake_only_rows_do_not_count_as_having_links(box):
+    """只有假链接的行不算取到过链接（取流侧会重新判定）；验证过的、带真节点的都算。"""
+    fake = {"url": "https://a.b.workers.dev/video.m3u8?q=1", "provider": "vidup"}
+    _write_jsonl(box / "results.jsonl", [
+        {"tmdbId": "1", "season": 1, "episode": 5, "urls": [fake]},
+        {"tmdbId": "1", "season": 1, "episode": 6, "urls": [fake, {"url": "https://bcdn.x.com/a.mp4"}]},
+        {"tmdbId": "1", "season": 1, "episode": 7, "urls": [{**fake, "link_checked": True}]},
+        {"tmdbId": "1", "season": 1, "episode": 8, "urls": [fake]},
+    ])
+    config = {"download_tv": {"link_health": {"fake_link_hosts": ["workers.dev"]}}}
+    report = box / "report.jsonl"
+    r.run(box, report="report.jsonl", today=date(2026, 10, 30), config=config)
+    reasons = {row.get("key"): row["reason"] for row in map(json.loads, report.read_text(encoding="utf-8").splitlines())}
+    assert reasons["1_S01E05"] == "not_fetched"
+    assert reasons["1_S01E06"] == "download_failed"
+    assert reasons["1_S01E07"] == "links_not_downloaded"
+    assert reasons["1_S01E08"] == "fetch_unresolved", "fail.txt 里的状态照常生效"
+
+
 def test_episodes_are_classified_and_shows_with_open_episodes_are_listed(box):
     summary, reasons = _reasons(box)
     assert reasons == {

@@ -577,6 +577,98 @@ def _urls(result):
     return [u["url"] for u in result["urls"]]
 
 
+# ------------------------------------------------------------ 假链接过滤
+
+FAKE_URL = "https://a.b.workers.dev/video.m3u8?q=1"
+
+
+class _LinkResp:
+    def __init__(self, status=404, text="未找到 1"):
+        self.status_code = status
+        self.text = text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+@pytest.fixture
+def fake_links(monkeypatch):
+    monkeypatch.setattr(m, "FAKE_LINK_HOSTS", ("workers.dev",))
+    asked = []
+
+    def install(resp):
+        def get(url, headers=None, timeout=None, stream=None):
+            asked.append(url)
+            if isinstance(resp, Exception):
+                raise resp
+            return resp
+        monkeypatch.setattr(m.std_requests, "get", get)
+    install(_LinkResp())
+    return install, asked
+
+
+def test_shipped_fake_link_hosts_are_shared_with_the_downloader():
+    assert m._load_fake_link_hosts() == ("workers.dev",)
+
+
+def test_drop_fake_links_only_trusts_an_explicit_not_found(fake_links):
+    install, asked = fake_links
+    real = m._url_entry("https://bcdn.x.com/a.mp4", "vidlink", "mp4")
+    node = m._url_entry(FAKE_URL, "vidup", "m3u8")
+    assert m._drop_fake_links([node, real], "vidup.to", "x") == ([real], 1)
+    assert asked == [FAKE_URL], "别的主机不验证"
+
+    for resp in (_LinkResp(200, "#EXTM3U"), _LinkResp(404, "nope"), _LinkResp(500, "未找到"), TimeoutError("x")):
+        install(resp)
+        kept, dropped = m._drop_fake_links([node], "vidup.to", "x")
+        assert dropped == 0 and kept[0]["link_checked"] is True, "没明确说无此片就留着，判死必须保守"
+    assert "link_checked" not in node, "不改原节点"
+
+
+def test_fetch_gives_real_nodes_when_only_some_links_are_fake(monkeypatch, fake_links):
+    _install_fake_session(monkeypatch, PAGE, [{"url": FAKE_URL}, {"url": "https://sun.finalsignal.top/x.m3u8"}],
+                          servers=[{"name": "a", "data": "d0"}, {"name": "b", "data": "d1"}])
+    status, result = m.process_episode(1, 1, 1, providers=["vidup"])
+    assert status == "ok" and _urls(result) == ["https://sun.finalsignal.top/x.m3u8"]
+
+
+def test_episode_with_only_fake_links_is_no_source(monkeypatch, fake_links):
+    """🔴 server 全是 404 或假链接：等同无源。否则这些集永远算"有链接"、永远下载失败。"""
+    monkeypatch.setattr(m, "DEAD_CONFIRM", False)
+    _install_fake_session(monkeypatch, PAGE, [{"url": FAKE_URL}],
+                          servers=[{"name": "a", "data": "d0"}, {"name": "b", "data": "d1"}],
+                          stream_status={"d1": 404})
+    status, result = m.process_episode(1, 1, 1, providers=["vidup"])
+    assert status == "dead" and result is None
+
+
+def test_fake_links_with_a_failing_server_are_not_no_source(monkeypatch, fake_links):
+    """还有 server 出错（不是 404）：下不了无源的结论，按瞬时重试。"""
+    monkeypatch.setattr(m, "DEAD_CONFIRM", False)
+    monkeypatch.setattr(m, "MAX_RETRIES", 1)
+    _install_fake_session(monkeypatch, PAGE, [{"url": FAKE_URL}],
+                          servers=[{"name": "a", "data": "d0"}, {"name": "b", "data": "d1"}],
+                          stream_status={"d1": 500})
+    status, _result = m.process_episode(1, 1, 1, providers=["vidup"])
+    assert status == "retry"
+
+
+def test_fake_only_rows_are_not_processed_so_they_get_fetched_again(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "FAKE_LINK_HOSTS", ("workers.dev",))
+    results = tmp_path / "results.jsonl"
+    rows = [
+        {"tmdbId": "1", "season": 1, "episode": 1, "urls": [{"url": FAKE_URL}]},
+        {"tmdbId": "1", "season": 1, "episode": 2, "urls": [{"url": FAKE_URL}, {"url": "https://bcdn.x.com/a.mp4"}]},
+        {"tmdbId": "1", "season": 1, "episode": 3, "urls": [{"url": FAKE_URL, "link_checked": True}]},
+        {"tmdbId": "1", "season": 1, "episode": 4, "urls": ["https://old.example/plain.m3u8"]},
+    ]
+    results.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    assert m._load_ok_keys(results) == {("1", 1, 2), ("1", 1, 3), ("1", 1, 4)}
+
+
 PAGE = 'window.x = "{\\"en\\":\\"ENC\\"}"'
 
 

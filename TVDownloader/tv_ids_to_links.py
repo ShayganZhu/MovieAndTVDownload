@@ -72,6 +72,20 @@ _CFG = load_config()
 _PROXY_CFG = _CFG.get("proxy", {}) or {}
 
 
+def _load_fake_link_hosts():
+    """假链接主机（download_tv.link_health.fake_link_hosts，取流与下载共用一份配置）。"""
+    cfg_path = Path(__file__).with_name("config.yaml")
+    if not cfg_path.exists():
+        return ()
+    with open(cfg_path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    health = (data.get("download_tv") or {}).get("link_health") or {}
+    return tuple(str(h).strip().lower() for h in (health.get("fake_link_hosts") or []) if str(h).strip())
+
+
+FAKE_LINK_HOSTS = _load_fake_link_hosts()
+
+
 def _secret(cfg_key, env_key, source=None):
     """敏感项：优先环境变量（同目录 .env），缺省回退 config.yaml（便于本地调试）。"""
     env_val = os.environ.get(env_key, "").strip()
@@ -1073,6 +1087,45 @@ def _parse_captions(items, where="", headers=None):
     return result
 
 
+FAKE_LINK_BODY = "未找到"
+
+
+def _is_fake_node(item):
+    """没验证过的假链接节点（主机在 FAKE_LINK_HOSTS 且没有 link_checked）。"""
+    if not isinstance(item, dict) or item.get("link_checked"):
+        return False
+    host = (urlsplit(str(item.get("url") or "")).hostname or "").lower()
+    return any(host == fake or host.endswith("." + fake) for fake in FAKE_LINK_HOSTS)
+
+
+def _link_says_not_found(url, site):
+    """请求一次假链接主机上的链接：明确回 404 + "未找到" 才算假，其余一律留着（判死必须保守）。"""
+    try:
+        with std_requests.get(url, headers={"User-Agent": UA, "Referer": f"https://{site}/"},
+                              timeout=TIMEOUT, stream=True) as resp:
+            return resp.status_code == 404 and FAKE_LINK_BODY in resp.text
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _drop_fake_links(urls, site, label):
+    """验证假链接主机上的节点（2026-11-01）：404 的丢掉，其余标 link_checked 留着。返回 (留下的, 丢了几个)。
+
+    vidup / vidfast 对一批没片的集也给 workers.dev 链接，新旧链接换请求头和指纹全是 404
+    "未找到 1"。不拦的话这些集算"有链接"，永远下载失败、也进不了无源台账。
+    每条验证一次而不是按主机直接丢：万一它哪天真能用了，不会悄悄漏掉一个源。
+    """
+    kept = []
+    for item in urls:
+        if not _is_fake_node(item):
+            kept.append(item)
+        elif _link_says_not_found(item["url"], site):
+            print(f"  [假链接] {label}: {item.get('provider')} 的 {urlsplit(item['url']).hostname} 回 404，已丢弃")
+        else:
+            kept.append({**item, "link_checked": True})
+    return kept, len(urls) - len(kept)
+
+
 def _fetch_vidup_like(session, site, api_name, tid, season, episode):
     """vidup.to / vidfast.vc 同构链路：
     页面正则 → enc-{api}(stage1) → stage1 POST → enc-{api}(stage2) → servers POST →
@@ -1173,6 +1226,7 @@ def _fetch_vidup_like(session, site, api_name, tid, season, episode):
     result_title = None
     result_captions = []
     stream_404 = 0
+    answered = 0
     for server, (stream_decrypted, error) in zip(servers_decrypted, answers):
         server_name = server.get('name', 'unknown') if isinstance(server, dict) else 'unknown'
         try:
@@ -1185,6 +1239,7 @@ def _fetch_vidup_like(session, site, api_name, tid, season, episode):
             r_tid = stream_decrypted.get("tmdbId")
             if r_tid is not None and str(r_tid) != str(tid):
                 print(f"  [warn] {label} {api_name} server '{server_name}' 返回 tmdbId={r_tid}，与入参不一致，key 仍用入参")
+            answered += 1
             if all(u["url"] != url for u in urls):
                 urls.append(_url_entry(url, api_name, "m3u8"))
             if result_title is None:
@@ -1210,10 +1265,14 @@ def _fetch_vidup_like(session, site, api_name, tid, season, episode):
             print(f"  {api_name} server '{server_name}' failed for {label}: {e}")
             continue
 
+    urls, faked = _drop_fake_links(urls, site, label)
     if urls:
         return urls, result_title, result_captions
     if stream_404 == len(servers_decrypted):
         raise NoSource(f"all {stream_404} {api_name} servers returned 404 for {label}")
+    # 给了链接的 server 全是假链接：等同这些 server 无此集。还有 server 出错就不能下结论。
+    if faked and stream_404 + answered == len(servers_decrypted):
+        raise NoSource(f"{api_name}: {stream_404} servers returned 404, {answered} gave fake links for {label}")
     raise Exception(f"All {api_name} servers failed for {label}. Last error: {last_server_error}")
 
 
@@ -1587,7 +1646,10 @@ def process_episode(tid, season, episode, providers=None, stop_event=None):
 
 
 def _load_ok_keys(results_file):
-    """results.jsonl 中已成功的 (tid, season, episode) 集合。"""
+    """results.jsonl 中已成功的 (tid, season, episode) 集合。
+
+    只有假链接的行不算成功：这些集会被重新取流，有真链接就下，没有就进 fail.txt。
+    """
     ok = set()
     if results_file.exists():
         with open(results_file, 'r', encoding='utf-8') as f:
@@ -1598,6 +1660,9 @@ def _load_ok_keys(results_file):
                 try:
                     obj = json.loads(line)
                     tid, s, e = obj.get('tmdbId'), obj.get('season'), obj.get('episode')
+                    urls = obj.get('urls')
+                    if urls and all(_is_fake_node(u) for u in urls):
+                        continue
                     if tid is not None and s is not None and e is not None:
                         ok.add((str(tid), int(s), int(e)))
                 except Exception:
