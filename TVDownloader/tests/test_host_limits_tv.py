@@ -154,12 +154,39 @@ def test_shipped_host_limits():
                               encoding="utf-8"))["download_tv"]
     assert cfg["host_limits"] == {"finalsignal.top": {"max_episodes": 16, "direct_connections": 200,
                                                       "proxy_connections": 600, "proxy": "residential",
-                                                      "path_max_episodes": {"/fine/": 8}}}
+                                                      "path_max_episodes": {"/fine/": 8}},
+                                  "armadilloscp.workers.dev": {"direct_connections": 200}}
     assert d._parse_host_limits(cfg["host_limits"])["finalsignal.top"]["path_max_episodes"] == {"/fine/": 8}
     # 集数上限必须给别的主机留出槽位，否则 finalsignal 的慢集占满全部槽位、vidlink 排不上。
     assert cfg["max_workers"] - cfg["host_limits"]["finalsignal.top"]["max_episodes"] >= 16
     assert cfg["download_queue_depth"] > cfg["max_workers"]
     assert cfg["max_parked_episodes"] == 20000
+
+
+def test_orion_cap_only_limits_connections():
+    """belfast 只限连接数：超出的请求等名额、绝不走代理，也不把集挡在派发闸门外（否则回扫没有反压）。"""
+    orion = d._parse_host_limits({"armadilloscp.workers.dev": {"direct_connections": 1}})
+    conns = d.HostConnections(limits=orion, proxy_url=lambda spec: pytest.fail("不该走代理"))
+    got_second = threading.Event()
+
+    def second():
+        with conns.connection("https://other.armadilloscp.workers.dev/b.ts") as proxies:
+            assert proxies is None
+            got_second.set()
+
+    with conns.connection("https://belfast.armadilloscp.workers.dev/a.ts") as proxies:
+        assert proxies is None
+        thread = threading.Thread(target=second)
+        thread.start()
+        assert not got_second.wait(0.2), "子域共用名额，满了要等"
+    assert got_second.wait(5)
+    thread.join(5)
+
+    src = Src([ep(i, 1, [{"url": f"https://belfast.armadilloscp.workers.dev/{i}/master.m3u8",
+                          "provider": "vidrock", "type": "m3u8"}]) for i in range(3)])
+    screen = d.DispatchScreen(limits=orion)
+    screen.set_source(src)
+    assert [screen.poll()[0] for _ in range(3)] == ["item"] * 3, "不设 max_episodes 就不排队"
 
 
 # ------------------------------------------------------------ 键写父域：换子域名不会绕过限流（2026-10-31）
