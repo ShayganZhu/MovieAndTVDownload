@@ -8,6 +8,7 @@
     按剧去重会让一部剧只下得了一集。
 """
 
+import json
 import queue
 import threading
 import time
@@ -544,6 +545,89 @@ def test_async_refetcher_reports_misses_only_when_asked(monkeypatch, tmp_path):
         assert plain.collect_missed() == []
     finally:
         stop.set()
+
+
+def test_provider_refetch_keeps_nodes_of_providers_it_did_not_ask(monkeypatch, tmp_path):
+    """🔴 只问 vidrock 时新结果会覆盖 results.jsonl 这一行：别的源的节点不能被冲掉，旧 vidrock 节点要换掉。"""
+    fresh = {"url": "https://belfast/new.m3u8", "provider": "vidrock"}
+    stale = {"url": "https://belfast/old.m3u8", "provider": "vidrock"}
+    other = {"url": "https://cdn/ep.mp4", "provider": "vidlink"}
+    sink = []
+    monkeypatch.setattr(p, "fetcher", _FakeFetcher({"7_S01E03": _ok_result("7", 1, 3, urls=(fresh,))},
+                                                   providers_sink=sink))
+    out = tmp_path / "results.jsonl"
+    monkeypatch.setattr(p.downloader, "INPUT_JSONL", str(out))
+    stop = threading.Event()
+    r = p.AsyncRefetcher(1, stop, providers=["vidrock"], keep_other_nodes=True)
+    r.start()
+    try:
+        r.dispatch([{**_ep("7", 1, 3), "urls": [stale, other]}])
+        assert _drain(r)
+        got = r.collect()
+    finally:
+        stop.set()
+    assert sink == [["vidrock"]]
+    assert got[0]["urls"] == [fresh, other]
+    assert json.loads(out.read_text(encoding="utf-8"))["urls"] == [fresh, other], "下次运行读到的也要是合并后的"
+
+
+def test_provider_refetch_miss_falls_back_to_all_source_refetch(monkeypatch, tmp_path):
+    """单源没换到（接口时有时无、别的源可能有）：交给全源重取，新链接照常收回来。"""
+    class Flaky(_FakeFetcher):
+        def process_episode(self, tid, season, episode, providers=None, stop_event=None):
+            self.providers_sink.append(providers)
+            return ("dead", None) if providers == ["vidrock"] else _ok_result("7", 1, 3)
+
+    sink = []
+    monkeypatch.setattr(p, "fetcher", Flaky(providers_sink=sink))
+    monkeypatch.setattr(p.downloader, "INPUT_JSONL", str(tmp_path / "results.jsonl"))
+    stop = threading.Event()
+    full = p.AsyncRefetcher(1, stop)
+    only = p.AsyncRefetcher(1, stop, providers=["vidrock"], keep_other_nodes=True, fallback=full)
+    pools = p._RefetchPools(full, only)
+    full.start()
+    only.start()
+    try:
+        only.dispatch([_ep("7", 1, 3)])
+        assert _wait_until(lambda: pools.pending_count() == 0)
+        got = pools.collect()
+    finally:
+        stop.set()
+    assert sink == [["vidrock"], None]
+    assert [e["urls"] for e in got] == [["new"]]
+    assert (full.dispatched, full.revived, only.revived) == (1, 1, 0)
+
+
+def test_provider_refetch_miss_is_not_forwarded_after_stop(monkeypatch):
+    monkeypatch.setattr(p, "fetcher", _FakeFetcher())
+    stop = threading.Event()
+    full = p.AsyncRefetcher(1, stop)
+    only = p.AsyncRefetcher(1, stop, fallback=full)
+    stop.set()
+    only._handle(_ep("7", 1, 3))
+    assert full.dispatched == 0
+
+
+def test_main_only_starts_provider_refetch_when_that_provider_is_in_use(monkeypatch):
+    monkeypatch.setattr(p.sys, "argv", ["pipeline.py"])
+    monkeypatch.setattr(p.fetcher, "_parse_args", lambda argv: None)
+    monkeypatch.setattr(p.FetchWorker, "start", lambda self: None)
+    monkeypatch.setattr(p.FetchWorker, "shutdown", lambda self, timeout=None: None)
+    monkeypatch.setattr(p.AsyncRefetcher, "start", lambda self: None)
+    monkeypatch.setattr(p.downloader, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(p.downloader, "interrupted", threading.Event())
+    monkeypatch.setattr(p.downloader, "PROVIDER_REFETCH_PROVIDER", "vidrock")
+    seen = []
+    monkeypatch.setattr(p.downloader, "main", lambda: seen.append(p.downloader.provider_refetch_hook))
+
+    monkeypatch.setattr(p.fetcher, "ACTIVE_PROVIDERS", ["vidup", "vidrock"])
+    assert p.main() == 0
+    monkeypatch.setattr(p.fetcher, "ACTIVE_PROVIDERS", ["vidup"])
+    assert p.main() == 0
+
+    assert seen[0]._providers == ["vidrock"] and seen[0]._fallback is not None
+    assert seen[1] is None
+    assert p.downloader.provider_refetch_hook is None, "收尾要还原钩子"
 
 
 def test_refetch_pools_merge_results_and_pending():

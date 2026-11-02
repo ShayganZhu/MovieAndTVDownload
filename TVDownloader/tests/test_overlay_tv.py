@@ -408,6 +408,57 @@ def test_pipeline_requeues_episode_after_transient_orion_failure(tmp_path, monke
     assert "瞬时失败，0s 后重排（第 1/" in capsys.readouterr().out
 
 
+class _RefetchHook:
+    def __init__(self):
+        self.sent = []
+
+    def dispatch(self, entries):
+        self.sent.extend(d.record_episode_key(e) for e in entries)
+        return len(entries)
+
+    def collect(self):
+        return []
+
+    def pending_count(self):
+        return 0
+
+
+@pytest.mark.parametrize("failures, single", [
+    ([("vidrock", "vidrock 链接已 200 分钟，超过可用时长 180 分钟，不再下载，需重新取流: u")], True),
+    ([("vidrock", "vidrock 链接已 200 分钟，需重新取流: u"), ("vidlink", "画质不达标")], True),
+    ([("vidrock", "需重新取流: u"), ("vidup", "直链已失效（HTTP 403），需重新取流: u")], False),
+    ([("vidup", "直链已失效（HTTP 403），需重新取流: u")], False),
+])
+def test_expired_episode_goes_to_single_source_refetch_only_if_just_that_source_expired(
+        tmp_path, monkeypatch, capsys, failures, single):
+    """🔴 端到端：只有 vidrock 要换链接时只问 vidrock；别的源也要换时仍走全源，否则它们换不到新链接。"""
+    node = {"url": "https://belfast.armadilloscp.workers.dev/a/master.m3u8",
+            "provider": "vidrock", "type": "m3u8", "link_checked": True}
+    entries = [{"tmdbId": "96", "season": 1, "episode": 1, "title": "x", "urls": [node]}]
+    _pipeline_env(tmp_path, monkeypatch, entries, lambda url: ())
+    full, only = _RefetchHook(), _RefetchHook()
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(d, "async_refetch_hook", full)
+    monkeypatch.setattr(d, "provider_refetch_hook", only)
+    monkeypatch.setattr(d, "PROVIDER_REFETCH_PROVIDER", "vidrock")
+    monkeypatch.setattr(d, "dispatch_stale_entries_async", lambda batch, counts: 0)
+    monkeypatch.setattr(d, "ListEntrySource", lambda es: d._ListEntrySource(es))
+    monkeypatch.setattr(d, "process_one_entry", lambda entry, ids: ("96_S01E01", False, {
+        "error": failures[0][1], "retriable": False, "needs_refetch": True,
+        "node_failures": [{"provider": p, "retriable": False, "error": e} for p, e in failures],
+    }))
+
+    d._run_pipeline()
+
+    assert (only.sent, full.sent) == ((["96_S01E01"], []) if single else ([], ["96_S01E01"]))
+    assert ("只问 vidrock" in capsys.readouterr().out) is single
+
+
+def test_shipped_provider_refetch_only_asks_vidrock():
+    assert d.PROVIDER_REFETCH_PROVIDER == "vidrock"
+    assert d.PROVIDER_REFETCH_WORKERS == 4
+
+
 def test_episode_whose_every_version_was_rejected_earlier_is_killed_without_download(
         tmp_path, monkeypatch):
     d.record_overlay_node_reject(ident(91), "T", node_of(hls("91")), _scan("hardsub"))

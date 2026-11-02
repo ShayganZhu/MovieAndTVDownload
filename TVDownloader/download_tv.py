@@ -158,6 +158,8 @@ async_refetch_hook = None
 # 到期重取的线程池（pipeline 模式由 pipeline.py 注入，只问 vidlink）。None = 单独跑下载，
 # DispatchScreen 退回"到点照常派发、启动预检换链接"的旧行为。
 due_refetch_hook = None
+# 只问一个源的重取线程池（pipeline 模式由 pipeline.py 注入）。None = 过期的集都走 async_refetch_hook。
+provider_refetch_hook = None
 # 【仅 pipeline.py】轮末投出异步重取后，等待结果回来的上限（秒）。
 # 投完必须等一等再判"还有没有集要重投"——否则会认为没有、直接收尾，
 # 重取成功的新链接就没有任何轮次去消费它。期间每秒收一次，在途清零即提前
@@ -449,6 +451,10 @@ DUE_REFETCH_PER_MINUTE = max(1.0, float(_DUE_REFETCH_CFG.get("max_per_minute", 6
 DUE_REFETCH_MAX_PER_EPISODE = max(1, int(_DUE_REFETCH_CFG.get("max_per_episode", 4)))
 DUE_REFETCH_RETRY_SECONDS = max(60.0, float(_DUE_REFETCH_CFG.get("retry_minutes", 360)) * 60)
 DUE_REFETCH_MAX_WAIT_SECONDS = max(0.0, float(_DUE_REFETCH_CFG.get("max_wait_hours", 60)) * 3600)
+# 只问一个源的重取（见 config.yaml 同名项与 provider_refetch_wanted）。
+_PROVIDER_REFETCH_CFG = _LINK_HEALTH_RAW.get("provider_refetch") or {}
+PROVIDER_REFETCH_PROVIDER = str(_PROVIDER_REFETCH_CFG.get("provider") or "").strip().lower()
+PROVIDER_REFETCH_WORKERS = max(1, int(_PROVIDER_REFETCH_CFG.get("workers", 4)))
 # 假链接主机（2026-11-01）：这些主机上没验证过的节点一律不算节点。取流时会逐条验证（见
 # tv_ids_to_links._drop_fake_links），验证过的带 link_checked；存量行没验证过，读入时去掉。
 FAKE_LINK_HOSTS = tuple(
@@ -6919,6 +6925,17 @@ def transient_requeue_wanted(node_failures):
     )
 
 
+def provider_refetch_wanted(node_failures):
+    """要换链接的节点是否全来自 PROVIDER_REFETCH_PROVIDER：是就只问它，全源重取要慢得多。"""
+    expired = [
+        failure for failure in node_failures or ()
+        if isinstance(failure, dict) and needs_refetch(str(failure.get("error") or ""))
+    ]
+    return bool(expired) and all(
+        failure.get("provider") == PROVIDER_REFETCH_PROVIDER for failure in expired
+    )
+
+
 def _signed_at(url):
     """直链 url 里的签名时刻（查询参数 t=，秒）；没有或解析不了返回 None。"""
     match = re.search(r"[?&]t=(\d{9,11})(?:&|$)", str(url or ""))
@@ -8122,8 +8139,15 @@ def _run_pipeline():
                         else AUTO_REFETCH_MAX_PER_EPISODE
                     )
                     if key and used < AUTO_REFETCH_MAX_PER_EPISODE:
+                        only_one_source = (
+                            provider_refetch_hook is not None
+                            and provider_refetch_wanted(info.get("node_failures"))
+                        )
                         try:
-                            accepted = async_refetch_hook.dispatch([entry])
+                            accepted = (
+                                provider_refetch_hook if only_one_source
+                                else async_refetch_hook
+                            ).dispatch([entry])
                             refetching = True
                             if accepted is not None and accepted <= 0:
                                 # 该集的重取仍在途（多半是预检投的那次还没回来），
@@ -8137,7 +8161,9 @@ def _run_pipeline():
                                 print(
                                     f"  → 直链过期，已即刻投递异步重取"
                                     f"（第 {used + 1}/"
-                                    f"{AUTO_REFETCH_MAX_PER_EPISODE} 次）",
+                                    f"{AUTO_REFETCH_MAX_PER_EPISODE} 次"
+                                    + (f"，只问 {PROVIDER_REFETCH_PROVIDER}" if only_one_source else "")
+                                    + "）",
                                     flush=True,
                                 )
                         except Exception as exc:  # noqa: BLE001
