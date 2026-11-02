@@ -7070,12 +7070,65 @@ def test_aged_orion_link_with_playlist_404_goes_to_refetch(sandbox, monkeypatch)
         raise _playlist_404()
 
     monkeypatch.setattr(d, "parse_master_playlist", master)
-    entry = {"tmdbId": "78", "season": 1, "episode": 1, "fetched_at": int(time.time() - 300 * 60),
+    entry = {"tmdbId": "78", "season": 1, "episode": 1, "fetched_at": int(time.time() - 150 * 60),
              "urls": [{"url": "https://belfast.armadilloscp.workers.dev/a/master.m3u8",
                        "provider": "vidrock", "type": "m3u8", "link_checked": True}]}
     _, ok, info = d.process_one_entry(entry, set())
     assert ok is False and info["needs_refetch"] is True
     assert "持续 HTTP 404" in info["error"]
+
+
+def _aged_entry(provider, age_minutes):
+    return {"tmdbId": "79", "season": 1, "episode": 1,
+            "fetched_at": None if age_minutes is None else int(time.time() - age_minutes * 60),
+            "urls": [{"url": "https://belfast.armadilloscp.workers.dev/a/master.m3u8",
+                      "provider": provider, "type": "m3u8", "link_checked": True}]}
+
+
+@pytest.fixture
+def link_max_age(sandbox, monkeypatch):
+    monkeypatch.setattr(d, "LINK_MAX_AGE_SECONDS", {"vidrock": 180 * 60})
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    calls = []
+
+    def master(url, retries=None, headers=None):
+        calls.append(url)
+        raise RuntimeError("请求失败: 测试不关心之后的流程")
+
+    monkeypatch.setattr(d, "parse_master_playlist", master)
+    return calls
+
+
+def test_orion_link_past_its_lifetime_is_refetched_without_any_request(link_max_age):
+    """🔴 旧链接的播放列表可能还打得开、分片却回空，缺片没超阈值就会当成功上传，所以不能先试。"""
+    _, ok, info = d.process_one_entry(_aged_entry("vidrock", 181), set())
+    assert ok is False and info["needs_refetch"] is True
+    assert "超过可用时长" in info["error"]
+    assert link_max_age == [], "一个请求都不该发"
+
+
+@pytest.mark.parametrize("provider,age", [("vidrock", 179), ("vidrock", None), ("vidup", 999)])
+def test_link_lifetime_only_applies_to_old_links_of_listed_providers(link_max_age, provider, age):
+    _, ok, info = d.process_one_entry(_aged_entry(provider, age), set())
+    assert ok is False and not info.get("needs_refetch")
+    assert len(link_max_age) >= 1, "没到时长（或年龄未知、别的源）照常下载"
+
+
+def test_expired_orion_node_still_lets_the_other_nodes_try(link_max_age, monkeypatch):
+    entry = _aged_entry("vidrock", 181)
+    other = "https://moon.goldenkite.top/a/master.m3u8"
+    entry["urls"].append({"url": other, "provider": "vidup", "type": "m3u8"})
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False and info["needs_refetch"] is True
+    assert link_max_age == [other]
+
+
+def test_shipped_link_lifetime_only_covers_vidrock():
+    import yaml
+
+    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
+                              encoding="utf-8"))["download_tv"]
+    assert cfg["link_health"]["link_max_age_minutes"] == {"vidrock": 180}
 
 
 def test_real_request_chain_404_is_recognised_as_expired(monkeypatch):

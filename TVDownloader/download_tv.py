@@ -468,6 +468,12 @@ PLAYLIST_404_EXPIRED_AFTER_SECONDS = {
     for host, minutes in (_LINK_HEALTH_RAW.get("playlist_404_expired_after_minutes") or {}).items()
     if str(host).strip() and float(minutes) > 0
 }
+# 按取流源限制链接可用时长（见 config.yaml 同名项与 _raise_if_link_too_old）。
+LINK_MAX_AGE_SECONDS = {
+    str(provider).strip().lower(): float(minutes) * 60
+    for provider, minutes in (_LINK_HEALTH_RAW.get("link_max_age_minutes") or {}).items()
+    if str(provider).strip() and float(minutes) > 0
+}
 # 瞬时失败稍后重排（2026-11-02，见 config.yaml transient_requeue 与 DispatchScreen.retry_later）。
 _TRANSIENT_REQUEUE_RAW = _CFG.get("transient_requeue") or {}
 TRANSIENT_REQUEUE_PROVIDERS = frozenset(_TRANSIENT_REQUEUE_RAW.get("providers") or ())
@@ -3235,6 +3241,19 @@ def _host_rule_key(host, table):
     return None
 
 
+def _raise_if_link_too_old(node, link_age):
+    """这个源的链接过了可用时长就不下了，直接进重取闭环（见 link_health.link_max_age_minutes）。
+
+    年龄未知（无 fetched_at）照常下载。
+    """
+    max_age = LINK_MAX_AGE_SECONDS.get(node.get("provider"))
+    if max_age and link_age is not None and link_age >= max_age:
+        raise RuntimeError(
+            f"{node.get('provider')} 链接已 {link_age / 60:.0f} 分钟，超过可用时长 "
+            f"{max_age / 60:.0f} 分钟，不再下载，{_NEEDS_REFETCH_MARKER}: {node.get('url')}"
+        )
+
+
 def _playlist_error_as_expired(exc, url, link_age):
     """播放列表请求的 HTTP 500 / 404 该不该按链接过期处理；该就返回补挂了重取标记的新异常。
 
@@ -4749,6 +4768,7 @@ def process_one_entry(entry, processed_ids):
         默认 PLAYLIST_RETRY_MAX 死磕，不放过最后的机会。
         """
         url = node["url"]
+        _raise_if_link_too_old(node, link_age_seconds(entry))
         # 取流阶段记录的节点专属请求头（如特定 Referer/UA）：m3u8 与 mp4 两条
         # 分支都必须携带，否则某些源站会 403/428 直接判死，白白损失可用源。
         node_headers = node.get("headers") or None
