@@ -2834,6 +2834,81 @@ def test_upload_one_entry_sidecar_exception_writes_assets_only_pending(sandbox, 
     assert pend[0]["failed_assets"] == ["meta.json"]
 
 
+def _assets_pending(info):
+    return {"tmdbId": info["tmdbId"], "season": info["season"], "episode": info["episode"],
+            "year": 2001, "title": "T", "local_path": info["final_path"], "assets_only": True,
+            "s3_key": f"tvs/2001/{info['tmdbId']}/S01/E{info['episode']:02d}/E{info['episode']:02d}.mp4",
+            "failed_assets": ["meta.json"], "fail_reason": "旁车资产上传失败: meta.json"}
+
+
+def _write_pending_rows(sandbox, rows):
+    (sandbox / "pending.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def test_resume_assets_only_at_startup_uploads_and_only_clears_finished_rows(sandbox, monkeypatch, capsys):
+    """🔴 中途重启不走收尾补传：启动时就把欠的 meta.json 传掉。视频待补传的行、传失败的行都留着。"""
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    ok, bad, gone = (_success_info(sandbox, f"{t}_S01E01") for t in ("1", "2", "3"))
+    for info in (ok, bad, gone):
+        os.remove(info["final_path"])
+    _write_sidecars(ok, subs=())
+    _write_sidecars(bad, subs=())
+    video = {"tmdbId": "4", "season": 1, "episode": 1, "local_path": "/x/E01.mp4", "s3_key": "tvs/x"}
+    _write_pending_rows(sandbox, [_assets_pending(ok), _assets_pending(bad), _assets_pending(gone), video])
+    calls = []
+
+    def upload(path, key):
+        calls.append(key)
+        return (False, "boom") if "/2/" in key else (True, None)
+
+    monkeypatch.setattr(d, "upload_to_r2", upload)
+    d.resume_assets_only_pending()
+
+    assert calls == ["tvs/2001/1/S01/E01/meta.json", "tvs/2001/2/S01/E01/meta.json"]
+    left = _read_jsonl(d.UPLOAD_PENDING_LOG)
+    assert [(r["tmdbId"], bool(r.get("assets_only"))) for r in left] == [("2", True), ("4", False)]
+    assert not os.path.isdir(os.path.dirname(ok["final_path"])), "传完清掉集目录"
+    assert os.path.isfile(os.path.join(os.path.dirname(bad["final_path"]), "meta.json")), "传失败的留着"
+    assert "共 3 集，补齐 2 集，失败 1 集，未轮到 0 集" in capsys.readouterr().out
+
+
+def test_resume_assets_only_is_time_boxed_and_leaves_the_rest(sandbox, monkeypatch, capsys):
+    monkeypatch.setattr(d, "ASSETS_RESUME_MAX_SECONDS", 0)
+    info = _success_info(sandbox)
+    os.remove(info["final_path"])
+    _write_sidecars(info, subs=())
+    _write_pending_rows(sandbox, [_assets_pending(info)])
+    monkeypatch.setattr(d, "upload_to_r2", lambda p, k: pytest.fail("超时后不该再传"))
+    d.resume_assets_only_pending()
+    assert len(_read_jsonl(d.UPLOAD_PENDING_LOG)) == 1
+    assert "未轮到 1 集" in capsys.readouterr().out
+
+
+def test_resume_assets_only_stops_on_interrupt(sandbox, monkeypatch):
+    info = _success_info(sandbox)
+    os.remove(info["final_path"])
+    _write_sidecars(info, subs=())
+    _write_pending_rows(sandbox, [_assets_pending(info)])
+    monkeypatch.setattr(d, "upload_to_r2", lambda p, k: pytest.fail("中断后不该再传"))
+    d.interrupted.set()
+    try:
+        d.resume_assets_only_pending()
+    finally:
+        d.interrupted.clear()
+    assert len(_read_jsonl(d.UPLOAD_PENDING_LOG)) == 1
+
+
+def test_resume_assets_only_keeps_a_newer_video_row_and_ignores_missing_file(sandbox, monkeypatch):
+    """同一集最新一条是视频待补传：不是 assets_only 待办，不动。没有 pending 文件也不报错。"""
+    d.resume_assets_only_pending()
+    info = _success_info(sandbox)
+    video = {"tmdbId": "1", "season": 1, "episode": 1, "local_path": info["final_path"], "s3_key": "tvs/x"}
+    _write_pending_rows(sandbox, [_assets_pending(info), video])
+    monkeypatch.setattr(d, "upload_to_r2", lambda p, k: pytest.fail("不该上传"))
+    d.resume_assets_only_pending()
+    assert len(_read_jsonl(d.UPLOAD_PENDING_LOG)) == 2
+
+
 def test_reupload_assets_only_success_clears_pending_and_dir(sandbox, monkeypatch, capsys):
     """assets_only pending：视频本地已不存在也**不算孤儿**；回扫集目录补传
     meta.json/subs，全部成功 → 移出 pending + 清空目录 + SUCCESS_LOG 不动。"""

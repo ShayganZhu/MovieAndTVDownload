@@ -189,6 +189,27 @@ def test_run_drops_fake_nodes_and_skips_fake_only_rows(tmp_path, monkeypatch, ca
     assert "2 行只有假链接" in capsys.readouterr().out
 
 
+def test_run_resumes_assets_only_pending_at_startup(tmp_path, monkeypatch):
+    downloaded, _uploads = _pipeline_env(tmp_path, monkeypatch, [], lambda url: ())
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    called = []
+    monkeypatch.setattr(d, "resume_assets_only_pending", lambda: called.append(True))
+    d._run_pipeline()
+    assert called == [True] and downloaded == []
+
+
+def test_run_survives_assets_only_resume_failure(tmp_path, monkeypatch, capsys):
+    _pipeline_env(tmp_path, monkeypatch, [], lambda url: ())
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+
+    def boom():
+        raise RuntimeError("坏了")
+
+    monkeypatch.setattr(d, "resume_assets_only_pending", boom)
+    d._run_pipeline()
+    assert "启动补传旁车资产失败" in capsys.readouterr().out
+
+
 def test_run_refetches_due_episode_with_vidlink_and_downloads_new_link(tmp_path, monkeypatch):
     """🔴 端到端：bcdnxw 的集过了刷新点，当次运行只问 vidlink 换链接，再用新链接下载。"""
     import queue

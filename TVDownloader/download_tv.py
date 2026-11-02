@@ -658,6 +658,8 @@ _thread_local = threading.local()
 
 # 上传相关：pending 日志写入锁 + 反压信号量 + boto3 客户端单例（线程安全懒加载）。
 pending_lock = threading.Lock()
+# 启动时补传旁车资产的总时长上限（秒，见 resume_assets_only_pending）。
+ASSETS_RESUME_MAX_SECONDS = 300
 # 反压：限制"在途+排队"的上传总量，达到上限时提交上传的线程阻塞，
 # 阻塞回传到转封装、再回传到下载，从而钳制本地磁盘占用上限。
 upload_semaphore = threading.BoundedSemaphore(MAX_PENDING_UPLOADS)
@@ -2452,7 +2454,14 @@ def remove_video_pending_records(keys):
     """从 upload_pending_log 删掉这些集的"视频待补传"记录（assets_only 的保留：那是视频已
     进 R2、旁车资产还没传全，仍要交给 reupload）。tmp + os.replace 原子重写，与 write_pending 互斥。"""
     key_set = {str(k) for k in keys}
-    if not key_set or not os.path.exists(UPLOAD_PENDING_LOG):
+    if key_set:
+        _drop_pending_records(lambda record: record_episode_key(record) in key_set
+                              and not record.get("assets_only"))
+
+
+def _drop_pending_records(should_drop):
+    """重写 upload_pending_log，去掉 should_drop(记录) 为真的行。tmp + os.replace 原子重写，与 write_pending 互斥。"""
+    if not os.path.exists(UPLOAD_PENDING_LOG):
         return
     with pending_lock:
         kept = []
@@ -2463,7 +2472,7 @@ def remove_video_pending_records(keys):
                 except json.JSONDecodeError:
                     kept.append(line)
                     continue
-                if record_episode_key(record) in key_set and not record.get("assets_only"):
+                if should_drop(record):
                     continue
                 kept.append(line if line.endswith("\n") else line + "\n")
         tmp_path = UPLOAD_PENDING_LOG + ".tmp"
@@ -7504,6 +7513,10 @@ def _run_pipeline():
         if stranded_uploads:
             print(f"发现 {len(stranded_uploads)} 集成品已在本地、但没有上传成功记录"
                   f"（上次中断 / 崩溃 / 上传降级留下），本次直接补传", flush=True)
+        try:
+            resume_assets_only_pending()
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ 启动补传旁车资产失败，已忽略（收尾补传仍会处理）: {exc}", flush=True)
     print(
         f"成功日志中有 {len(logged_ids)} 个 ID，"
         f"目标目录中有 {len(disk_ids)} 个已下载 ID，"
@@ -9007,6 +9020,49 @@ def _reupload_assets_only(record):
     except ValueError:
         pass
     return "done", uploaded
+
+
+def resume_assets_only_pending():
+    """启动时补传上次运行留下的 assets_only 记录（2026-11-02）：视频已进 R2、旁车资产没传全的集。
+
+    收尾补传（reupload_pending）只在正常跑完时运行，而全量测试几天才跑完一次、中途重启又多：
+    11-02 全舰队 143 集的 meta.json 都是重启时被中断的上传，一直留在本地，R2 上缺着。
+    在启动阶段顺序处理，此时还没有别的线程写 pending。文件都很小；超过
+    ASSETS_RESUME_MAX_SECONDS 或传不上的留在 pending，下次再补，绝不拖住主流程。
+    """
+    if not os.path.exists(UPLOAD_PENDING_LOG):
+        return
+    latest = {}
+    with open(UPLOAD_PENDING_LOG, encoding="utf-8") as file:
+        for line in file:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            key = record_episode_key(record)
+            if key:
+                latest[key] = record
+    todo = {key: record for key, record in latest.items() if record.get("assets_only")}
+    if not todo:
+        return
+    deadline = time.monotonic() + ASSETS_RESUME_MAX_SECONDS
+    resolved, failed = set(), 0
+    for key, record in todo.items():
+        if interrupted.is_set() or time.monotonic() >= deadline:
+            break
+        try:
+            status, _detail = _reupload_assets_only(record)
+        except Exception as exc:  # noqa: BLE001 - 补救路径，不影响主流程
+            print(f"  [{key}] ⚠️ 旁车资产补传异常: {exc}", flush=True)
+            status = "failed"
+        if status == "failed":
+            failed += 1
+        else:
+            resolved.add(key)
+    _drop_pending_records(lambda record: record.get("assets_only")
+                          and record_episode_key(record) in resolved)
+    print(f"启动补传旁车资产：共 {len(todo)} 集，补齐 {len(resolved)} 集，失败 {failed} 集，"
+          f"未轮到 {len(todo) - len(resolved) - failed} 集（后两类留给下次）", flush=True)
 
 
 def reupload_pending():
