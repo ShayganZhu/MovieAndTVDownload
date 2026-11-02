@@ -497,6 +497,7 @@ TRANSIENT_REQUEUE_JITTER_SECONDS = max(0.0, float(_TRANSIENT_REQUEUE_RAW.get("ji
 #                      env:变量名 = 从 .env / 环境变量读代理 URL（含账号的 URL 别写进配置）
 #   path_max_episodes  {路径前缀: 集数}：在 max_episodes 之内，这些路径单独封顶（2026-10-31，/fine/ 的
 #                      分片大量 400 / 502，不封顶会占满名额）；max_episodes 为 0 时不起作用
+#   backfill_max_parked 这台主机排队的集到这么多，回扫的新链接先等着（见 backfill_should_wait）；0 = 不等
 def _parse_host_limits(raw):
     limits = {}
     for host, limit in (raw or {}).items():
@@ -510,6 +511,7 @@ def _parse_host_limits(raw):
                 str(prefix): int(cap)
                 for prefix, cap in (limit.get("path_max_episodes") or {}).items() if int(cap) > 0
             },
+            "backfill_max_parked": max(0, int(limit.get("backfill_max_parked") or 0)),
         }
     return limits
 
@@ -3247,13 +3249,16 @@ def _host_rule_key(host, table):
     return None
 
 
-def _raise_if_link_too_old(node, link_age):
-    """这个源的链接过了可用时长就不下了，直接进重取闭环（见 link_health.link_max_age_minutes）。
-
-    年龄未知（无 fetched_at）照常下载。
-    """
+def link_too_old(node, link_age):
+    """这个节点的链接是否过了可用时长（见 link_health.link_max_age_minutes）；年龄未知算没过。"""
     max_age = LINK_MAX_AGE_SECONDS.get(node.get("provider"))
-    if max_age and link_age is not None and link_age >= max_age:
+    return bool(max_age) and link_age is not None and link_age >= max_age
+
+
+def _raise_if_link_too_old(node, link_age):
+    """这个源的链接过了可用时长就不下了，直接进重取闭环。年龄未知（无 fetched_at）照常下载。"""
+    if link_too_old(node, link_age):
+        max_age = LINK_MAX_AGE_SECONDS[node.get("provider")]
         raise RuntimeError(
             f"{node.get('provider')} 链接已 {link_age / 60:.0f} 分钟，超过可用时长 "
             f"{max_age / 60:.0f} 分钟，不再下载，{_NEEDS_REFETCH_MARKER}: {node.get('url')}"
@@ -6995,6 +7000,9 @@ class DispatchScreen:
        这台主机在下的集数满了就排队（FIFO），不占下载槽位；别的集照常派。主循环在每集下载
        结束时调 release()，空出名额就先派排队的。path_max_episodes 里的路径再单独封顶，
        各排各的队，封顶的路径排满了也不挡同主机别的路径。
+       这些主机熔断时集也进这个队，不进冷却堆：冷却堆满了会停止从来源取集，整台主机挂掉时
+       别的源的集也跟着出不来（19 号机 11-02 belfast 全部回 502，下行几乎为 0 约 19 分钟）。
+       链接已超过 link_max_age_minutes 的集不排队：派出去当场就转重取，排队只会白等。
 
     4. **瞬时失败稍后重排**（retry_later，2026-11-02）：transient_requeue.providers 的节点瞬时失败时，
        主循环把这一集交回来，隔几分钟再派（首轮之外没有下一轮，不重排就只能等下次运行）。
@@ -7020,6 +7028,7 @@ class DispatchScreen:
         self._cool_counts = {}
         self._parked = {}            # (主机, 路径前缀或 None) -> 排队的集（FIFO）
         self._parked_total = 0
+        self._parked_hosts = Counter()  # 主机 -> 排队的集数（回扫线程只读，见 backfill_should_wait）
         self._lane_busy = Counter()  # 主机、(主机, 路径前缀或 None) -> 在下的集数
         self._lane_of = {}           # id(条目) -> 占着名额的 (主机, 路径前缀或 None)（release 时按它还）
         self._due = []               # (到点时刻（墙钟）, 序号, 条目)：等 vidlink 缓存刷新的集
@@ -7107,6 +7116,8 @@ class DispatchScreen:
         limit = self._limits.get(host)
         if not limit or not limit["max_episodes"]:
             return None
+        if link_too_old(nodes[0], link_age_seconds(entry, self._wall())):
+            return None
         path = _path_of(url)
         for prefix in limit.get("path_max_episodes") or ():
             if path.startswith(prefix):
@@ -7131,8 +7142,17 @@ class DispatchScreen:
         lane = self._lane_key(entry)
         if lane is None or self._lane_has_room(lane):
             return False
+        self._park(entry, lane)
+        return True
+
+    def parked_on(self, host):
+        """这台主机（host_limits 的键）此刻排队的集数。"""
+        return self._parked_hosts[host]
+
+    def _park(self, entry, lane):
         self._parked.setdefault(lane, deque()).append(entry)
         self._parked_total += 1
+        self._parked_hosts[lane[0]] += 1
         self.parked += 1
         if self.parked == 1 or self.parked % 500 == 0:
             host, prefix = lane
@@ -7140,14 +7160,14 @@ class DispatchScreen:
             print(f"  [主机限流排队] {record_episode_key(entry)}: {host} 已有 "
                   f"{self._lane_busy[host]} 集在下{detail}，排队等名额（当前排队 {self._parked_total} 集，"
                   f"累计 {self.parked} 集次）", flush=True)
-        return True
 
     def _unpark(self):
         # 单独封顶的路径先派：它们占不满名额，排在后面的话会被别的集一直挡在外面。
         for lane in sorted(self._parked, key=lambda lane: lane[1] is None):
             queue_ = self._parked[lane]
-            if queue_ and self._lane_has_room(lane):
+            if queue_ and self._lane_has_room(lane) and self._trip_remaining(queue_[0]) is None:
                 self._parked_total -= 1
+                self._parked_hosts[lane[0]] -= 1
                 return queue_.popleft()
         return None
 
@@ -7235,22 +7255,32 @@ class DispatchScreen:
         self._due.clear()
         return False
 
-    def _hold_if_host_tripped(self, entry, now):
-        if HOST_CIRCUIT_HOLD_MAX_PER_EPISODE <= 0:
-            return False
+    def _trip_remaining(self, entry):
+        """节点全在熔断中主机上时，返回最早那台还要冷却多久；还有节点可试返回 None。"""
         nodes = _entry_nodes(entry)
         if not nodes:
-            return False
+            return None
         # 长期故障主机（bcdnxw 恒 429）不算"还有别的节点可试"：派出去也只是白走一遍再判失败。
         nodes = [node for node in nodes if _host_of(node["url"]) not in BROKEN_VIDLINK_HOSTS] or nodes
         remaining = [host_circuit_remaining(node) for node in nodes]
-        if any(r is None for r in remaining):
+        return None if any(r is None for r in remaining) else min(remaining)
+
+    def _hold_if_host_tripped(self, entry, now):
+        if HOST_CIRCUIT_HOLD_MAX_PER_EPISODE <= 0:
             return False
+        wait = self._trip_remaining(entry)
+        if wait is None:
+            return False
+        lane = self._lane_key(entry)
+        if lane is not None:
+            self._park(entry, lane)
+            return True
+        nodes = _entry_nodes(entry)
+        nodes = [node for node in nodes if _host_of(node["url"]) not in BROKEN_VIDLINK_HOSTS] or nodes
         key = record_episode_key(entry)
         held = self._cool_counts.get(key, 0)
         if held >= HOST_CIRCUIT_HOLD_MAX_PER_EPISODE:
             return False
-        wait = min(remaining)
         self._cool_counts[key] = held + 1
         self._seq += 1
         heapq.heappush(self._cooling, (now + wait, self._seq, entry))
@@ -7259,6 +7289,25 @@ class DispatchScreen:
         print(f"  [熔断等冷却] {key}: 节点所在主机 {hosts} 熔断中，{wait:.0f}s 后再派发"
               f"（第 {held + 1}/{HOST_CIRCUIT_HOLD_MAX_PER_EPISODE} 次）", flush=True)
         return True
+
+
+# 这一轮的派发闸门（_run_pipeline 设置，回扫线程只读）。
+active_dispatch_screen = None
+
+
+def backfill_should_wait(result):
+    """回扫的新链接要不要先等：第一个节点所在主机排队的集到了 backfill_max_parked 就等。
+
+    有集数上限的主机，集会从来源一路拿进闸门里排队，队列不满、回扫就没有反压，
+    链接排到超过 link_max_age_minutes 又得重取。
+    """
+    screen = active_dispatch_screen
+    nodes = _entry_nodes(result)
+    if screen is None or not nodes:
+        return False
+    host = _host_rule_key(_host_of(nodes[0]["url"]), HOST_LIMITS)
+    cap = (HOST_LIMITS.get(host) or {}).get("backfill_max_parked")
+    return bool(cap) and screen.parked_on(host) >= cap
 
 
 class NodeRetrySource:
@@ -7849,7 +7898,8 @@ def _run_pipeline():
         })
         print(f"  [未下载] {record_episode_key(entry)}: {reason}", flush=True)
 
-    dispatch_screen = DispatchScreen(on_skip=_dispatch_skip)
+    global active_dispatch_screen
+    dispatch_screen = active_dispatch_screen = DispatchScreen(on_skip=_dispatch_skip)
 
     # 硬字幕/水印换节点重下的重投入口（每轮套在来源外面）。
     node_retry = (

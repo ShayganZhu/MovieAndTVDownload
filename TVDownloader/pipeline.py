@@ -285,9 +285,15 @@ class FetchWorker:
         下载的速度推进，直链从签出到被下载始终只隔一个队列的距离。
         每 ENQUEUE_POLL_SECONDS 看一次停止信号：Ctrl+C / 下载侧收尾（shutdown）时
         立刻放手，结果已落盘 results.jsonl，下次运行读得到。
+        回扫的结果还要看那台主机在闸门里排队的集数（见 downloader.backfill_should_wait）。
         """
         started = None
         while not self._stop.is_set():
+            if result.get("backfill") and downloader.backfill_should_wait(result):
+                if started is None:
+                    started = time.monotonic()
+                self._stop.wait(ENQUEUE_POLL_SECONDS)
+                continue
             try:
                 self._q.put(result, timeout=ENQUEUE_POLL_SECONDS)
             except queue.Full:

@@ -373,6 +373,40 @@ def test_on_result_is_ignored_after_stop(monkeypatch):
     assert q.empty()
 
 
+def test_backfill_result_waits_for_room_at_its_host_but_normal_results_do_not(monkeypatch):
+    """🔴 belfast 排队太长时回扫要等，不然链接排到超过 3 小时；正常取流的结果不受影响。"""
+    full = threading.Event()
+    full.set()
+    monkeypatch.setattr(p.downloader, "backfill_should_wait", lambda result: full.is_set())
+    monkeypatch.setattr(p, "ENQUEUE_POLL_SECONDS", 0.01)
+    q = queue.Queue()
+    worker = p.FetchWorker(q)
+    worker._on_result(_ep("1", 1, 1))
+    assert q.get_nowait()["tmdbId"] == "1", "不是回扫的结果不看排队"
+
+    thread = threading.Thread(target=worker._on_result, args=(_ep("2", 1, 1, backfill="vidrock"),))
+    thread.start()
+    time.sleep(0.1)
+    assert q.empty(), "排队满了回扫要等"
+    full.clear()
+    thread.join(5)
+    assert q.get_nowait()["tmdbId"] == "2"
+    assert worker.waited == 1
+
+
+def test_backfill_result_stops_waiting_on_shutdown(monkeypatch):
+    monkeypatch.setattr(p.downloader, "backfill_should_wait", lambda result: True)
+    monkeypatch.setattr(p, "ENQUEUE_POLL_SECONDS", 0.01)
+    q = queue.Queue()
+    worker = p.FetchWorker(q)
+    thread = threading.Thread(target=worker._on_result, args=(_ep("2", 1, 1, backfill="vidrock"),))
+    thread.start()
+    time.sleep(0.05)
+    worker._stop.set()
+    thread.join(5)
+    assert not thread.is_alive() and q.empty() and worker.left_on_disk == 1
+
+
 # ------------------------------------------------- main 的接线
 
 def test_recheck_dead_is_rejected_in_pipeline_mode(monkeypatch):
