@@ -462,6 +462,18 @@ PLAYLIST_500_EXPIRED_AFTER_SECONDS = {
     for host, minutes in (_LINK_HEALTH_RAW.get("playlist_500_expired_after_minutes") or {}).items()
     if str(host).strip() and float(minutes) > 0
 }
+# 链接过期后播放列表回 404 的主机：同上，只是状态码不同（见 config.yaml 同名项）。
+PLAYLIST_404_EXPIRED_AFTER_SECONDS = {
+    str(host).strip().lower(): float(minutes) * 60
+    for host, minutes in (_LINK_HEALTH_RAW.get("playlist_404_expired_after_minutes") or {}).items()
+    if str(host).strip() and float(minutes) > 0
+}
+# 瞬时失败稍后重排（2026-11-02，见 config.yaml transient_requeue 与 DispatchScreen.retry_later）。
+_TRANSIENT_REQUEUE_RAW = _CFG.get("transient_requeue") or {}
+TRANSIENT_REQUEUE_PROVIDERS = frozenset(_TRANSIENT_REQUEUE_RAW.get("providers") or ())
+TRANSIENT_REQUEUE_MAX_PER_EPISODE = max(0, int(_TRANSIENT_REQUEUE_RAW.get("max_per_episode", 3)))
+TRANSIENT_REQUEUE_DELAY_SECONDS = max(0.0, float(_TRANSIENT_REQUEUE_RAW.get("delay_seconds", 120)))
+TRANSIENT_REQUEUE_JITTER_SECONDS = max(0.0, float(_TRANSIENT_REQUEUE_RAW.get("jitter_seconds", 180)))
 # 按 CDN 主机限流（2026-10-30，23 号机实测，见 config.yaml host_limits）：sun.finalsignal.top 按
 # 客户端 IP 限流，单机一个 IP 只能从它拿到 ~50 Mbps，连接开多了成片回 502。
 # 键可以写父域（见 _host_rule_key）：finalsignal.top 管 sun / sun1 / sun2 等全部子域，共用一份名额。
@@ -996,6 +1008,15 @@ HLS_HOST_CIRCUIT_THRESHOLD_429 = max(
 _HLS_HOST_CIRCUIT_STATUS = frozenset({429, 500, 502, 503, 504})
 # 熔断文案。⚠️ 有意**不**加入 _PERMANENT_FAILURE_MARKERS。
 _HLS_HOST_BLOCKED_MARKER = "分片主机疑似故障已熔断"
+# 熔断时在下的集原地等冷却的主机（键可写父域，2026-11-02，见 config.yaml m3u8_host_circuit_wait_hosts）。
+HLS_HOST_TRIP_WAIT_HOSTS = {
+    str(host).strip().lower()
+    for host in (_CFG.get("m3u8_host_circuit_wait_hosts") or [])
+    if str(host).strip()
+}
+HLS_HOST_TRIP_WAIT_SECONDS = max(0.0, float(_CFG.get("m3u8_host_circuit_wait_seconds", 300)))
+# host -> 这次不可用从哪一刻算起（time.monotonic()）：首次熔断时记下，任一分片成功才清掉。
+_hls_host_down_since = {}
 
 
 class HostCircuitOpenError(RuntimeError):
@@ -1045,20 +1066,43 @@ def _hls_host_record_result(url, status):
                 _hls_host_tripped[host] = (
                     time.monotonic() + HOST_CIRCUIT_COOLDOWN_SEC
                 )
+                _hls_host_down_since.setdefault(host, time.monotonic())
         else:
             # 拿到正常响应说明主机活着：两个计数器都清零、并立即解除熔断。
             _hls_host_5xx[host] = 0
             _hls_host_429[host] = 0
             _hls_host_tripped.pop(host, None)
+            _hls_host_down_since.pop(host, None)
         tripped = host in _hls_host_tripped
     if newly_tripped:
+        waiting = "，在下的集原地等冷却" if _hls_host_trip_waitable(url) else ""
         print(
             f"  [主机熔断] {host} 连续 {count} 次 HTTP {status}，暂时跳过该主机的"
             f"全部 m3u8 节点（其余节点不受影响），"
-            f"{HOST_CIRCUIT_COOLDOWN_SEC:.0f}s 后自动重试",
+            f"{HOST_CIRCUIT_COOLDOWN_SEC:.0f}s 后自动重试{waiting}",
             flush=True,
         )
     return tripped
+
+
+def _hls_host_trip_waitable(url):
+    """这台主机熔断时在下的集该不该等：配了等待，且这次不可用还没超过等待上限。"""
+    host = _host_of(url)
+    if (
+        HLS_HOST_TRIP_WAIT_SECONDS <= 0
+        or _host_rule_key(host, HLS_HOST_TRIP_WAIT_HOSTS) is None
+    ):
+        return False
+    with _hls_host_lock:
+        since = _hls_host_down_since.get(host)
+    return since is None or time.monotonic() - since < HLS_HOST_TRIP_WAIT_SECONDS
+
+
+def _wait_out_hls_host_trip(url, what):
+    """等冷却结束（半开）或别的分片成功解除熔断；超过等待上限就不再等。"""
+    while _hls_host_is_tripped(url) and _hls_host_trip_waitable(url):
+        if interrupted.wait(random.uniform(0.5, 2.0)):
+            raise DownloadInterrupted(f"{what} {_INTERRUPTED_ERROR}")
 
 
 def _hls_host_is_tripped(url):
@@ -1081,6 +1125,7 @@ def _hls_host_is_tripped(url):
 
 
 def _raise_if_hls_host_tripped(url, what):
+    _wait_out_hls_host_trip(url, what)
     if _hls_host_is_tripped(url):
         raise HostCircuitOpenError(
             f"{_HLS_HOST_BLOCKED_MARKER}（{_host_of(url)}），跳过{what}: {url}"
@@ -3190,32 +3235,36 @@ def _host_rule_key(host, table):
     return None
 
 
-def _playlist_500_as_expired(exc, url, link_age):
-    """播放列表请求的 HTTP 500 该不该按签名过期处理；该就返回补挂了重取标记的新异常。
+def _playlist_error_as_expired(exc, url, link_age):
+    """播放列表请求的 HTTP 500 / 404 该不该按链接过期处理；该就返回补挂了重取标记的新异常。
 
-    link_health.playlist_500_expired_after_minutes 里配了的主机：重试耗尽仍是 HTTP 500、
-    且链接年龄（link_age，秒）已到该值时才算（电影侧 f4889f9 移植，2026-10-30）。
-    finalsignal 上签名过期的 vidup / videasy 链接回 500 而不是 401/403，不挂
-    _NEEDS_REFETCH_MARKER 的话它被当成普通瞬时错误，这一集本次运行永远换不到新链接。
+    link_health.playlist_500_expired_after_minutes / playlist_404_expired_after_minutes 里
+    配了的主机：重试耗尽仍是这个状态码、且链接年龄（link_age，秒）已到该值时才算（500 为电影侧
+    f4889f9 移植，2026-10-30）。finalsignal 上签名过期的 vidup / videasy 链接回 500，
+    vidrock 的 Orion 链接约 4 小时后回 404，都不是 401/403，不挂 _NEEDS_REFETCH_MARKER 的话
+    这一集本次运行永远换不到新链接。
 
-    🔴 必须看年龄：源站过载时新链接也会偶发 500。年龄未知（无 fetched_at）一律按瞬时错误。
-    只用于主/媒体播放列表（见 _attempt_download）；分片 500 仍是瞬时错误。
+    🔴 必须看年龄：源站过载时新链接也会偶发 500。年龄未知（无 fetched_at）一律按原错误处理。
+    只用于主/媒体播放列表（见 _attempt_download）；分片 500 / 404 不走这里。
     退避中途收到中断时，DownloadInterrupted 的 __cause__ 正是那次 500：不能改写成
     "需重取"，得原样抛出让整集收手。不该算过期时返回 None。
     """
     if isinstance(exc, DownloadInterrupted):
         return None
+    status = _status_of(exc.__cause__)
+    table = {500: PLAYLIST_500_EXPIRED_AFTER_SECONDS,
+             404: PLAYLIST_404_EXPIRED_AFTER_SECONDS}.get(status)
+    if not table:
+        return None
     host = _host_of(url)
-    after = PLAYLIST_500_EXPIRED_AFTER_SECONDS.get(
-        _host_rule_key(host, PLAYLIST_500_EXPIRED_AFTER_SECONDS), 0)
+    after = table.get(_host_rule_key(host, table), 0)
     if (
         after > 0 and link_age is not None and link_age >= after
-        and _status_of(exc.__cause__) == 500
         and _NEEDS_REFETCH_MARKER not in str(exc)
     ):
         return RuntimeError(
-            f"{exc}；链接已 {link_age / 60:.0f} 分钟、播放列表持续 HTTP 500"
-            f"（{host} 上签名过期的表现），{_NEEDS_REFETCH_MARKER}"
+            f"{exc}；链接已 {link_age / 60:.0f} 分钟、播放列表持续 HTTP {status}"
+            f"（{host} 上链接过期的表现），{_NEEDS_REFETCH_MARKER}"
         )
     return None
 
@@ -3732,6 +3781,9 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
             if status in _HLS_HOST_CIRCUIT_STATUS and _hls_host_record_result(
                 url, status
             ):
+                # 可以等的主机：回循环开头等冷却，已下的分片不白费。
+                if _hls_host_trip_waitable(url):
+                    continue
                 raise HostCircuitOpenError(
                     f"{_HLS_HOST_BLOCKED_MARKER}（{_host_of(url)}，HTTP {status}），"
                     f"分片 {index + 1} 不再重试: {url}"
@@ -4742,7 +4794,7 @@ def process_one_entry(entry, processed_ids):
                 headers=node_headers,
             )
         except Exception as exc:  # noqa: BLE001
-            expired = _playlist_500_as_expired(exc, url, link_age_seconds(entry))
+            expired = _playlist_error_as_expired(exc, url, link_age_seconds(entry))
             if expired is None:
                 raise
             raise expired from exc
@@ -4848,7 +4900,7 @@ def process_one_entry(entry, processed_ids):
                         playlist_url, headers=node_headers
                     )
                 except Exception as exc:  # noqa: BLE001
-                    expired = _playlist_500_as_expired(
+                    expired = _playlist_error_as_expired(
                         exc, playlist_url, link_age_seconds(entry)
                     )
                     if expired is None:
@@ -6836,6 +6888,17 @@ def host_circuit_remaining(node):
     return remaining if remaining > 0 else None
 
 
+def transient_requeue_wanted(node_failures):
+    """这次失败里有没有 transient_requeue.providers 的节点是瞬时失败（可重试、也不用换链接）。"""
+    return any(
+        isinstance(failure, dict)
+        and failure.get("provider") in TRANSIENT_REQUEUE_PROVIDERS
+        and failure.get("retriable")
+        and not needs_refetch(str(failure.get("error") or ""))
+        for failure in node_failures or ()
+    )
+
+
 def _signed_at(url):
     """直链 url 里的签名时刻（查询参数 t=，秒）；没有或解析不了返回 None。"""
     match = re.search(r"[?&]t=(\d{9,11})(?:&|$)", str(url or ""))
@@ -6896,7 +6959,10 @@ class DispatchScreen:
        结束时调 release()，空出名额就先派排队的。path_max_episodes 里的路径再单独封顶，
        各排各的队，封顶的路径排满了也不挡同主机别的路径。
 
-    来源报 done 时还有挂起冷却中 / 排队的集就报 wait，到点 / 有名额再派出去。
+    4. **瞬时失败稍后重排**（retry_later，2026-11-02）：transient_requeue.providers 的节点瞬时失败时，
+       主循环把这一集交回来，隔几分钟再派（首轮之外没有下一轮，不重排就只能等下次运行）。
+
+    来源报 done 时还有挂起冷却中 / 排队 / 等重排的集就报 wait，到点 / 有名额再派出去。
     冷却中的集最多 max_held 个（默认 DOWNLOAD_QUEUE_DEPTH）、排队的最多 max_parked 个：满了就报
     wait、不再从来源往外拿。没有这道上限的话，主机熔断期间一次 poll 会把来源整条拖进冷却堆——
     单独跑时是整轮存量（实测 2 万集一次拿空、刷 2 万行日志），pipeline 模式下会抽空取流侧的
@@ -6927,11 +6993,14 @@ class DispatchScreen:
         self._due_burst = float(DUE_REFETCH_WORKERS * 2)
         self._due_tokens = self._due_burst
         self._due_refilled = self._clock()
+        self._later = []             # (到点时刻, 序号, 条目)：瞬时失败后等重排的集（不占 max_held）
+        self._later_counts = {}      # 集 key -> 本次运行已重排几次
         self.held = 0
         self.skipped = 0
         self.parked = 0
         self.due_sent = 0
         self.due_gave_up = 0
+        self.requeued = 0
 
     def set_source(self, source):
         self._source = source
@@ -6945,6 +7014,8 @@ class DispatchScreen:
                 pass
             elif self._cooling and self._cooling[0][0] <= now:
                 _due, _seq, entry = heapq.heappop(self._cooling)
+            elif self._later and self._later[0][0] <= now:
+                _due, _seq, entry = heapq.heappop(self._later)
             elif len(self._cooling) >= self._max_held or self._parked_total >= self._max_parked:
                 # 冷却堆 / 排队满了：先不从来源往外拿，等到点 / 有名额再说（保住来源的反压）。
                 return "wait", None
@@ -6952,7 +7023,7 @@ class DispatchScreen:
                 state, entry = self._source.poll()
                 if state == "done":
                     self._pump_due()    # 来源报 done 时重取已全部回来，失败的这里才归位
-                    if self._cooling or self._parked_total or self._waiting_for_due():
+                    if self._cooling or self._later or self._parked_total or self._waiting_for_due():
                         return "wait", None
                 if state != "item":
                     return state, entry
@@ -6971,6 +7042,23 @@ class DispatchScreen:
         if lane is not None:
             self._lane_busy[lane[0]] -= 1
             self._lane_busy[lane] -= 1
+
+    def retry_later(self, entry, node_failures):
+        """主循环：这一集下载失败了，符合 transient_requeue 就隔几分钟再派。
+
+        返回 (延迟秒数, 第几次)；不重排返回 None。多重排一次多等一份 delay，再加随机抖动：
+        一次熔断会同时失败几十集，一起回去等于再冲一次刚恢复的主机。
+        """
+        key = record_episode_key(entry)
+        used = self._later_counts.get(key, 0)
+        if not key or used >= TRANSIENT_REQUEUE_MAX_PER_EPISODE or not transient_requeue_wanted(node_failures):
+            return None
+        self._later_counts[key] = used + 1
+        delay = TRANSIENT_REQUEUE_DELAY_SECONDS * (used + 1) + random.uniform(0, TRANSIENT_REQUEUE_JITTER_SECONDS)
+        self._seq += 1
+        heapq.heappush(self._later, (self._clock() + delay, self._seq, entry))
+        self.requeued += 1
+        return delay, used + 1
 
     def _lane_key(self, entry):
         """条目占的名额 (主机, 路径前缀或 None)；不受集数上限的集返回 None。"""
@@ -7116,6 +7204,8 @@ class DispatchScreen:
         nodes = _entry_nodes(entry)
         if not nodes:
             return False
+        # 长期故障主机（bcdnxw 恒 429）不算"还有别的节点可试"：派出去也只是白走一遍再判失败。
+        nodes = [node for node in nodes if _host_of(node["url"]) not in BROKEN_VIDLINK_HOSTS] or nodes
         remaining = [host_circuit_remaining(node) for node in nodes]
         if any(r is None for r in remaining):
             return False
@@ -7988,6 +8078,7 @@ def _run_pipeline():
             # 仅“可重试”的失败进入下一轮；确定性失败绝不重下。
             if should_retry and round_failed_retriable is not None:
                 round_failed_retriable.append(entry)
+            refetching = False
             # 有节点的签名直链已过期：重投拿到的还是同一条、必然再挂，
             # 必须换新 url 才有意义。
             if should_refetch and round_failed_expired is not None:
@@ -8013,6 +8104,7 @@ def _run_pipeline():
                     if key and used < AUTO_REFETCH_MAX_PER_EPISODE:
                         try:
                             accepted = async_refetch_hook.dispatch([entry])
+                            refetching = True
                             if accepted is not None and accepted <= 0:
                                 # 该集的重取仍在途（多半是预检投的那次还没回来），
                                 # 钩子已合并，不重复计额度。
@@ -8031,6 +8123,12 @@ def _run_pipeline():
                         except Exception as exc:  # noqa: BLE001
                             # 投递失败不影响本集的失败结论，轮末/下次运行还有退路。
                             print(f"⚠️ 异步重取投递失败: {exc}", flush=True)
+            # 重取回来的新链接会再派一次，这里只管不换链接也能好的瞬时失败。
+            if retriable and not refetching:
+                later = dispatch_screen.retry_later(entry, info.get("node_failures"))
+                if later is not None:
+                    print(f"  → {label} 瞬时失败，{later[0]:.0f}s 后重排"
+                          f"（第 {later[1]}/{TRANSIENT_REQUEUE_MAX_PER_EPISODE} 次）", flush=True)
 
         elif stage == "conversion":
             entry = conversion_future_to_entry.pop(future)
@@ -8541,6 +8639,8 @@ def _run_pipeline():
                 host_summary,
                 f"因主机集数上限排队 {dispatch_screen.parked} 集次" if dispatch_screen.parked else "",
             ) if x))
+        if dispatch_screen.requeued:
+            print(f"瞬时失败稍后重排：{dispatch_screen.requeued} 集次。")
         if dispatch_screen.due_sent or dispatch_screen.due_gave_up:
             print(f"到期重取：投递 {dispatch_screen.due_sent} 次，"
                   f"{dispatch_screen.due_gave_up} 集次留给下次运行。")

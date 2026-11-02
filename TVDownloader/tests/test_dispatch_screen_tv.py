@@ -111,6 +111,80 @@ def test_hold_disabled_dispatches_immediately(monkeypatch):
     assert screen.poll()[0] == "item"
 
 
+def test_broken_vidlink_host_does_not_count_as_another_node_to_try(capsys):
+    """🔴 Orion 主机熔断、只剩 bcdnxw（恒 429）的集：派出去也是白走一遍再判失败，要等冷却。"""
+    orion = "belfast.armadilloscp.workers.dev"
+    _trip(orion, 5)
+    clock = _Clock()
+    screen = d.DispatchScreen(clock=clock, wall=lambda: NOW)
+    bad = vid("6", host="bcdnxw.hakunaymatata.com", signed=NOW - 3600)
+    screen.set_source(Src([ep(6, 1, [hls("6", host=orion), bad])]))
+    assert screen.poll() == ("wait", None)
+    assert "[熔断等冷却] 6_S01E01" in capsys.readouterr().out
+    d._hls_host_tripped.clear()
+    clock.t += 6
+    assert screen.poll()[0] == "item"
+
+
+# ------------------------------------------------------------ 瞬时失败稍后重排
+
+ORION_FAILURE = {"provider": "vidrock", "retriable": True, "error": "分片主机疑似故障已熔断（belfast），跳过该节点: u"}
+
+
+@pytest.fixture
+def requeue_env(monkeypatch):
+    monkeypatch.setattr(d, "TRANSIENT_REQUEUE_PROVIDERS", frozenset({"vidrock"}))
+    monkeypatch.setattr(d, "TRANSIENT_REQUEUE_MAX_PER_EPISODE", 2)
+    monkeypatch.setattr(d, "TRANSIENT_REQUEUE_DELAY_SECONDS", 100)
+    monkeypatch.setattr(d, "TRANSIENT_REQUEUE_JITTER_SECONDS", 0)
+    clock = _Clock()
+    screen = d.DispatchScreen(clock=clock, wall=lambda: NOW)
+    screen.set_source(Src([]))
+    return clock, screen
+
+
+def test_transient_failure_comes_back_after_the_delay_and_blocks_the_finish(requeue_env):
+    clock, screen = requeue_env
+    entry = ep(7, 1, [hls("7", host="moon.goldenkite.top")])
+    assert screen.retry_later(entry, [ORION_FAILURE]) == (100, 1)
+    assert screen.poll() == ("wait", None), "还有等重排的集，本轮不能收尾"
+    clock.t += 101
+    assert screen.poll() == ("item", entry)
+    assert screen.poll() == ("done", None)
+    assert screen.requeued == 1
+
+
+def test_requeue_is_capped_and_waits_longer_each_time(requeue_env):
+    clock, screen = requeue_env
+    entry = ep(7, 2, [hls("7", 2, host="moon.goldenkite.top")])
+    assert screen.retry_later(entry, [ORION_FAILURE]) == (100, 1)
+    assert screen.retry_later(entry, [ORION_FAILURE]) == (200, 2)
+    assert screen.retry_later(entry, [ORION_FAILURE]) is None, "用完次数留给下次运行"
+
+
+@pytest.mark.parametrize("failure", [
+    {"provider": "vidup", "retriable": True, "error": "分片主机疑似故障已熔断（sun1）"},
+    {"provider": "vidrock", "retriable": False, "error": "全部 2 条候选流均因画质不达标被淘汰"},
+    {"provider": "vidrock", "retriable": True, "error": "直链已失效，需重新取流"},
+])
+def test_only_transient_failures_of_listed_providers_are_requeued(requeue_env, failure):
+    _clock, screen = requeue_env
+    assert screen.retry_later(ep(7, 3, [hls("7", 3)]), [failure]) is None
+    assert screen.retry_later(ep(7, 3, [hls("7", 3)]), None) is None
+    assert screen.poll() == ("done", None)
+
+
+def test_waiting_requeues_do_not_block_new_episodes(requeue_env, monkeypatch):
+    """等重排的集不占 max_held：一次熔断失败几十集时，新集照常派，下载槽位不闲着。"""
+    clock = _Clock()
+    screen = d.DispatchScreen(clock=clock, wall=lambda: NOW, max_held=1)
+    fresh = ep(8, 9, [hls("8", 9, host="moon.goldenkite.top")])
+    screen.set_source(Src([fresh]))
+    for episode in (1, 2):
+        assert screen.retry_later(ep(8, episode, [hls("8", episode)]), [ORION_FAILURE]) is not None
+    assert screen.poll() == ("item", fresh)
+
+
 # ------------------------------------------------------------ vidlink 缓存挂起
 
 def test_vidlink_refresh_due_only_for_vidlink_only_bad_links():

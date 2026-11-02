@@ -865,6 +865,23 @@ download_tv:
   # 不再一次熔断连锁判掉整条排队（电影侧 06 号机 10-27：一次 15 秒熔断判掉 545 部）。
   # 每集每次运行最多挂起这么多次，用完照常派出去。设 0 关闭。
   host_circuit_hold_max_per_episode: 20
+  # 【熔断时在下的集原地等冷却】这些主机（键可写父域）熔断时，在下的集不当场判失败，分片等冷却结束
+  # 接着下；这次不可用（从首次熔断算，任一分片成功就清零）超过 wait_seconds 才按熔断放弃，整集换节点。
+  # 🧪 2026-11-02 19 号机实测：belfast（Orion）5 小时熔断 11 次，多是 15 秒半开后就恢复、有的半开前
+  #    就有分片成功，但每次连带约 65 集失败、已下的分片全白费。其他主机不配：finalsignal 这类过载时
+  #    持续 502，等只会占满下载槽位。设 0 秒或留空关闭。
+  m3u8_host_circuit_wait_hosts: [armadilloscp.workers.dev]
+  m3u8_host_circuit_wait_seconds: 300
+  # 【瞬时失败稍后重排】这些源的节点瞬时失败（熔断、超时、5xx、缺片过多）时，隔几分钟把这一集重新派发。
+  # max_rounds=1 没有下一轮，不重排的话要等下次运行，而 Orion 链接约 4 小时就过期。第 n 次重排等
+  # n × delay_seconds + 随机 0~jitter_seconds，避免一次熔断失败的几十集同时回去。每集每次运行最多
+  # max_per_episode 次。只配 vidrock：finalsignal / bcdnxw 实测重投救不回来（见 max_rounds 的记录）。
+  # providers 留空即关闭。
+  transient_requeue:
+    providers: [vidrock]
+    max_per_episode: 3
+    delay_seconds: 120
+    jitter_seconds: 180
   # 派发前链接健康（电影侧 1573d28 / 3120958 移植）：只剩 vidlink 坏链接的集在缓存刷新前
   # 不派、启动预检也不重取（刷新前重取只会拿回同一条死链接）。
   link_health:
@@ -903,6 +920,10 @@ download_tv:
     # 偶发 500，一律判过期会把可重试的瞬时失败变成当轮放弃。只看播放列表，分片 500 仍是瞬时错误。
     # 键可写父域：finalsignal.top 管 sun / sun1 / sun2 等全部子域（新链接已换到 sun1 / sun2）。
     playlist_500_expired_after_minutes: {finalsignal.top: 150}
+    # 同上，状态码是 404 的主机。2026-11-02 19 号机实测：Orion 链接不满 4 小时 62/62 能用，
+    # 超过 4 小时 12/24 回 404，而 404 默认算"资源不存在"、不重新取流，这些集就再也下不了。
+    # 门槛取 120 分钟：更年轻的链接回 404 没见过，仍按资源不存在处理。
+    playlist_404_expired_after_minutes: {armadilloscp.workers.dev: 120}
   # 画质预检样本大小（字节）：整片下载前先取头部这么多字节，用 ffprobe 读 moov
   # 判分辨率/编码/时长，码率 = Range 探测到的总长 × 8 / 时长。判定口径与下完整片
   # 后完全一致，却只花几 MB —— 避免 1~3GB 的整集下完才发现码率不达标而白丢。

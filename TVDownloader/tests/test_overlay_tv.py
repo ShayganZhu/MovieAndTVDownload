@@ -377,6 +377,37 @@ def test_pipeline_retries_other_node_and_uploads_clean_version(tmp_path, monkeyp
     assert "硬字幕换节点" in capsys.readouterr().out
 
 
+def test_pipeline_requeues_episode_after_transient_orion_failure(tmp_path, monkeypatch, capsys):
+    """🔴 端到端：max_rounds=1 没有下一轮，Orion 被熔断牵连的集要在本轮内再下一次。"""
+    orion = {"url": "https://belfast.armadilloscp.workers.dev/a/master.m3u8",
+             "provider": "vidrock", "type": "m3u8", "link_checked": True}
+    entries = [{"tmdbId": "95", "season": 1, "episode": 1, "title": "x", "urls": [orion]}]
+    downloaded, uploads = _pipeline_env(tmp_path, monkeypatch, entries, lambda url: ())
+    monkeypatch.setattr(d, "TRANSIENT_REQUEUE_PROVIDERS", frozenset({"vidrock"}))
+    monkeypatch.setattr(d, "TRANSIENT_REQUEUE_DELAY_SECONDS", 0)
+    monkeypatch.setattr(d, "TRANSIENT_REQUEUE_JITTER_SECONDS", 0)
+    succeed = d.process_one_entry
+    attempts = []
+
+    def flaky(entry, ids):
+        attempts.append(d.record_episode_key(entry))
+        if len(attempts) > 1:
+            return succeed(entry, ids)
+        error = "分片主机疑似故障已熔断（belfast.armadilloscp.workers.dev），跳过该节点: u"
+        return "95_S01E01", False, {
+            "error": error, "retriable": True, "needs_refetch": False,
+            "node_failures": [{"provider": "vidrock", "retriable": True, "error": error}],
+        }
+
+    monkeypatch.setattr(d, "process_one_entry", flaky)
+
+    d._run_pipeline()
+
+    assert attempts == ["95_S01E01", "95_S01E01"]
+    assert uploads == ["95_S01E01"]
+    assert "瞬时失败，0s 后重排（第 1/" in capsys.readouterr().out
+
+
 def test_episode_whose_every_version_was_rejected_earlier_is_killed_without_download(
         tmp_path, monkeypatch):
     d.record_overlay_node_reject(ident(91), "T", node_of(hls("91")), _scan("hardsub"))

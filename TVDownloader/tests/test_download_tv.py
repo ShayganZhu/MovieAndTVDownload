@@ -2010,9 +2010,116 @@ def hls_circuit_env(monkeypatch):
     monkeypatch.setattr(d, "_hls_host_5xx", {})
     monkeypatch.setattr(d, "_hls_host_429", {})
     monkeypatch.setattr(d, "_hls_host_tripped", {})
+    monkeypatch.setattr(d, "_hls_host_down_since", {})
     monkeypatch.setattr(d, "HLS_HOST_CIRCUIT_THRESHOLD", 8)
     monkeypatch.setattr(d, "HLS_HOST_CIRCUIT_THRESHOLD_429", 20)
     monkeypatch.setattr(d, "HOST_CIRCUIT_COOLDOWN_SEC", 15)
+
+
+class _ClockedInterrupt:
+    """替身中断事件：每次等待都把假时钟往前拨，熔断冷却和等待上限不用真等。"""
+
+    def __init__(self, monkeypatch):
+        self.now = time.monotonic()
+        self.waits = 0
+        self.on_wait = None
+        monkeypatch.setattr(d.time, "monotonic", lambda: self.now)
+
+    def is_set(self):
+        return False
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        self.now += timeout or 0
+        if self.on_wait is not None:
+            self.on_wait()
+        return False
+
+
+@pytest.fixture
+def hls_wait_env(hls_circuit_env, monkeypatch):
+    monkeypatch.setattr(d, "HLS_HOST_TRIP_WAIT_HOSTS", {"armadilloscp.workers.dev"})
+    monkeypatch.setattr(d, "HLS_HOST_TRIP_WAIT_SECONDS", 300)
+    monkeypatch.setattr(d, "HLS_HOST_CIRCUIT_THRESHOLD", 2)
+    monkeypatch.setattr(d, "validate_segment_content", lambda content, url: None)
+    clock = _ClockedInterrupt(monkeypatch)
+    monkeypatch.setattr(d, "interrupted", clock)
+    return clock
+
+
+ORION_SEGMENT = "https://belfast.armadilloscp.workers.dev/a/seg.ts"
+
+
+def _segment_requests(monkeypatch, failures):
+    """前 failures 次请求回 502，之后成功；返回请求计数。"""
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append(url)
+        if len(calls) <= failures:
+            raise d.requests.HTTPError("502", response=_FakeResp(502))
+        return b"segment"
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    return calls
+
+
+def test_in_flight_segment_waits_out_a_short_trip_on_wait_host(hls_wait_env, monkeypatch, capsys):
+    """🔴 19 号机实测：belfast 熔断多是十几秒就恢复，在下的集不能因此整集作废。"""
+    calls = _segment_requests(monkeypatch, failures=2)
+    assert d.download_single_segment(ORION_SEGMENT, 0, 20, 0.001) == b"segment"
+    assert len(calls) == 3, "冷却结束后接着下这一片"
+    host = "belfast.armadilloscp.workers.dev"
+    assert host not in d._hls_host_tripped and host not in d._hls_host_down_since
+    assert "在下的集原地等冷却" in capsys.readouterr().out
+
+
+def test_wait_host_gives_up_once_it_stays_down_past_the_limit(hls_wait_env, monkeypatch):
+    """真挂了不能一直占着下载槽位：连续不可用超过上限就按熔断放弃，整集换节点。"""
+    monkeypatch.setattr(d, "HLS_HOST_TRIP_WAIT_SECONDS", 60)
+    _segment_requests(monkeypatch, failures=10 ** 6)
+    with pytest.raises(d.HostCircuitOpenError):
+        d.download_single_segment(ORION_SEGMENT, 0, 500, 0.001)
+
+
+def test_other_hosts_still_abort_the_episode_on_trip(hls_wait_env, monkeypatch):
+    """没配等待的主机（finalsignal 这类过载时持续 502）照旧当场放弃。"""
+    calls = _segment_requests(monkeypatch, failures=10 ** 6)
+    with pytest.raises(d.HostCircuitOpenError):
+        d.download_single_segment("https://sun1.finalsignal.top/a/seg.ts", 0, 20, 0.001)
+    assert len(calls) == 2
+    other_worker = "https://white-tooth.other.workers.dev/a/seg.ts"
+    assert d._hls_host_trip_waitable(other_worker) is False
+
+
+def test_success_elsewhere_releases_waiting_segments_at_once(hls_wait_env, monkeypatch):
+    calls = _segment_requests(monkeypatch, failures=0)
+    for _ in range(2):
+        d._hls_host_record_result(ORION_SEGMENT, 502)
+    hls_wait_env.on_wait = lambda: d._hls_host_record_result(ORION_SEGMENT, 200)
+    assert d.download_single_segment(ORION_SEGMENT, 0, 20, 0.001) == b"segment"
+    assert hls_wait_env.waits == 1 and len(calls) == 1
+
+
+def test_interrupt_wakes_a_segment_waiting_for_cooldown(hls_circuit_env, monkeypatch):
+    monkeypatch.setattr(d, "HLS_HOST_TRIP_WAIT_HOSTS", {"armadilloscp.workers.dev"})
+    monkeypatch.setattr(d, "HLS_HOST_TRIP_WAIT_SECONDS", 300)
+    d._hls_host_tripped["belfast.armadilloscp.workers.dev"] = time.monotonic() + 1000
+    stop = threading.Event()
+    threading.Timer(0.05, stop.set).start()
+    monkeypatch.setattr(d, "interrupted", stop)
+    with pytest.raises(d.DownloadInterrupted):
+        d._raise_if_hls_host_tripped(ORION_SEGMENT, "分片 1")
+
+
+def test_shipped_trip_wait_and_requeue_settings_only_cover_orion():
+    import yaml
+
+    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
+                              encoding="utf-8"))["download_tv"]
+    assert cfg["m3u8_host_circuit_wait_hosts"] == ["armadilloscp.workers.dev"]
+    assert cfg["transient_requeue"]["providers"] == ["vidrock"]
+    assert cfg["link_health"]["playlist_404_expired_after_minutes"] == {"armadilloscp.workers.dev": 120}
 
 
 def test_hls_circuit_half_opens_after_cooldown(hls_circuit_env, monkeypatch):
@@ -6917,7 +7024,7 @@ def test_aged_finalsignal_link_with_playlist_500_goes_to_refetch(playlist_500, m
     monkeypatch.setattr(d, "parse_master_playlist", master)
     _, ok, info = d.process_one_entry(_final_entry(200), set())
     assert ok is False and info["needs_refetch"] is True
-    assert "签名过期的表现" in info["error"]
+    assert "链接过期的表现" in info["error"]
 
 
 def test_fresh_link_playlist_500_stays_a_transient_error(playlist_500, monkeypatch):
@@ -6945,14 +7052,64 @@ def test_media_playlist_500_on_aged_link_marks_refetch(playlist_500, monkeypatch
     assert ok is False and info["needs_refetch"] is True
 
 
+def _playlist_404():
+    """request_with_retry 对 404 的真实形态：不重试，RuntimeError 的 __cause__ 是那次 HTTP 404。"""
+    cause = d.requests.HTTPError("404", response=_FakeResp(404))
+    try:
+        raise RuntimeError(f"请求失败({d._HTTP_PERMANENT_MARKER} HTTP 404): u; {cause}") from cause
+    except RuntimeError as exc:
+        return exc
+
+
+def test_aged_orion_link_with_playlist_404_goes_to_refetch(sandbox, monkeypatch):
+    """🔴 Orion 链接约 4 小时后回 404：不进重取的话，回扫又不再问，这一集就再也下不了。"""
+    monkeypatch.setattr(d, "PLAYLIST_404_EXPIRED_AFTER_SECONDS", {"armadilloscp.workers.dev": 120 * 60})
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+
+    def master(url, retries=None, headers=None):
+        raise _playlist_404()
+
+    monkeypatch.setattr(d, "parse_master_playlist", master)
+    entry = {"tmdbId": "78", "season": 1, "episode": 1, "fetched_at": int(time.time() - 300 * 60),
+             "urls": [{"url": "https://belfast.armadilloscp.workers.dev/a/master.m3u8",
+                       "provider": "vidrock", "type": "m3u8", "link_checked": True}]}
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False and info["needs_refetch"] is True
+    assert "持续 HTTP 404" in info["error"]
+
+
+def test_real_request_chain_404_is_recognised_as_expired(monkeypatch):
+    """走真实的 parse_master_playlist → request_with_retry，确认 404 的 __cause__ 带得到状态码。"""
+    monkeypatch.setattr(d, "PLAYLIST_404_EXPIRED_AFTER_SECONDS", {"armadilloscp.workers.dev": 120 * 60})
+
+    class _Session:
+        def request(self, method, url, **kwargs):
+            return _FakeResp(404)
+
+    monkeypatch.setattr(d, "get_session", lambda: _Session())
+    orion = "https://belfast.armadilloscp.workers.dev/a/master.m3u8"
+    with pytest.raises(RuntimeError) as exc:
+        d.parse_master_playlist(orion)
+    assert d._NEEDS_REFETCH_MARKER in str(d._playlist_error_as_expired(exc.value, orion, 300 * 60))
+
+
+def test_playlist_404_rule_needs_age_and_a_listed_host(monkeypatch):
+    monkeypatch.setattr(d, "PLAYLIST_404_EXPIRED_AFTER_SECONDS", {"armadilloscp.workers.dev": 120 * 60})
+    orion = "https://belfast.armadilloscp.workers.dev/a/master.m3u8"
+    assert d._playlist_error_as_expired(_playlist_404(), orion, 121 * 60) is not None
+    assert d._playlist_error_as_expired(_playlist_404(), orion, 30 * 60) is None, "年轻链接的 404 是真没有"
+    assert d._playlist_error_as_expired(_playlist_404(), orion, None) is None, "年龄未知不算过期"
+    assert d._playlist_error_as_expired(_playlist_404(), "https://sun1.finalsignal.top/m.m3u8", 999 * 60) is None
+
+
 def test_playlist_500_rule_ignores_other_hosts_errors_and_interrupts(playlist_500):
     old = 200 * 60
-    assert d._playlist_500_as_expired(_playlist_500("u"), "https://moon.goldenkite.top/m.m3u8", old) is None
+    assert d._playlist_error_as_expired(_playlist_500("u"), "https://moon.goldenkite.top/m.m3u8", old) is None
     not_500 = RuntimeError("请求失败")
-    assert d._playlist_500_as_expired(not_500, f"https://{FINAL_HOST}/m.m3u8", old) is None
+    assert d._playlist_error_as_expired(not_500, f"https://{FINAL_HOST}/m.m3u8", old) is None
     stopped = d.DownloadInterrupted("中断")
     stopped.__cause__ = _playlist_500("u").__cause__
-    assert d._playlist_500_as_expired(stopped, f"https://{FINAL_HOST}/m.m3u8", old) is None
+    assert d._playlist_error_as_expired(stopped, f"https://{FINAL_HOST}/m.m3u8", old) is None
     assert d.link_age_seconds({"fetched_at": 1000}, now=1600) == 600
     assert d.link_age_seconds({}) is None
 
@@ -6974,8 +7131,8 @@ def test_playlist_500_rule_covers_every_finalsignal_subdomain(monkeypatch):
     exc.__cause__ = cause
     old = 151 * 60
     for host in ("sun.finalsignal.top", "sun1.finalsignal.top", "sun2.finalsignal.top"):
-        assert d._NEEDS_REFETCH_MARKER in str(d._playlist_500_as_expired(exc, f"https://{host}/m.m3u8", old))
-    assert d._playlist_500_as_expired(exc, "https://moon.goldenkite.top/m.m3u8", old) is None
+        assert d._NEEDS_REFETCH_MARKER in str(d._playlist_error_as_expired(exc, f"https://{host}/m.m3u8", old))
+    assert d._playlist_error_as_expired(exc, "https://moon.goldenkite.top/m.m3u8", old) is None
 
 
 # --------------------------------- 分片 HTTP 400：短重试，整条流都 400 就整集收手转重取（2026-10-31）
