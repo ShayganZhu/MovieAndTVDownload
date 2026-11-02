@@ -149,7 +149,23 @@ tv_ids_to_links:
   # 链接的 20 集都同时有别家的链接，已上传的 127 集没有一集是用它下成的；而它的 phoenix 等满
   # 60 秒不回、miami 回 401 / 500，每集白等半分钟以上。代码仍保留，要恢复就加回本列表（它不在
   # provider_breaker.blocks_dead 里，出错不阻止判死）。
-  providers: [vidup, vidfast, vidlink]
+  # vidrock 2026-11-02 接入（themoviebox.uk 的 Orion / Luna 线路，普通 TS）。06 号机端到端试验 60 集：
+  # 下载失败 0 集，画质通过约六成，对照组时长与已入库版本相差不到 10 秒。排在最后：码率低于其余三家。
+  # 它不在 provider_breaker.blocks_dead 里，出错不阻止判死，第三方接口的抖动不拖累取流。
+  # 重取换回来的新链接也按本列表来，不在列表里的话重取会把它的节点丢掉。
+  providers: [vidup, vidfast, vidlink, vidrock]
+  # 回扫（2026-11-02）：取流主流程跑完后，已有结论的集再问一遍新源，重启接着问。
+  # 结果和普通取流一样入队，下载跟不上就等，所以链接拿到后很快就下。
+  backfill:
+    enabled: true
+    provider: vidrock
+    workers: 16
+    max_per_minute: 120         # 接口每集约 5 秒；上限没测过，看到 429 就往下调
+    max_passes: 3               # 瞬时失败最多再问几遍，其余留给下次运行
+    retry_wait_minutes: 30
+    ledger: backfill_vidrock.jsonl
+    # 先后顺序即优先级；删掉一类就不问它。no_source 量最大（每台约 37 万集）、命中最低，放最后。
+    categories: [bad_vidlink, other_failed, linked_no_source, quality_dead, fake_only, no_source]
   # 并发线程数：同时解析多少集。配合住宅代理分散 IP。
   # 无源404不重试，任务为纯IO等待，可拉高并发；电影版 50 实测稳定。
   # 2026-09 全量实跑：50 并发时老剧段（判死需 2 轮 × 5 server）仅 ~72 集/分钟，瓶颈在代理 RTT，
@@ -211,6 +227,7 @@ tv_ids_to_links:
   direct:
     encdec: true                # enc-dec.app 加解密接口
     vidlink: true               # vidlink.pro（enc 在 enc-dec，接口在 vidlink.pro）
+    vidrock: true               # themoviebox.uk（11-02 06 号机直连可用）
     fallback_cooldown_minutes: 10
   # 轮间退避：第 n 轮结束后等待 min(round_backoff*n, round_backoff_max) 秒再进入下一轮，
   # 给代理池换 IP / 源站恢复留时间。若某轮 ≥90% 且 ≥50 集都是瞬时失败（疑似代理或源站整体故障），

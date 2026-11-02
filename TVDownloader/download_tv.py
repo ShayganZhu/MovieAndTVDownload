@@ -1954,6 +1954,43 @@ def load_dead_keys(threshold_fn=None):
     return dead
 
 
+def load_revived_dead_keys(dead_ids):
+    """回扫给画质判死集换到新来源后放回：results 里带 revive_dead、比最后一次判死更新的行。
+
+    新来源也画质不达标时会再记一条判死（时间更新），下次启动就不再放回，不会反复白下。
+    只放回画质判死：硬字幕 / 水印 / 人工判死不是来源的问题。
+    """
+    if not dead_ids or not os.path.exists(INPUT_JSONL) or not os.path.exists(DOWNLOAD_DEAD_LOG):
+        return set()
+    dead_at, never = {}, set()
+    with open(DOWNLOAD_DEAD_LOG, encoding="utf-8") as file:
+        for line in file:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            key = record_episode_key(record)
+            if not key:
+                continue
+            if record.get("manual") or (record.get("reason_class") or "quality") != "quality":
+                never.add(key)
+            dead_at[key] = max(dead_at.get(key, 0), parse_int(record.get("dead_at")) or 0)
+    revived = set()
+    with open(INPUT_JSONL, encoding="utf-8", errors="replace") as file:
+        for line in file:
+            if '"revive_dead"' not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            key = record_episode_key(record)
+            if (key in dead_ids and key not in never and record.get("revive_dead")
+                    and (parse_int(record.get("fetched_at")) or 0) > dead_at.get(key, 0)):
+                revived.add(key)
+    return revived
+
+
 def _latest_by_key(path):
     """读 jsonl 台账，返回 集 key -> 该集最后一条记录（纯追加台账的读取口径）。"""
     latest = {}
@@ -7490,6 +7527,10 @@ def _run_pipeline():
     # 画质判死账本：这些集"有源但流的画质不达标"，重下必然得到同样结论。
     # --retry-dead 时按当前门槛逐条复判，够格的放回重试队列。
     dead_ids = load_dead_keys(dead_record_passes_now if RETRY_DEAD_MODE else None)
+    revived_dead = load_revived_dead_keys(dead_ids)
+    if revived_dead:
+        dead_ids -= revived_dead
+        print(f"[回扫] {len(revived_dead)} 集画质判死的集换到了新来源，放回下载队列", flush=True)
     processed_ids = logged_ids | disk_ids | dead_ids
     # 下完了、还没转封装的集（上次中断留下）：接着转，不重下。已经有结论的集不再转。
     for job in resumable_conversions:
@@ -8215,6 +8256,13 @@ def _run_pipeline():
                     if state == "wait":
                         source_waiting = True
                         return False
+                    # 回扫给判死集换到新来源（本次运行才拿到的）：放回去，否则会被当已处理跳过。
+                    if entry.get("revive_dead"):
+                        revive_key = record_episode_key(entry)
+                        if revive_key in dead_ids:
+                            dead_ids.discard(revive_key)
+                            with processing_lock:
+                                processed_ids.discard(revive_key)
                     f = download_executor.submit(
                         process_one_entry, entry, processed_ids
                     )

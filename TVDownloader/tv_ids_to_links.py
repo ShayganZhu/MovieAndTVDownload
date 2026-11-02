@@ -32,7 +32,7 @@ from pathlib import Path
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import yaml
 import requests as std_requests
@@ -72,14 +72,19 @@ _CFG = load_config()
 _PROXY_CFG = _CFG.get("proxy", {}) or {}
 
 
-def _load_fake_link_hosts():
-    """假链接主机（download_tv.link_health.fake_link_hosts，取流与下载共用一份配置）。"""
+def _load_download_cfg():
+    """config.yaml 的 download_tv 段（假链接主机、回扫要读的下载侧台账路径都在这里）。"""
     cfg_path = Path(__file__).with_name("config.yaml")
     if not cfg_path.exists():
-        return ()
+        return {}
     with open(cfg_path, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    health = (data.get("download_tv") or {}).get("link_health") or {}
+    return data.get("download_tv") or {}
+
+
+def _load_fake_link_hosts():
+    """假链接主机（download_tv.link_health.fake_link_hosts，取流与下载共用一份配置）。"""
+    health = _load_download_cfg().get("link_health") or {}
     return tuple(str(h).strip().lower() for h in (health.get("fake_link_hosts") or []) if str(h).strip())
 
 
@@ -655,7 +660,7 @@ BREAKER_BLOCKS_DEAD = frozenset(
 # 后面环节的错误多半只关乎某部片或某个 server。enc-dec 是三家共用的服务，它坏了
 # 不能算到任何一家头上（那由轮间的 outage 退避处理）。
 _PROVIDER_ENTRY = {"vidup": "page", "vidfast": "page", "videasy": "videasy-seed",
-                   "vidlink": "vidlink-api"}
+                   "vidlink": "vidlink-api", "vidrock": "vidrock-api"}
 # 封禁 / 源站整体故障的状态码。429 不在内：videasy 的 seed 对单个出口限流很紧，
 # 那是"这个出口问太快"，换个 IP 就好，不代表整个源挂了。
 _OUTAGE_STATUSES = frozenset({403, 451, 502, 503}) | frozenset(range(520, 531))
@@ -837,8 +842,12 @@ class _DirectRoute:
                   f"接下来 {self.cooldown / 60:g} 分钟改走代理", flush=True)
 
 
+# vidrock 的接口（config 的 vidrock_api）：见 _fetch_vidrock。
+VIDROCK_API = _CFG.get("vidrock_api", "https://themoviebox.uk/api/resolve")
+VIDROCK_HOST = urlsplit(VIDROCK_API).hostname or ""
 ENCDEC_ROUTE = _DirectRoute("enc-dec", bool(_DIRECT_CFG.get("encdec", False)))
 VIDLINK_ROUTE = _DirectRoute("vidlink", bool(_DIRECT_CFG.get("vidlink", False)))
+VIDROCK_ROUTE = _DirectRoute("vidrock", bool(_DIRECT_CFG.get("vidrock", False)))
 
 
 def _route_for(url):
@@ -847,6 +856,8 @@ def _route_for(url):
     host = urlsplit(url).hostname or ""
     if host == "vidlink.pro" or host.endswith(".vidlink.pro"):
         return VIDLINK_ROUTE
+    if host == VIDROCK_HOST:
+        return VIDROCK_ROUTE
     return None
 
 
@@ -929,7 +940,7 @@ RETRY_STATS = _RetryStats()
 
 def _direct_summary():
     parts = [f"{r.name} 直连 {r.served} 次、回退代理 {r.fallbacks} 次"
-             for r in (ENCDEC_ROUTE, VIDLINK_ROUTE) if r.enabled]
+             for r in (ENCDEC_ROUTE, VIDLINK_ROUTE, VIDROCK_ROUTE) if r.enabled]
     retry = RETRY_STATS.summary()
     return "；".join(x for x in ("直连：" + "；".join(parts) if parts else "", retry) if x)
 
@@ -1456,10 +1467,50 @@ def _fetch_videasy(session, tid, season, episode):
     raise Exception(f"All videasy servers failed for {label}: {errors}")
 
 
+# ---- vidrock（themoviebox.uk，2026-11-02，不经 enc-dec）----
+# 只认这些线路：接口是个聚合器，其余线路多半不是视频。11-02 在 06 号机实测：标成 mp4 的
+# cinesrc.st / vidcore.io / vidup.to / vidspark.org 都是网页；Alpha / Beta / Gamma / 1080p Ultra
+# 回 403、404 或网页；AoNeRoom（bcdnw.hakunaymatata.com）恒 429。Orion / Luna 是普通 TS。
+VIDROCK_SERVERS = tuple(_CFG.get("vidrock_servers") or ("Orion", "Luna"))
+VIDROCK_DEFAULT_REFERER = "https://vidrock.to/"
+
+
+def _fetch_vidrock(session, tid, season, episode):
+    """themoviebox.uk 的 resolve 接口：一个 GET 返回 sources[]。{server, type, original_url, url}，
+    url 是它自己的代理链接，查询参数 referer 就是 CDN 要的 Referer（不带回 403）。
+    只有 200 且没有可用线路才算无此集；其余错误一律瞬时。"""
+    label = _ep_label(tid, season, episode)
+    query = urlencode({"type": "tv", "id": tid, "season": season, "episode": episode})
+    resp = _check(session.get(f"{VIDROCK_API}?{query}", timeout=STREAM_TIMEOUT, headers={"User-Agent": UA}),
+                  "vidrock-api")
+    data = _json(resp, "vidrock-api")
+    if not isinstance(data, dict):
+        raise Exception(f"vidrock api: unexpected payload type {type(data).__name__}")
+    entries = []
+    seen_urls = set()
+    for source in data.get("sources") or []:
+        if not isinstance(source, dict) or source.get("type") != "hls":
+            continue
+        words = str(source.get("server") or "").split()
+        url = source.get("original_url")
+        if not words or words[0] not in VIDROCK_SERVERS or not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        proxy_query = parse_qs(urlsplit(str(source.get("url") or "")).query)
+        referer = (proxy_query.get("referer") or [VIDROCK_DEFAULT_REFERER])[0]
+        # 分片常落在 workers.dev 上，master 也可能：这是真链接，别被假链接过滤当成没验证过的节点。
+        entries.append({**_url_entry(url, "vidrock", "m3u8", {"Referer": referer, "Origin": referer.rstrip("/")}),
+                        "link_checked": True})
+    if not entries:
+        raise NoSource(f"vidrock: no {'/'.join(VIDROCK_SERVERS)} source for {label}")
+    return entries, None, []
+
+
 PROVIDERS = {
     "vidup": _fetch_vidup,
     "vidlink": _fetch_vidlink,
     "vidfast": _fetch_vidfast,
+    "vidrock": _fetch_vidrock,
     # config.yaml 的 providers 里长期启用（2026-10-30，排在 vidlink 前）。
     "videasy": _fetch_videasy,
 }
@@ -2020,6 +2071,245 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True,
     return retry_items
 
 
+# ---- 回扫（2026-11-02）：已有结论的集再问一遍新源 ----
+# 取流只问"没处理过"的集，新接入的源碰不到已判无源、已判死、卡在坏链接上的集。回扫在取流主流程
+# 跑完后接着跑，只问 BACKFILL_PROVIDER；结果和普通取流一样落盘 + 入队，入队满了就等下载腾位，
+# 所以链接拿到后很快就下，不会放到失效。问过的集记进 ledger（无此集也记），重启接着问。
+_BACKFILL_CFG = _CFG.get("backfill") or {}
+BACKFILL_ENABLED = bool(_BACKFILL_CFG.get("enabled", False))
+BACKFILL_PROVIDER = str(_BACKFILL_CFG.get("provider") or "vidrock")
+BACKFILL_WORKERS = max(1, int(_BACKFILL_CFG.get("workers", 16)))
+BACKFILL_PER_MINUTE = max(1.0, float(_BACKFILL_CFG.get("max_per_minute", 120)))
+BACKFILL_MAX_PASSES = max(1, int(_BACKFILL_CFG.get("max_passes", 3)))
+BACKFILL_RETRY_WAIT = max(0.0, float(_BACKFILL_CFG.get("retry_wait_minutes", 30)) * 60)
+# 分类及先后顺序（从配置读，删掉一类就不问它）：
+#   bad_vidlink       只剩长期故障主机上的 vidlink 节点
+#   other_failed      有真链接但还没成功（finalsignal 下不动的集等）
+#   linked_no_source  判无源，但同剧别的集有链接
+#   quality_dead      画质判死（硬字幕 / 水印 / 人工判死的不算，那些不是链接的问题）
+#   fake_only         只拿到过假链接
+#   no_source         其余判无源的集，量最大、命中最低，放最后
+BACKFILL_CATEGORIES = tuple(_BACKFILL_CFG.get("categories") or (
+    "bad_vidlink", "other_failed", "linked_no_source", "quality_dead", "fake_only", "no_source"))
+# 这几类保留原有节点、新节点排最前：只替换来源不改结论，新节点画质不达标时不至于整集判死，
+# 原来的节点（比如等缓存刷新的 vidlink）还留着机会。其余几类原节点已确定没用。
+_BACKFILL_KEEP_OLD_NODES = frozenset({"bad_vidlink", "other_failed"})
+
+
+class _RateLimiter:
+    """多线程共用的匀速闸门：每分钟最多放 per_minute 个。"""
+
+    def __init__(self, per_minute, clock=time.monotonic):
+        self._interval = 60.0 / per_minute
+        self._clock = clock
+        self._next = clock()
+        self._lock = threading.Lock()
+
+    def wait(self, stop_event=None):
+        with self._lock:
+            now = self._clock()
+            at = max(now, self._next)
+            self._next = at + self._interval
+        delay = at - now
+        if delay > 0:
+            if stop_event is not None:
+                stop_event.wait(delay)
+            else:
+                time.sleep(delay)
+
+
+def _episode_tuple(record):
+    try:
+        return str(record["tmdbId"]), int(record["season"]), int(record["episode"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _iter_jsonl(path):
+    if not path.exists():
+        return
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                yield record
+
+
+def _load_backfill_asked(ledger, provider):
+    """这个源已有答案（拿到链接或无此集）的集。瞬时错误不记账，下一遍接着问。"""
+    return {key for record in _iter_jsonl(ledger)
+            if record.get("provider") == provider and record.get("status") in ("ok", "dead")
+            and (key := _episode_tuple(record))}
+
+
+def backfill_candidates(results_file, fail_file, success_file, dead_file, ledger, provider,
+                        ids, broken_hosts, deferred=(), categories=None):
+    """按 categories 的顺序列出要回扫的集：[(分类, (tid, s, e), 要保留的旧节点)]。
+
+    已有成功记录、这个源已问过的、不在本机 ids 里的都不问。硬字幕 / 水印 / 人工判死的集也不问：
+    那不是来源的问题，放回来违背判死结论。
+    """
+    categories = BACKFILL_CATEGORIES if categories is None else categories
+    wanted = set(ids)
+    skip = {key for record in _iter_jsonl(success_file) if (key := _episode_tuple(record))}
+    skip |= _load_backfill_asked(ledger, provider)
+    quality, other_dead = set(), set()
+    for record in _iter_jsonl(dead_file):
+        key = _episode_tuple(record)
+        if not key:
+            continue
+        if record.get("manual") or (record.get("reason_class") or "quality") != "quality":
+            other_dead.add(key)
+        else:
+            quality.add(key)
+    quality -= other_dead
+    newest = {}
+    for record in _iter_jsonl(results_file):
+        key = _episode_tuple(record)
+        if key and (key not in newest or (record.get("fetched_at") or 0) >= newest[key][0]):
+            newest[key] = (record.get("fetched_at") or 0, record.get("urls") or [])
+    buckets = {name: [] for name in categories}
+    linked_shows = set()
+    seen_links = set()
+    for key, (_at, urls) in newest.items():
+        real = [u for u in urls if not _is_fake_node(u)]
+        if not real:
+            continue
+        linked_shows.add(key[0])
+        seen_links.add(key)
+        if key in skip or key in quality or key in other_dead or key[0] not in wanted:
+            continue
+        hosts = {(urlsplit(str(u.get("url") or "")).hostname or "").lower() for u in real if isinstance(u, dict)}
+        name = ("bad_vidlink" if hosts and hosts <= set(broken_hosts)
+                and all(isinstance(u, dict) and u.get("provider") == "vidlink" for u in real) else "other_failed")
+        if name in buckets:
+            buckets[name].append((name, key, real))
+    if "quality_dead" in buckets:
+        buckets["quality_dead"] = [("quality_dead", key, []) for key in sorted(quality - skip)
+                                   if key[0] in wanted]
+    fake = {key for key, (_at, urls) in newest.items() if urls and key not in seen_links}
+    fake |= {tuple(key) for key in deferred}
+    if "fake_only" in buckets:
+        buckets["fake_only"] = [("fake_only", key, []) for key in sorted(fake - skip - seen_links)
+                                if key[0] in wanted and key not in quality and key not in other_dead]
+    dead_eps, dead_shows = _load_fail(fail_file)
+    for key in sorted(dead_eps - skip - seen_links - quality - other_dead - fake):
+        if key[0] not in wanted or key[0] in dead_shows:
+            continue
+        name = "linked_no_source" if key[0] in linked_shows else "no_source"
+        if name in buckets:
+            buckets[name].append((name, key, []))
+    return [item for name in categories for item in buckets.get(name, ())]
+
+
+def run_backfill(results_file, ledger, candidates, on_result=None, stop_event=None,
+                 provider=None, workers=None, per_minute=None, max_passes=None, retry_wait=None):
+    """问一遍候选集。拿到链接就落盘 + 入队（入队满了等下载腾位），答案记进 ledger。返回各分类计数。"""
+    provider = BACKFILL_PROVIDER if provider is None else provider
+    workers = BACKFILL_WORKERS if workers is None else workers
+    max_passes = BACKFILL_MAX_PASSES if max_passes is None else max_passes
+    retry_wait = BACKFILL_RETRY_WAIT if retry_wait is None else retry_wait
+    limiter = _RateLimiter(BACKFILL_PER_MINUTE if per_minute is None else per_minute)
+    counts = Counter()
+    lock = threading.Lock()
+    stopped = lambda: stop_event is not None and stop_event.is_set()
+    total = len(candidates)
+
+    def note(status, category, key):
+        record = {"tmdbId": key[0], "season": key[1], "episode": key[2], "provider": provider,
+                  "category": category, "status": status, "at": int(time.time())}
+        with lock:
+            with open(ledger, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    pending = list(candidates)
+    for pass_no in range(1, max_passes + 1):
+        if not pending or stopped():
+            break
+        queue_iter = iter(pending)
+        retry = []
+
+        def worker():
+            while not stopped():
+                with lock:
+                    item = next(queue_iter, None)
+                if item is None:
+                    return
+                category, key, old_nodes = item
+                limiter.wait(stop_event)
+                if stopped():
+                    return
+                try:
+                    status, result = process_episode(*key, providers=[provider], stop_event=stop_event)
+                except Exception as exc:  # noqa: BLE001 - 单集出错不影响回扫
+                    print(f"  [回扫异常] {_ep_label(*key)}: {exc}", flush=True)
+                    status, result = "retry", None
+                if status == "ok" and result and result.get("urls"):
+                    nodes = list(result["urls"])
+                    if category in _BACKFILL_KEEP_OLD_NODES:
+                        have = {u["url"] for u in nodes}
+                        nodes += [u for u in old_nodes if isinstance(u, dict) and u.get("url") not in have]
+                    result["urls"] = nodes
+                    result["backfill"] = provider
+                    if category == "quality_dead":
+                        result["revive_dead"] = True
+                    append_result(results_file, result)
+                    note("ok", category, key)
+                    if on_result is not None:
+                        on_result(result)
+                    outcome = "ok"
+                elif status == "dead":
+                    note("dead", category, key)
+                    outcome = "dead"
+                else:
+                    with lock:
+                        retry.append(item)
+                    outcome = "retry"
+                with lock:
+                    counts[(category, outcome)] += 1
+                    done = sum(n for (_c, o), n in counts.items() if o != "retry")
+                    if done % 500 == 0 and outcome != "retry":
+                        got = sum(n for (_c, o), n in counts.items() if o == "ok")
+                        print(f"[回扫] 已有答案 {done}/{total} 集，拿到链接 {got} 集"
+                              f"（第 {pass_no} 遍，{provider}）", flush=True)
+
+        threads = [threading.Thread(target=worker, name=f"backfill-{i}", daemon=True) for i in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        pending = retry
+        if pending and pass_no < max_passes and not stopped():
+            print(f"[回扫] 第 {pass_no} 遍结束，{len(pending)} 集瞬时失败，{retry_wait / 60:g} 分钟后再问", flush=True)
+            if stop_event is not None:
+                stop_event.wait(retry_wait)
+            else:
+                time.sleep(retry_wait)
+    return counts, pending
+
+
+def _start_backfill(results_file, fail_file, ids, deferred, on_result, stop_event):
+    if BACKFILL_PROVIDER not in PROVIDERS:
+        print(f"⚠️ 回扫的取流源 {BACKFILL_PROVIDER} 不存在，跳过回扫", flush=True)
+        return
+    dl = _load_download_cfg()
+    ledger = _resolve(_BACKFILL_CFG.get("ledger") or f"backfill_{BACKFILL_PROVIDER}.jsonl")
+    broken = {str(h).strip().lower() for h in ((dl.get("link_health") or {}).get("broken_vidlink_hosts") or [])}
+    candidates = backfill_candidates(
+        results_file, fail_file, _resolve(dl.get("success_log") or "success.jsonl"),
+        _resolve(dl.get("download_dead_log") or "download_dead.jsonl"), ledger, BACKFILL_PROVIDER,
+        ids, broken, deferred=[k for k, names in deferred.items() if FAKE_LINK_MARK in names])
+    by_category = Counter(item[0] for item in candidates)
+    print(f"\n==> 回扫开始（只问 {BACKFILL_PROVIDER}，{BACKFILL_WORKERS} 线程，每分钟最多 {BACKFILL_PER_MINUTE:g} 集）："
+          f"共 {len(candidates)} 集 {dict(by_category)}", flush=True)
+    counts, left = run_backfill(results_file, ledger, candidates, on_result=on_result, stop_event=stop_event)
+    summary = {name: {o: counts[(name, o)] for o in ("ok", "dead") if counts[(name, o)]} for name in by_category}
+    print(f"==> 回扫结束：{summary}，还有 {len(left)} 集瞬时失败留给下次运行", flush=True)
+
+
 def _parse_args(argv):
     parser = argparse.ArgumentParser(description="TMDB 季集展开 + 多源（vidup/vidlink/vidfast）逐集取流")
     parser.add_argument(
@@ -2260,6 +2550,8 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
             print(f"\n==> {len(deferred)} 集因源熔断或只有假链接推迟，写入 {provider_down_file.name}"
                   f"（不计入已处理，下次运行重查）。")
     print(f"\nAll done. 共跑 {round_no} 轮，结果已合并写入 {results_file}")
+    if BACKFILL_ENABLED and not args.recheck_dead and not (stop_event is not None and stop_event.is_set()):
+        _start_backfill(results_file, fail_file, ids, deferred, on_result, stop_event)
 
 
 def write_provider_down(path, deferred):

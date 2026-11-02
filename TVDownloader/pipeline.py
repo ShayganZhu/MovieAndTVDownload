@@ -181,7 +181,8 @@ class QueueEntrySource:
                 self._closed = True
                 break
             key = self._key(item)
-            if key is not None and key in self._seen:
+            # 回扫结果是已投递过的集的新来源（和重取结果一样），必须放行。
+            if key is not None and key in self._seen and not item.get("backfill"):
                 # 已由队列里更早的一条（或 backlog）投递过，跳过以免白占槽位。
                 self.skipped_duplicates += 1
                 continue

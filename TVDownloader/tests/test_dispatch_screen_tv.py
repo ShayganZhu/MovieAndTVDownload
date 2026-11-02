@@ -420,6 +420,16 @@ def test_drop_fake_nodes_only_touches_unchecked_nodes_on_fake_hosts(monkeypatch)
     assert d.drop_fake_nodes(same) == (same, 0), "验证过的、别的主机、老格式字符串都不动"
 
 
+def test_vidrock_node_on_workers_dev_survives_the_fake_filter_and_is_not_a_bad_vidlink(monkeypatch):
+    monkeypatch.setattr(d, "FAKE_LINK_HOSTS", ("workers.dev",))
+    node = {"url": FAKE, "provider": "vidrock", "type": "m3u8", "link_checked": True,
+            "headers": {"Referer": "https://vidrock.to/"}}
+    entry = ep(32, 1, [vid("32", host=BX, signed=NOW - 3600), node])
+    assert d.drop_fake_nodes(entry) == (entry, 0)
+    assert d.vidlink_refresh_due(entry, NOW) is None, "有别的真节点就照常派发"
+    assert d._normalize_url_entry(node)["headers"]["Referer"] == "https://vidrock.to/"
+
+
 def test_episode_with_fake_node_no_longer_escapes_the_vidlink_hold(monkeypatch):
     """🔴 假节点算"别的节点"的话，bcdnxw + workers.dev 的集会绕过挂起、到点也换不到链接。"""
     monkeypatch.setattr(d, "FAKE_LINK_HOSTS", ("workers.dev",))

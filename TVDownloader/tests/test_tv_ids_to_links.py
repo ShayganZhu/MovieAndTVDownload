@@ -577,6 +577,78 @@ def _urls(result):
     return [u["url"] for u in result["urls"]]
 
 
+# ------------------------------------------------------------ vidrock
+
+def _vr_source(server, url, type_="hls", referer="https://vidrock.to/"):
+    return {"server": server, "type": type_, "original_url": url,
+            "url": f"https://themoviebox.uk/proxy?url=x&referer={referer}"}
+
+
+class _VrSession:
+    def __init__(self, resp):
+        self.resp = resp
+        self.asked = []
+
+    def get(self, url, timeout=None, headers=None):
+        self.asked.append((url, timeout))
+        return self.resp
+
+
+def test_vidrock_only_takes_real_lines_and_carries_the_referer_the_cdn_needs():
+    session = _VrSession(_FakeResp(payload={"sources": [
+        _vr_source("Beta", "https://vidcore.io/tv/1/1/1", "mp4", "https://cinemaos.live/"),
+        _vr_source("Alpha - English", "https://x.lol/a.m3u8"),
+        _vr_source("Orion", "https://star.lol/o.m3u8"),
+        _vr_source("Luna", "https://moon.xyz/l.m3u8"),
+        _vr_source("Orion", "https://star.lol/o.m3u8"),
+        _vr_source("Orion", "https://star.lol/mp4.mp4", "mp4"),
+    ]}))
+    urls, title, captions = m._fetch_vidrock(session, "7", 2, 3)
+    assert [u["url"] for u in urls] == ["https://star.lol/o.m3u8", "https://moon.xyz/l.m3u8"]
+    assert urls[0]["provider"] == "vidrock" and urls[0]["type"] == "m3u8" and urls[0]["link_checked"] is True
+    assert urls[0]["headers"] == {"Referer": "https://vidrock.to/", "Origin": "https://vidrock.to"}
+    assert title is None and captions == []
+    assert session.asked[0][0].endswith("/api/resolve?type=tv&id=7&season=2&episode=3")
+
+
+def test_vidrock_without_usable_line_is_no_source_and_errors_are_transient():
+    with pytest.raises(m.NoSource):
+        m._fetch_vidrock(_VrSession(_FakeResp(payload={"sources": [_vr_source("Beta", "https://a/b", "mp4")]})), "1", 1, 1)
+    with pytest.raises(m.NoSource):
+        m._fetch_vidrock(_VrSession(_FakeResp(payload={"success": True, "sources": []})), "1", 1, 1)
+    with pytest.raises(m.HttpStatusError) as err:
+        m._fetch_vidrock(_VrSession(_FakeResp(status=502, payload={})), "1", 1, 1)
+    assert not isinstance(err.value, m.NoSource) and m._is_retriable(err.value)
+    with pytest.raises(Exception) as err:
+        m._fetch_vidrock(_VrSession(_FakeResp(payload=["x"])), "1", 1, 1)
+    assert not isinstance(err.value, m.NoSource)
+
+
+def test_vidrock_goes_direct_and_is_the_last_shipped_provider():
+    assert m._route_for(m.VIDROCK_API) is m.VIDROCK_ROUTE
+    assert m._route_for("https://other.example/x") is None
+    assert m.VIDROCK_ROUTE.enabled is True
+    assert m.ACTIVE_PROVIDERS == ["vidup", "vidfast", "vidlink", "vidrock"]
+    assert "vidrock" not in m.BREAKER_BLOCKS_DEAD, "第三方接口抖动不能阻止判无源"
+
+
+def test_vidrock_outage_does_not_block_a_no_source_verdict(monkeypatch):
+    """第三方聚合接口出错不能拖累取流：其余源都说无此集就照常判无源。"""
+    monkeypatch.setattr(m, "DEAD_CONFIRM", False)
+    monkeypatch.setattr(m, "PROVIDER_BREAKER", m.ProviderBreaker())
+
+    def boom(session, tid, s, e):
+        raise m.HttpStatusError(502, "vidrock-api")
+
+    def none(session, tid, s, e):
+        raise m.NoSource("无")
+
+    monkeypatch.setitem(m.PROVIDERS, "vidrock", boom)
+    monkeypatch.setitem(m.PROVIDERS, "vidup", none)
+    monkeypatch.setattr(m, "build_proxy", lambda: None)
+    assert m.process_episode(1, 1, 1, providers=["vidup", "vidrock"])[0] == "dead"
+
+
 # ------------------------------------------------------------ 假链接过滤
 
 FAKE_URL = "https://a.b.workers.dev/video.m3u8?q=1"
