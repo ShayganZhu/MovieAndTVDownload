@@ -539,12 +539,16 @@ download_tv:
   #    其余主机的 16 个相同）。⚠️ finalsignal 没有排队的集时，这 64 个槽位可能全给 mp4，
   #    64 × mp4_concurrency 16 = 1024 条连到 hakunaymatata（上面记录过 ~1400 条时它全局 429），
   #    真遇到 429 再调小。
-  max_workers: 64          # 同时下载的集数
+  # 🔴 2026-11-03 由 64 提到 128（用户定，先在 19 号机试）：Orion 48 + finalsignal 16 正好占满 64 个槽位，
+  #    两边都有几千集排队时别的源一个槽位都分不到；而 belfast 每条连接只有 0.13~0.16 Mbps、总量随连接数
+  #    线性增长，三台各 48 集时每台只从它拿到 80~110 Mbps。128 = Orion 96 + finalsignal 16 + 其余主机 16。
+  #    hakunaymatata 另设集数上限 64（见 host_limits），槽位再多 mp4 也不超过原来的 1024 条连接。
+  max_workers: 128         # 同时下载的集数
   # 主循环同时持有的“下载 future”上限（分批投递深度），必须 > max_workers。
   # 一次性把整轮几万集全部 submit 会让 wait(FIRST_COMPLETED) 每次都对全部
   # 未完成 future 挂/摘 waiter，主循环退化成 O(N²)；分批后 wait 规模恒定。
   # 留空/不配时默认 max_workers × 2。
-  download_queue_depth: 128
+  download_queue_depth: 256
   # 流式来源（pipeline.py：取流↔下载同进程重叠）下，「在途任务已排空但取流
   # 还没产出新集」时的轮询间隔（秒）。只有这一种情况才会 sleep —— 此刻主循环
   # 无事可做，不让出 CPU 就是 100% 空转。
@@ -843,9 +847,16 @@ download_tv:
     # 不要限连接数（direct_connections）：11-02 试过 200 条，Orion 从约 95 集/小时掉到 18 集。24 号机空闲时
     # 测冷分片 8 / 64 / 256 条是 1.6 / 14.5 / 47.1 Mbps，每条约 0.2 Mbps，总量随连接数线性增长。
     # 代理也用不了：住宅代理对这台主机 CONNECT 直接回 403（代理商的规则，别的网站正常）。
+    # 11-03 48 → 96（用户定，先在 19 号机试），max_workers 同步到 128：三台共约 1,900 条连接时没见限流，
+    # 每台速度也没因别的机器加入而下降，所以多开集数应能按比例多拿带宽。
     armadilloscp.workers.dev:
-      max_episodes: 48
+      max_episodes: 96
       backfill_max_parked: 200
+    # 2026-11-03 hakunaymatata（vidlink 的 mp4：bcdn / bcdn4 / bcdnxw）封顶 64 集：max_workers 提到 128 后，
+    # Orion 和 finalsignal 排空的时候 mp4 可能占满 128 个槽位 × 每集 16 块 = 2048 条连接，超过 09-15 实测
+    # 触发它全局 429 的 ~1400 条。64 集 × 16 = 1024 条，与提槽位之前的上限相同。
+    hakunaymatata.com:
+      max_episodes: 64
   # 派发闸门里因主机集数上限排队的集最多这么多，满了就不再从来源往外拿（取流随之降速）。
   max_parked_episodes: 20000
   # 🔴 2026-10-30 由 8 提到 30：sun.finalsignal.top 过载时会成片回 502（连接一多就有），8 次连续

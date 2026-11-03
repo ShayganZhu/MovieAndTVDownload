@@ -155,7 +155,8 @@ def test_shipped_host_limits():
     assert cfg["host_limits"] == {"finalsignal.top": {"max_episodes": 16, "direct_connections": 200,
                                                       "proxy_connections": 600, "proxy": "residential",
                                                       "path_max_episodes": {"/fine/": 8}},
-                                  "armadilloscp.workers.dev": {"max_episodes": 48, "backfill_max_parked": 200}}
+                                  "armadilloscp.workers.dev": {"max_episodes": 96, "backfill_max_parked": 200},
+                                  "hakunaymatata.com": {"max_episodes": 64}}
     # 🔴 belfast 不能限连接数：总速度随连接数线性增长，限 200 条时 Orion 掉了约 80%（2026-11-02）。
     orion = d._parse_host_limits(cfg["host_limits"])["armadilloscp.workers.dev"]
     assert (orion["direct"], orion["proxy"]) == (0, 0)
@@ -163,6 +164,12 @@ def test_shipped_host_limits():
     # 集数上限必须给别的主机留出槽位，否则 finalsignal 的慢集占满全部槽位、vidlink 排不上。
     assert cfg["max_workers"] - cfg["host_limits"]["finalsignal.top"]["max_episodes"] >= 16
     assert cfg["max_workers"] - cfg["host_limits"]["armadilloscp.workers.dev"]["max_episodes"] >= 16
+    # 两台慢主机同时排满时也要留出 16 个：11-03 Orion 48 + finalsignal 16 正好占满 64 个槽位。
+    slow = sum(cfg["host_limits"][h]["max_episodes"] for h in ("finalsignal.top", "armadilloscp.workers.dev"))
+    assert cfg["max_workers"] - slow >= 16
+    # mp4 连到 hakunaymatata 的连接不超过 1024 条（09-15 实测 ~1400 条时它全局 429）。
+    assert cfg["host_limits"]["hakunaymatata.com"]["max_episodes"] * cfg["mp4_concurrency"] <= 1024
+    assert d._host_rule_key("bcdn4.hakunaymatata.com", d._parse_host_limits(cfg["host_limits"])) == "hakunaymatata.com"
     assert cfg["download_queue_depth"] > cfg["max_workers"]
     assert cfg["max_parked_episodes"] == 20000
 
