@@ -166,7 +166,11 @@ def test_shipped_host_limits():
     assert cfg["max_workers"] - cfg["host_limits"]["finalsignal.top"]["max_episodes"] >= 16
     assert cfg["max_workers"] - cfg["host_limits"]["armadilloscp.workers.dev"]["max_episodes"] >= 16
     # 两台慢主机同时排满时也要留出 16 个：11-03 Orion 48 + finalsignal 16 正好占满 64 个槽位。
-    slow = sum(cfg["host_limits"][h]["max_episodes"] for h in ("finalsignal.top", "armadilloscp.workers.dev"))
+    # vidrock 停用（dropped_providers）时 belfast 不占槽位，槽位改回了 64；恢复 vidrock 要把 max_workers 一起调回 128。
+    slow_hosts = ["finalsignal.top"]
+    if "vidrock" not in (cfg["link_health"].get("dropped_providers") or []):
+        slow_hosts.append("armadilloscp.workers.dev")
+    slow = sum(cfg["host_limits"][h]["max_episodes"] for h in slow_hosts)
     assert cfg["max_workers"] - slow >= 16
     # mp4 连到 hakunaymatata 的连接不超过 1024 条（09-15 实测 ~1400 条时它全局 429）。
     assert cfg["host_limits"]["hakunaymatata.com"]["max_episodes"] * cfg["mp4_concurrency"] <= 1024
@@ -469,7 +473,7 @@ def test_shipped_config_with_two_source_ips_keeps_other_hosts_slots(monkeypatch)
     limits = d._parse_host_limits(cfg["host_limits"])
     slots = cfg["max_workers"] + sum(limit["extra_episodes"] for limit in limits.values())
     slow = limits["armadilloscp.workers.dev"]["max_episodes"] + limits["finalsignal.top"]["max_episodes"]
-    assert (limits["armadilloscp.workers.dev"]["max_episodes"], slots) == (96, 176)
+    assert (limits["armadilloscp.workers.dev"]["max_episodes"], slots) == (96, cfg["max_workers"] + 48)
     assert slots - slow == cfg["max_workers"] - 48 - 16, "别的主机分到的槽位与单 IP 时一样"
     assert cfg["download_queue_depth"] > slots
 
