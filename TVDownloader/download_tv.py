@@ -352,6 +352,8 @@ SEG_400_RETRY_DELAY = float(_CFG.get("seg_400_retry_delay", 1))
 #   实际请求数 5 × 1 = 5 < 改动前的 9，**成本仍是降的**；
 #   L3 退避 1+2+4+8 ≈ 15s，足以跨过短抖动，又远低于正片那套（封顶 60s）。
 SAMPLE_SEG_RETRY_MAX = max(1, int(_CFG.get("sample_seg_retry_max", 5)))
+# 单个分片请求的总时长上限（秒），0 = 不限（见 config.yaml 同名项与 _read_body_with_deadline）。
+SEGMENT_TOTAL_TIMEOUT = max(0, int(_CFG.get("segment_total_timeout_seconds", 300)))
 # 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒内完成，给足冗余防坏 TS
 # 让 ffmpeg 无限阻塞占死 convert worker。超时判失败(可重试)，不拖垮转封装池。
 CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
@@ -1238,9 +1240,27 @@ def get_session():
     return _thread_local.session
 
 
+def _read_body_with_deadline(response, deadline, url):
+    """读响应体，限总时长（time.monotonic 时刻）、收到中断就收手。
+
+    requests 的 timeout 只管单次读取，对端慢慢滴数据时永远不超时；.content 又不看中断信号。
+    每读一块才检查一次，所以块不能太大：1 KB/s 的滴流读满一块约 16 秒。
+    """
+    chunks = []
+    for chunk in response.iter_content(chunk_size=16384):
+        chunks.append(chunk)
+        if interrupted.is_set():
+            raise DownloadInterrupted(f"请求{_INTERRUPTED_ERROR}: {url}")
+        if time.monotonic() > deadline:
+            raise requests.exceptions.Timeout(
+                f"超过总时长上限，只收到 {sum(map(len, chunks))} 字节: {url}"
+            )
+    return b"".join(chunks)
+
+
 def request_with_retry(
     method, url, retries=3, backoff=0.5, backoff_max=45.0, as_text=False,
-    retry_403=0, retry_403_delay=1.0, **kwargs
+    retry_403=0, retry_403_delay=1.0, total_timeout=None, **kwargs
 ):
     """发起 HTTP 请求；成功时返回 str 或 bytes。
 
@@ -1255,9 +1275,13 @@ def request_with_retry(
     retry_403_delay 起指数退避重试至多 retry_403 次，不占 retries 的名额；还是 403
     才照上面的确定性失败处理。默认 0 = 不重试（分片层 retries=1 调用本函数，403 由
     download_single_segment 自己按整集判别）。
+
+    total_timeout（分片用）：这次请求从发出到读完的总时长上限（秒），超过按瞬时失败处理。
     """
     session = get_session()
     kwargs.setdefault("timeout", 30)
+    if total_timeout:
+        kwargs["stream"] = True
 
     # 不修改 Session 的全局 headers，避免一次请求的临时头污染后续请求。
     request_headers = dict(HEADERS)
@@ -1268,12 +1292,18 @@ def request_with_retry(
     attempt = 0
     while attempt < retries:
         try:
+            deadline = time.monotonic() + total_timeout if total_timeout else None
             with session.request(
                 method, url, headers=request_headers, **kwargs
             ) as response:
+                if deadline is not None and not response.ok:
+                    # 错误页也读完：流式请求没读完就关，连接回不了池，502 期间要反复重建 TLS。
+                    _read_body_with_deadline(response, deadline, url)
                 response.raise_for_status()
                 if method.upper() == "HEAD":
                     return None
+                if deadline is not None:
+                    return _read_body_with_deadline(response, deadline, url)
                 if as_text:
                     response.encoding = response.encoding or "utf-8"
                     return response.text
@@ -3792,6 +3822,7 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
             with HOST_CONNECTIONS.connection(url) as proxies:
                 content = request_with_retry(
                     "GET", url, retries=1, as_text=False, timeout=60,
+                    total_timeout=SEGMENT_TOTAL_TIMEOUT or None,
                     headers=headers, **({"proxies": proxies} if proxies else {}),
                 )
             validate_segment_content(content, url)

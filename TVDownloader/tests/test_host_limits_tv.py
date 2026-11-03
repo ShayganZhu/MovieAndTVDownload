@@ -155,8 +155,10 @@ def test_shipped_host_limits():
     assert cfg["host_limits"] == {"finalsignal.top": {"max_episodes": 16, "direct_connections": 200,
                                                       "proxy_connections": 600, "proxy": "residential",
                                                       "path_max_episodes": {"/fine/": 8}},
-                                  "armadilloscp.workers.dev": {"direct_connections": 200, "max_episodes": 32,
-                                                               "backfill_max_parked": 200}}
+                                  "armadilloscp.workers.dev": {"max_episodes": 48, "backfill_max_parked": 200}}
+    # 🔴 belfast 不能限连接数：总速度随连接数线性增长，限 200 条时 Orion 掉了约 80%（2026-11-02）。
+    orion = d._parse_host_limits(cfg["host_limits"])["armadilloscp.workers.dev"]
+    assert (orion["direct"], orion["proxy"]) == (0, 0)
     assert d._parse_host_limits(cfg["host_limits"])["finalsignal.top"]["path_max_episodes"] == {"/fine/": 8}
     # 集数上限必须给别的主机留出槽位，否则 finalsignal 的慢集占满全部槽位、vidlink 排不上。
     assert cfg["max_workers"] - cfg["host_limits"]["finalsignal.top"]["max_episodes"] >= 16

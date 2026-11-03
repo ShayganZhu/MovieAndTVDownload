@@ -1592,6 +1592,113 @@ def test_download_single_segment_backoff_wakes_up_on_interrupt(
     assert len(calls) == 1
 
 
+class _StreamResp:
+    """流式响应替身：逐块产出，drip_seconds 模拟对端慢慢滴数据（单次读取永远不超时）。"""
+
+    def __init__(self, status=200, chunks=(b"ab", b"cd"), drip_seconds=0.0, on_chunk=None):
+        self.status_code = status
+        self.chunks, self.drip_seconds, self.on_chunk = list(chunks), drip_seconds, on_chunk
+        self.read_all = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    @property
+    def ok(self):
+        return self.status_code < 400
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise d.requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+    def iter_content(self, chunk_size=1):
+        for chunk in self.chunks:
+            time.sleep(self.drip_seconds)
+            if self.on_chunk:
+                self.on_chunk()
+            yield chunk
+        self.read_all = True
+
+
+def _stream_session(monkeypatch, resp):
+    seen = {}
+
+    class _Session:
+        def request(self, method, url, **kwargs):
+            seen.update(kwargs)
+            return resp
+
+    monkeypatch.setattr(d, "get_session", lambda: _Session())
+    return seen
+
+
+def test_total_timeout_reads_whole_body_as_stream(monkeypatch):
+    seen = _stream_session(monkeypatch, _StreamResp())
+    assert d.request_with_retry("GET", "https://cdn/a.ts", retries=1, total_timeout=5, timeout=60) == b"abcd"
+    assert seen["stream"] is True and seen["timeout"] == 60
+
+
+def test_slow_drip_stops_at_total_timeout_as_transient_failure(monkeypatch):
+    """🔴 19 号机 11-02：连接 88 分钟才收到 5 MB，单次读取一直不超时，线程永远不返回。"""
+    resp = _StreamResp(chunks=[b"x"] * 1000, drip_seconds=0.01)
+    _stream_session(monkeypatch, resp)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="超过总时长上限") as exc:
+        d.request_with_retry("GET", "https://cdn/a.ts", retries=1, total_timeout=0.05)
+    assert time.monotonic() - started < 2, "不能把 1000 块都读完"
+    assert not resp.read_all
+    assert d._HTTP_PERMANENT_MARKER not in str(exc.value), "瞬时失败，分片层要接着重试"
+    assert d._classify_failure(str(exc.value)) is True
+
+
+def test_slow_drip_stops_on_interrupt(monkeypatch):
+    """🔴 kill -INT 后这些线程要立刻返回，否则主线程收尾一直等（19 号机等了 17 分钟）。"""
+    stop = threading.Event()
+    monkeypatch.setattr(d, "interrupted", stop)
+    resp = _StreamResp(chunks=[b"x"] * 100, on_chunk=stop.set)
+    _stream_session(monkeypatch, resp)
+    with pytest.raises(d.DownloadInterrupted):
+        d.request_with_retry("GET", "https://cdn/a.ts", retries=1, total_timeout=300)
+    assert not resp.read_all
+
+
+def test_error_page_body_is_read_so_the_connection_goes_back_to_the_pool(monkeypatch):
+    resp = _StreamResp(status=502, chunks=[b"<html>"])
+    _stream_session(monkeypatch, resp)
+    with pytest.raises(RuntimeError, match="请求失败"):
+        d.request_with_retry("GET", "https://cdn/a.ts", retries=1, total_timeout=5)
+    assert resp.read_all
+
+
+def test_requests_without_total_timeout_are_not_streamed(monkeypatch):
+    seen = _stream_session(monkeypatch, _FakeResp(200, content=b"body"))
+    assert d.request_with_retry("GET", "https://cdn/a.m3u8", retries=1) == b"body"
+    assert "stream" not in seen
+
+
+def test_segment_requests_use_the_total_timeout(monkeypatch):
+    seen = {}
+
+    def fake_request(method, url, **kwargs):
+        seen.update(kwargs)
+        return b"\x47" * 188 * 10
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    monkeypatch.setattr(d, "SEGMENT_TOTAL_TIMEOUT", 300)
+    d.download_single_segment("https://cdn/a.ts", 0, 1, 0)
+    assert seen["total_timeout"] == 300
+    monkeypatch.setattr(d, "SEGMENT_TOTAL_TIMEOUT", 0)
+    d.download_single_segment("https://cdn/a.ts", 0, 1, 0)
+    assert seen["total_timeout"] is None, "0 = 不限"
+
+
+def test_shipped_segment_total_timeout():
+    assert d.SEGMENT_TOTAL_TIMEOUT == 300
+
+
 def test_request_with_retry_short_circuits_permanent_status(monkeypatch):
     """playlist 层同样短路：404 不该重试 10 次（约 4 分钟）才换节点。"""
     sleeps = []
