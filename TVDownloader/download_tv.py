@@ -14,6 +14,7 @@ import re
 import statistics
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -56,6 +57,28 @@ _CFG = load_config()
 
 # 脚本所在目录（TVDownloader/），作为相对路径与默认目录的根。
 _SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _load_dotenv(path):
+    """轻量解析同目录 .env（KEY=VALUE，支持 # 注释与引号），不覆盖已存在的环境变量。
+    不引入 python-dotenv 依赖，保持最小改动。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+
+
+# 尽早读 .env：host_limits 的 source_ips 在模块加载时就要按它算名额和槽位。
+_load_dotenv(os.path.join(str(_SCRIPT_DIR), ".env"))
 
 
 def resolve_dir(value, default_name):
@@ -500,12 +523,45 @@ TRANSIENT_REQUEUE_JITTER_SECONDS = max(0.0, float(_TRANSIENT_REQUEUE_RAW.get("ji
 #   path_max_episodes  {路径前缀: 集数}：在 max_episodes 之内，这些路径单独封顶（2026-10-31，/fine/ 的
 #                      分片大量 400 / 502，不封顶会占满名额）；max_episodes 为 0 时不起作用
 #   backfill_max_parked 这台主机排队的集到这么多，回扫的新链接先等着（见 backfill_should_wait）；0 = 不等
+#   source_ips         分片直连从这几个本机 IP 发出，每次挑在用连接最少的（2026-11-03，belfast 按客户端 IP
+#                      封顶）。env:变量名 = 从 .env 读，逗号或空格分隔；本机绑不上的 IP 启动时跳过。配了以后
+#                      max_episodes、direct_connections 都按每个 IP 算，多出来的集数另加下载槽位（见 MAX_WORKERS）
+def _can_bind(ip):
+    """本机能不能从这个 IP 发出连接（网卡上没配这个地址时绑不上）。"""
+    try:
+        with socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET) as sock:
+            sock.bind((ip, 0))
+        return True
+    except OSError as exc:
+        print(f"⚠️ 出口 IP {ip} 本机绑不上（{exc}），不用它", flush=True)
+        return False
+
+
+def _source_ips(spec):
+    """host_limits 的 source_ips → 本机绑得上的出口 IP（去重、保序）。"""
+    if isinstance(spec, str):
+        spec = spec.strip()
+        if spec.startswith("env:"):
+            spec = os.environ.get(spec[4:].strip(), "")
+        spec = spec.replace(",", " ").split()
+    ips = []
+    for ip in spec or ():
+        ip = str(ip).strip()
+        if ip and ip not in ips and _can_bind(ip):
+            ips.append(ip)
+    return ips
+
+
 def _parse_host_limits(raw):
     limits = {}
     for host, limit in (raw or {}).items():
         limit = limit or {}
+        source_ips = _source_ips(limit.get("source_ips"))
+        max_episodes = max(0, int(limit.get("max_episodes") or 0))
         limits[str(host).strip().lower()] = {
-            "max_episodes": max(0, int(limit.get("max_episodes") or 0)),
+            "max_episodes": max_episodes * max(1, len(source_ips)),
+            "extra_episodes": max_episodes * max(0, len(source_ips) - 1),
+            "source_ips": source_ips,
             "direct": max(0, int(limit.get("direct_connections") or 0)),
             "proxy": max(0, int(limit.get("proxy_connections") or 0)),
             "proxy_spec": str(limit.get("proxy") or "residential").strip(),
@@ -519,6 +575,9 @@ def _parse_host_limits(raw):
 
 
 HOST_LIMITS = _parse_host_limits(_CFG.get("host_limits"))
+# 多个出口 IP 多出来的集数名额另加下载槽位，别的主机能分到的槽位与单 IP 时一样。
+MAX_WORKERS = int(MAX_WORKERS) + sum(limit["extra_episodes"] for limit in HOST_LIMITS.values())
+DOWNLOAD_QUEUE_DEPTH = max(DOWNLOAD_QUEUE_DEPTH, MAX_WORKERS + 1)
 # 派发闸门里因主机集数上限而排队的集最多这么多；满了就不再从来源往外拿（保住反压）。
 MAX_PARKED_EPISODES = max(1, int(_CFG.get("max_parked_episodes", 20000)))
 PLAYLIST_RETRY_MAX = int(_CFG.get("playlist_retry_max", 4))
@@ -599,25 +658,6 @@ QUALITY_KILL_RATIO = float(_CFG.get("quality_kill_ratio", 1.0))
 
 # ---- R2 上传配置 ----
 UPLOAD_PENDING_LOG = resolve_file(_CFG.get("upload_pending_log"), "upload_pending.jsonl")
-def _load_dotenv(path):
-    """轻量解析同目录 .env（KEY=VALUE，支持 # 注释与引号），不覆盖已存在的环境变量。
-    不引入 python-dotenv 依赖，保持最小改动。"""
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, val = line.partition("=")
-                key = key.strip()
-                val = val.strip().strip('"').strip("'")
-                if key and key not in os.environ:
-                    os.environ[key] = val
-    except FileNotFoundError:
-        pass
-
-
-_load_dotenv(os.path.join(str(_SCRIPT_DIR), ".env"))
 
 
 def _s3_secret(cfg_key, env_key):
@@ -1188,9 +1228,22 @@ def is_permanent_http_failure(exc_or_msg):
 
 
 # ---------- HTTP ----------
-def get_session():
-    """每个线程复用自己的 requests.Session。"""
-    if not hasattr(_thread_local, "session"):
+class _SourceAddressAdapter(HTTPAdapter):
+    """连接从指定的本机 IP 发出（host_limits 的 source_ips）。"""
+
+    def __init__(self, source_ip, **kwargs):
+        self._source_address = (source_ip, 0)
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["source_address"] = self._source_address
+        super().init_poolmanager(*args, **kwargs)
+
+
+def get_session(source_ip=None):
+    """每个线程复用自己的 requests.Session；给了 source_ip 时另用一个从这个本机 IP 发出的。"""
+    attr = f"session_{source_ip}" if source_ip else "session"
+    if not hasattr(_thread_local, attr):
         session = requests.Session()
         # ⚠️ 状态码重试**全部交给上层**（L3 分片层 / mp4 块层），这里只保留
         # 连接级与读取级重试。2026-09-14 与电影侧对齐（其 2026-09-10 实测结论）。
@@ -1226,18 +1279,20 @@ def get_session():
             allowed_methods=frozenset(("GET", "HEAD")),
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(
+        adapter_kwargs = dict(
             pool_connections=SEGMENT_CONCURRENCY,
             pool_maxsize=SEGMENT_CONCURRENCY * 2,
             max_retries=retry,
             pool_block=True,
         )
+        adapter = (_SourceAddressAdapter(source_ip, **adapter_kwargs) if source_ip
+                   else HTTPAdapter(**adapter_kwargs))
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         session.headers.update(HEADERS)
         session.verify = False
-        _thread_local.session = session
-    return _thread_local.session
+        setattr(_thread_local, attr, session)
+    return getattr(_thread_local, attr)
 
 
 def _read_body_with_deadline(response, deadline, url):
@@ -1260,7 +1315,7 @@ def _read_body_with_deadline(response, deadline, url):
 
 def request_with_retry(
     method, url, retries=3, backoff=0.5, backoff_max=45.0, as_text=False,
-    retry_403=0, retry_403_delay=1.0, total_timeout=None, **kwargs
+    retry_403=0, retry_403_delay=1.0, total_timeout=None, source_ip=None, **kwargs
 ):
     """发起 HTTP 请求；成功时返回 str 或 bytes。
 
@@ -1277,8 +1332,10 @@ def request_with_retry(
     download_single_segment 自己按整集判别）。
 
     total_timeout（分片用）：这次请求从发出到读完的总时长上限（秒），超过按瞬时失败处理。
+
+    source_ip（分片用，见 HostConnections）：从这个本机 IP 发出。
     """
-    session = get_session()
+    session = get_session(source_ip) if source_ip else get_session()
     kwargs.setdefault("timeout", 30)
     if total_timeout:
         kwargs["stream"] = True
@@ -3727,6 +3784,7 @@ def _download_proxy_url(spec):
 class HostConnections:
     """限流主机（HOST_LIMITS）的分片连接名额：先用直连名额，满了用代理名额，都满就等。
 
+    主机配了多个出口 IP（source_ips）时，直连挑在用连接最少的那个 IP 发出，直连名额按每个 IP 算。
     只管 HLS 分片请求（download_single_segment）：一集的分片下载有 segment_concurrency 个线程，
     每个请求发出前拿一个名额、请求结束（不论成败）就还，退避等待期间不占名额。
     代理拼不出来（没配账号）时只用直连名额，首次打一行告警。线程安全。
@@ -3739,6 +3797,7 @@ class HostConnections:
         self._in_use = Counter()
         self._proxies = {}
         self.served = Counter()
+        self.served_ips = Counter()
 
     def _proxy_for(self, host, limit):
         if host not in self._proxies:
@@ -3751,38 +3810,45 @@ class HostConnections:
 
     @contextmanager
     def connection(self, url):
-        """with 块内是一次请求：返回要用的 proxies（直连时为 None）。"""
+        """with 块内是一次请求：返回这次请求要加的参数（{} = 默认出口直连，proxies = 经代理，
+        source_ip = 从这个本机 IP 直连）。"""
         host = _host_rule_key(_host_of(url), self._limits)   # 同一条规则下的子域共用名额
         limit = self._limits.get(host)
-        if not limit or not limit["direct"]:
-            yield None
+        source_ips = (limit or {}).get("source_ips") or ()
+        if not limit or not (limit["direct"] or source_ips):
+            yield {}
             return
         with self._cond:
             while True:
-                proxies = None
-                if self._in_use[(host, "direct")] < limit["direct"]:
-                    route = "direct"
+                ip = min(source_ips or (None,), key=lambda i: self._in_use[(host, "direct", i)])
+                if not limit["direct"] or self._in_use[(host, "direct", ip)] < limit["direct"]:
+                    slot, request = (host, "direct", ip), ({"source_ip": ip} if ip else {})
                 elif (limit["proxy"] and self._in_use[(host, "proxy")] < limit["proxy"]
                       and self._proxy_for(host, limit)):
-                    route, proxies = "proxy", self._proxy_for(host, limit)
+                    slot, request = (host, "proxy"), {"proxies": self._proxy_for(host, limit)}
                 else:
                     if interrupted.is_set():
                         raise DownloadInterrupted(f"等 {host} 连接名额时{_INTERRUPTED_ERROR}")
                     self._cond.wait(1.0)
                     continue
-                self._in_use[(host, route)] += 1
-                self.served[route] += 1
+                self._in_use[slot] += 1
+                self.served[slot[1]] += 1
+                if "source_ip" in request:
+                    self.served_ips[ip] += 1
                 break
         try:
-            yield proxies
+            yield request
         finally:
             with self._cond:
-                self._in_use[(host, route)] -= 1
+                self._in_use[slot] -= 1
                 self._cond.notify()
 
     def summary(self):
         direct, proxy = self.served["direct"], self.served["proxy"]
-        return f"限流主机分片请求：直连 {direct} 次、经代理 {proxy} 次" if direct or proxy else ""
+        if not (direct or proxy):
+            return ""
+        ips = "、".join(f"{ip} {n} 次" for ip, n in self.served_ips.items())
+        return f"限流主机分片请求：直连 {direct} 次{f'（{ips}）' if ips else ''}、经代理 {proxy} 次"
 
 
 HOST_CONNECTIONS = HostConnections()
@@ -3818,12 +3884,13 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
         _raise_if_hls_host_tripped(url, f"分片 {index + 1}")
         try:
             # 外层已经负责精确重试次数，因此这里关闭额外应用层重试。
-            # 限流主机（finalsignal）先占一个直连 / 代理名额，请求结束就还（见 HostConnections）。
-            with HOST_CONNECTIONS.connection(url) as proxies:
+            # 限流主机（finalsignal）先占一个直连 / 代理名额，请求结束就还；配了多个出口 IP 的主机
+            # （belfast）挑一个 IP 发出（见 HostConnections）。
+            with HOST_CONNECTIONS.connection(url) as route:
                 content = request_with_retry(
                     "GET", url, retries=1, as_text=False, timeout=60,
                     total_timeout=SEGMENT_TOTAL_TIMEOUT or None,
-                    headers=headers, **({"proxies": proxies} if proxies else {}),
+                    headers=headers, **route,
                 )
             validate_segment_content(content, url)
             _hls_host_record_result(url, 200)
@@ -7876,6 +7943,10 @@ def _run_pipeline():
         f"（反压上限 {MAX_PENDING_UPLOADS} 在途上传，S3 上传="
         f"{'开启' if S3_ENABLED else '关闭'}）"
     )
+    for host, limit in HOST_LIMITS.items():
+        if limit.get("source_ips"):
+            print(f"{host} 的分片从 {'、'.join(limit['source_ips'])} 发出，集数上限 {limit['max_episodes']}",
+                  flush=True)
     if MULTI_ROUND_ENABLED and MAX_ROUNDS > 1:
         print(
             f"多轮下载已启用：最多 {MAX_ROUNDS} 轮，"

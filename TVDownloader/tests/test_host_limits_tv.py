@@ -42,8 +42,8 @@ def test_direct_first_then_proxy_then_wait():
     seen, release, entered = [], threading.Event(), threading.Barrier(4)
 
     def take():
-        with conns.connection(f"https://{FINAL}/seg.ts") as proxies:
-            seen.append(proxies and proxies["https"])
+        with conns.connection(f"https://{FINAL}/seg.ts") as route:
+            seen.append(route.get("proxies", {}).get("https"))
             if len(seen) <= 3:
                 entered.wait(5)
                 release.wait(5)
@@ -63,10 +63,10 @@ def test_direct_first_then_proxy_then_wait():
 
 def test_unlimited_hosts_and_missing_proxy():
     conns = d.HostConnections(limits=LIMITS, proxy_url=lambda spec: None)
-    with conns.connection("https://bcdn.hakunaymatata.com/x.mp4") as proxies:
-        assert proxies is None
+    with conns.connection("https://bcdn.hakunaymatata.com/x.mp4") as route:
+        assert route == {}
     with conns.connection(f"https://{FINAL}/a.ts") as a, conns.connection(f"https://{FINAL}/b.ts") as b:
-        assert (a, b) == (None, None)
+        assert (a, b) == ({}, {})
     assert conns.summary() == "限流主机分片请求：直连 2 次、经代理 0 次"
 
 
@@ -155,7 +155,8 @@ def test_shipped_host_limits():
     assert cfg["host_limits"] == {"finalsignal.top": {"max_episodes": 16, "direct_connections": 200,
                                                       "proxy_connections": 600, "proxy": "residential",
                                                       "path_max_episodes": {"/fine/": 8}},
-                                  "armadilloscp.workers.dev": {"max_episodes": 48, "backfill_max_parked": 200},
+                                  "armadilloscp.workers.dev": {"max_episodes": 48, "source_ips": "env:TV_SOURCE_IPS",
+                                                               "backfill_max_parked": 200},
                                   "hakunaymatata.com": {"max_episodes": 64}}
     # 🔴 belfast 不能限连接数：总速度随连接数线性增长，限 200 条时 Orion 掉了约 80%（2026-11-02）。
     orion = d._parse_host_limits(cfg["host_limits"])["armadilloscp.workers.dev"]
@@ -181,12 +182,12 @@ def test_orion_connections_wait_for_a_slot_and_never_use_the_proxy():
     got_second = threading.Event()
 
     def second():
-        with conns.connection("https://other.armadilloscp.workers.dev/b.ts") as proxies:
-            assert proxies is None
+        with conns.connection("https://other.armadilloscp.workers.dev/b.ts") as route:
+            assert route == {}
             got_second.set()
 
-    with conns.connection("https://belfast.armadilloscp.workers.dev/a.ts") as proxies:
-        assert proxies is None
+    with conns.connection("https://belfast.armadilloscp.workers.dev/a.ts") as route:
+        assert route == {}
         thread = threading.Thread(target=second)
         thread.start()
         assert not got_second.wait(0.2), "子域共用名额，满了要等"
@@ -424,3 +425,129 @@ def test_main_loop_finishes_episodes_queued_behind_a_path_cap(tmp_path, monkeypa
     d._run_pipeline()
 
     assert sorted(uploads) == [f"97_S01E0{i}" for i in range(1, 5)] + [f"98_S01E0{i}" for i in range(1, 4)]
+
+
+# ------------------------------------------------------------ 多出口 IP（2026-11-03，belfast 按客户端 IP 封顶）
+
+TWO_IPS = {"armadilloscp.workers.dev": {"max_episodes": 96, "direct": 0, "proxy": 0, "proxy_spec": "",
+                                        "source_ips": ["10.0.0.1", "10.0.0.2"]}}
+
+
+def test_source_ips_from_env_skip_unbindable(monkeypatch, capsys):
+    monkeypatch.setenv("TEST_SOURCE_IPS", "127.0.0.1, 192.0.2.1 127.0.0.1")
+    assert d._source_ips("env:TEST_SOURCE_IPS") == ["127.0.0.1"]
+    assert "出口 IP 192.0.2.1 本机绑不上" in capsys.readouterr().out
+    monkeypatch.delenv("TEST_SOURCE_IPS")
+    assert d._source_ips("env:TEST_SOURCE_IPS") == []
+    assert d._source_ips(None) == []
+
+
+def test_source_ips_scale_episodes_per_ip(monkeypatch):
+    monkeypatch.setattr(d, "_can_bind", lambda ip: ip != "10.0.0.9")
+    limits = d._parse_host_limits({
+        "armadilloscp.workers.dev": {"max_episodes": 48, "source_ips": ["10.0.0.1", "10.0.0.9", "10.0.0.2"]},
+        "hakunaymatata.com": {"max_episodes": 64},
+    })
+    orion = limits["armadilloscp.workers.dev"]
+    assert (orion["source_ips"], orion["max_episodes"], orion["extra_episodes"]) == (["10.0.0.1", "10.0.0.2"], 96, 48)
+    assert (limits["hakunaymatata.com"]["max_episodes"], limits["hakunaymatata.com"]["extra_episodes"]) == (64, 0)
+    monkeypatch.setattr(d, "_can_bind", lambda ip: False)
+    orion = d._parse_host_limits({"armadilloscp.workers.dev": {"max_episodes": 48, "source_ips": ["10.0.0.1"]}})
+    assert (orion["armadilloscp.workers.dev"]["max_episodes"], orion["armadilloscp.workers.dev"]["extra_episodes"]) == (48, 0), \
+        "IP 都绑不上（重启后第二个 IP 没了）就照单 IP 跑"
+
+
+def test_shipped_config_with_two_source_ips_keeps_other_hosts_slots(monkeypatch):
+    import os
+
+    import yaml
+
+    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
+                              encoding="utf-8"))["download_tv"]
+    monkeypatch.setenv("TV_SOURCE_IPS", "172.96.172.17,103.195.100.154")
+    monkeypatch.setattr(d, "_can_bind", lambda ip: True)
+    limits = d._parse_host_limits(cfg["host_limits"])
+    slots = cfg["max_workers"] + sum(limit["extra_episodes"] for limit in limits.values())
+    slow = limits["armadilloscp.workers.dev"]["max_episodes"] + limits["finalsignal.top"]["max_episodes"]
+    assert (limits["armadilloscp.workers.dev"]["max_episodes"], slots) == (96, 176)
+    assert slots - slow == cfg["max_workers"] - 48 - 16, "别的主机分到的槽位与单 IP 时一样"
+    assert cfg["download_queue_depth"] > slots
+
+
+def test_source_ips_pick_the_least_busy_ip():
+    conns = d.HostConnections(limits=TWO_IPS, proxy_url=lambda spec: pytest.fail("不该走代理"))
+    url = f"https://{BELFAST}/seg.ts"
+    with conns.connection(url) as a, conns.connection(url) as b, conns.connection(url) as c:
+        assert [a, b, c] == [{"source_ip": "10.0.0.1"}, {"source_ip": "10.0.0.2"}, {"source_ip": "10.0.0.1"}]
+        with conns.connection(url) as e:
+            assert e == {"source_ip": "10.0.0.2"}, "没设连接上限，不用等"
+    with conns.connection(url) as a:
+        with conns.connection(url) as b:
+            assert (a, b) == ({"source_ip": "10.0.0.1"}, {"source_ip": "10.0.0.2"})
+    assert conns.served_ips == {"10.0.0.1": 3, "10.0.0.2": 3}
+    assert conns.summary() == "限流主机分片请求：直连 6 次（10.0.0.1 3 次、10.0.0.2 3 次）、经代理 0 次"
+
+
+def test_direct_cap_counts_per_source_ip():
+    limits = {FINAL: {**LIMITS[FINAL], "direct": 1, "proxy": 0, "source_ips": ["10.0.0.1", "10.0.0.2"]}}
+    conns = d.HostConnections(limits=limits, proxy_url=lambda spec: None)
+    got_third = threading.Event()
+
+    def third():
+        with conns.connection(f"https://{FINAL}/c.ts"):
+            got_third.set()
+
+    with conns.connection(f"https://{FINAL}/a.ts") as a, conns.connection(f"https://{FINAL}/b.ts") as b:
+        assert (a, b) == ({"source_ip": "10.0.0.1"}, {"source_ip": "10.0.0.2"})
+        thread = threading.Thread(target=third)
+        thread.start()
+        assert not got_third.wait(0.2), "每个 IP 1 条，两条都占着时第 3 条要等"
+    assert got_third.wait(5)
+    thread.join(5)
+
+
+def test_segment_request_goes_out_from_the_source_ip(monkeypatch):
+    monkeypatch.setattr(d, "HOST_CONNECTIONS", d.HostConnections(limits=TWO_IPS))
+    calls = []
+
+    def fake_request(method, url, **kw):
+        calls.append(kw.get("source_ip"))
+        return b"\x47" * 188 * 4
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    monkeypatch.setattr(d, "validate_segment_content", lambda content, url: None)
+    with d.HOST_CONNECTIONS.connection(f"https://{BELFAST}/hold.ts"):     # 10.0.0.1 先占一条
+        d.download_single_segment(f"https://{BELFAST}/s1.ts", 0, 1, 0)
+    d.download_single_segment("https://bcdn.hakunaymatata.com/s2.ts", 1, 1, 0)
+    assert calls == ["10.0.0.2", None]
+
+
+def test_bound_session_really_sends_from_the_source_ip():
+    import http.server
+
+    clients = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            clients.append(self.client_address[0])
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/seg.ts"
+        assert d.request_with_retry("GET", url, retries=1, source_ip="127.0.0.1", total_timeout=5) == b"ok"
+    finally:
+        server.shutdown()
+    assert clients == ["127.0.0.1"]
+    adapter = d.get_session("127.0.0.1").get_adapter("https://example.com")
+    assert adapter.poolmanager.connection_pool_kw["source_address"] == ("127.0.0.1", 0)
+    assert d.get_session("127.0.0.1") is not d.get_session(), "默认出口的会话不受影响"
+    assert "source_address" not in d.get_session().get_adapter("https://example.com").poolmanager.connection_pool_kw

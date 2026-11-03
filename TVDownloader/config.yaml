@@ -543,6 +543,8 @@ download_tv:
   #    两边都有几千集排队时别的源一个槽位都分不到。19 号机先试过 Orion 96 集，belfast 没有更快（见 host_limits），
   #    改回 48，槽位保留 128：128 = Orion 48 + finalsignal 16 + 其余主机 64，到期重取的 vidlink 一来就有位子。
   #    hakunaymatata 另设集数上限 64（见 host_limits），槽位再多 mp4 也不超过原来的 1024 条连接。
+  # 2026-11-03 host_limits 配了多个出口 IP（source_ips）时，多出来的集数名额自动另加槽位：19 号机两个 IP
+  #    = 128 + 48 = 176。
   max_workers: 128         # 同时下载的集数
   # 主循环同时持有的“下载 future”上限（分批投递深度），必须 > max_workers。
   # 一次性把整轮几万集全部 submit 会让 wait(FIRST_COMPLETED) 每次都对全部
@@ -853,8 +855,13 @@ download_tv:
     # 2 GB 的集要下 3 个多小时，超过链接寿命。
     # 住宅代理（dataedpt）对所有 *.workers.dev 子域回 403 "address forbidden"（根域放行），要代理商加白名单；
     # 放行后再用 direct_connections / proxy_connections 把超出单 IP 上限的连接分到代理上。
+    # 2026-11-03 多出口 IP（source_ips，用户定，先在 19 号机试）：每台机器还有一个没用上的 IPv4。19 号机配上
+    # 103.195.100.154 后压测 90 秒，从它拿到 belfast 112 Mbps，同时 .17 上的 pipeline 105 → 87 Mbps，合计约
+    # 199 Mbps，上限确实按 IP 算。.env 里 TV_SOURCE_IPS 写本机的 IP（逗号分隔，含主 IP）；没写的机器照旧一个 IP。
+    # max_episodes 按每个 IP 算：两个 IP 就是 96 集，多出的 48 集另加 48 个下载槽位，别的主机的槽位不变。
     armadilloscp.workers.dev:
       max_episodes: 48
+      source_ips: env:TV_SOURCE_IPS
       backfill_max_parked: 200
     # 2026-11-03 hakunaymatata（vidlink 的 mp4：bcdn / bcdn4 / bcdnxw）封顶 64 集：max_workers 提到 128 后，
     # Orion 和 finalsignal 排空的时候 mp4 可能占满 128 个槽位 × 每集 16 块 = 2048 条连接，超过 09-15 实测
