@@ -155,7 +155,7 @@ def test_shipped_host_limits():
     assert cfg["host_limits"] == {"finalsignal.top": {"max_episodes": 16, "direct_connections": 200,
                                                       "proxy_connections": 600, "proxy": "residential",
                                                       "path_max_episodes": {"/fine/": 8}},
-                                  "armadilloscp.workers.dev": {"max_episodes": 96, "backfill_max_parked": 200},
+                                  "armadilloscp.workers.dev": {"max_episodes": 48, "backfill_max_parked": 200},
                                   "hakunaymatata.com": {"max_episodes": 64}}
     # 🔴 belfast 不能限连接数：总速度随连接数线性增长，限 200 条时 Orion 掉了约 80%（2026-11-02）。
     orion = d._parse_host_limits(cfg["host_limits"])["armadilloscp.workers.dev"]
