@@ -506,6 +506,12 @@ PLAYLIST_404_EXPIRED_AFTER_SECONDS = {
     for host, minutes in (_LINK_HEALTH_RAW.get("playlist_404_expired_after_minutes") or {}).items()
     if str(host).strip() and float(minutes) > 0
 }
+# 链接过期后主播放列表回 200、却解析不出变体和分片的主机（见 config.yaml 同名项与 _empty_playlist_as_expired）。
+PLAYLIST_EMPTY_EXPIRED_AFTER_SECONDS = {
+    str(host).strip().lower(): float(minutes) * 60
+    for host, minutes in (_LINK_HEALTH_RAW.get("playlist_empty_expired_after_minutes") or {}).items()
+    if str(host).strip() and float(minutes) > 0
+}
 # 按取流源限制链接可用时长（见 config.yaml 同名项与 _raise_if_link_too_old）。
 LINK_MAX_AGE_SECONDS = {
     str(provider).strip().lower(): float(minutes) * 60
@@ -3402,6 +3408,28 @@ def _playlist_error_as_expired(exc, url, link_age):
     return None
 
 
+def _empty_playlist_as_expired(url, link_age):
+    """主播放列表回 200 却解析不出变体和分片时，该不该按链接过期处理；该就返回挂了重取标记的异常。
+
+    link_health.playlist_empty_expired_after_minutes 里配了的主机、链接年龄（link_age，秒）到了才算，
+    年龄未知一律按原来的确定性失败处理。2026-11-03：finalsignal 上过期的 vidfast / vidup 链接回 200，
+    正文是 "error time check" 或只有一行路径，旧逻辑判"没有找到媒体播放列表"，不重试也不换链接，
+    三台卡了 2,648 集。不该算过期时返回 None。
+    """
+    if link_age is None or not PLAYLIST_EMPTY_EXPIRED_AFTER_SECONDS:
+        return None
+    host = _host_of(url)
+    after = PLAYLIST_EMPTY_EXPIRED_AFTER_SECONDS.get(
+        _host_rule_key(host, PLAYLIST_EMPTY_EXPIRED_AFTER_SECONDS), 0
+    )
+    if after > 0 and link_age >= after:
+        return RuntimeError(
+            f"播放列表回 200 却没有清晰度变体和分片；链接已 {link_age / 60:.0f} 分钟"
+            f"（{host} 上链接过期的表现），{_NEEDS_REFETCH_MARKER}"
+        )
+    return None
+
+
 def parse_master_playlist(master_url, retries=None, headers=None):
     """返回 [(resolution, media_playlist_url, declared_bandwidth_kbps), ...]。
 
@@ -4944,6 +4972,9 @@ def process_one_entry(entry, processed_ids):
                 raise
             raise expired from exc
         if not variants:
+            expired = _empty_playlist_as_expired(url, link_age_seconds(entry))
+            if expired is not None:
+                raise expired
             raise RuntimeError("没有找到媒体播放列表或清晰度变体")
 
         # 按声明分辨率高度从高到低排，高度相同时优先试 BANDWIDTH 高的。

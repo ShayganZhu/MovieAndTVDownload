@@ -7274,6 +7274,55 @@ def test_playlist_500_rule_ignores_other_hosts_errors_and_interrupts(playlist_50
     assert d.link_age_seconds({}) is None
 
 
+@pytest.fixture
+def playlist_empty(sandbox, monkeypatch):
+    monkeypatch.setattr(d, "PLAYLIST_EMPTY_EXPIRED_AFTER_SECONDS", {"finalsignal.top": 150 * 60})
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+
+
+@pytest.mark.parametrize("body", [
+    "error time check",                                    # 链接 6~10 小时（2026-11-03 23 号机实测）
+    "/r6/s/ma9yIsUHLd1oEUKmveBRD6CL9aSh9fi08J7f9fAYJaJBpCdYD0B",   # 只有一行路径（11 小时以上）
+])
+def test_aged_finalsignal_link_with_empty_playlist_goes_to_refetch(playlist_empty, monkeypatch, body):
+    """🔴 finalsignal 上过期的链接播放列表回 200 却没有变体和分片：满 150 分钟就进重取闭环。
+    旧逻辑判"没有找到媒体播放列表"（确定性失败），不重试也不换链接，三台卡了 2,648 集。"""
+    monkeypatch.setattr(d, "request_with_retry", lambda *a, **k: body)
+    _, ok, info = d.process_one_entry(_final_entry(200), set())
+    assert ok is False and info["needs_refetch"] is True
+    assert "链接过期的表现" in info["error"] and "没有找到媒体播放列表" not in info["error"]
+
+
+def test_fresh_or_other_host_empty_playlist_stays_a_permanent_failure(playlist_empty, monkeypatch):
+    """更年轻的链接、不知道年龄的、不在表里的主机：回空列表仍按原来的确定性失败处理。"""
+    monkeypatch.setattr(d, "parse_master_playlist", lambda url, retries=None, headers=None: [])
+    other = {**_final_entry(200), "urls": [{"url": "https://moon.goldenkite.top/r6/x/master.m3u8",
+                                            "provider": "vidup", "type": "m3u8"}]}
+    for entry in (_final_entry(30), {**_final_entry(200), "fetched_at": None}, other):
+        _, ok, info = d.process_one_entry(entry, set())
+        assert ok is False and info["retriable"] is False
+        assert not info.get("needs_refetch")
+        assert "没有找到媒体播放列表" in info["error"]
+
+
+def test_empty_playlist_rule_covers_every_finalsignal_subdomain(monkeypatch):
+    monkeypatch.setattr(d, "PLAYLIST_EMPTY_EXPIRED_AFTER_SECONDS", {"finalsignal.top": 150 * 60})
+    for host in ("sun.finalsignal.top", "sun1.finalsignal.top", "sun2.finalsignal.top"):
+        assert d._NEEDS_REFETCH_MARKER in str(d._empty_playlist_as_expired(f"https://{host}/m.m3u8", 151 * 60))
+    assert d._empty_playlist_as_expired("https://sun.finalsignal.top/m.m3u8", 149 * 60) is None
+    assert d._empty_playlist_as_expired("https://sun.finalsignal.top/m.m3u8", None) is None
+    assert d._empty_playlist_as_expired("https://moon.goldenkite.top/m.m3u8", 151 * 60) is None
+
+
+def test_shipped_empty_playlist_rule_covers_finalsignal():
+    import yaml
+
+    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
+                              encoding="utf-8"))["download_tv"]
+    assert cfg["link_health"]["playlist_empty_expired_after_minutes"] == {"finalsignal.top": 150}
+    assert d.PLAYLIST_EMPTY_EXPIRED_AFTER_SECONDS == {"finalsignal.top": 150 * 60}
+
+
 def test_shipped_playlist_500_rule_covers_finalsignal():
     import yaml
 
