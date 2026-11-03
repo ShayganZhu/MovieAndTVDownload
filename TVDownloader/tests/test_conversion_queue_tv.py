@@ -189,6 +189,42 @@ def test_run_drops_fake_nodes_and_skips_fake_only_rows(tmp_path, monkeypatch, ca
     assert "2 行只有假链接" in capsys.readouterr().out
 
 
+def test_run_skips_dropped_provider_nodes_and_their_unconverted_ts(tmp_path, monkeypatch, capsys):
+    """🔴 2026-11-03 停用 vidrock：已有链接不再下，上次下完没转的 ts 也不转、不上传，有别家节点就用别家的。"""
+    fresh = int(time.time())
+    monkeypatch.setattr(d, "DROPPED_PROVIDERS", frozenset({"vidrock"}))
+
+    def orion(n):
+        return {"url": f"https://belfast.armadilloscp.workers.dev/seg{n}", "provider": "vidrock",
+                "type": "m3u8", "link_checked": True}
+
+    entries = [
+        {"tmdbId": "96", "season": 1, "episode": 1, "title": "x", "urls": [orion(1), hls("96", 1)]},
+        {"tmdbId": "96", "season": 1, "episode": 2, "title": "x", "urls": [orion(2)]},
+        # 同集：较新的一行只有 vidrock，不能顶掉较早的别家链接
+        {"tmdbId": "96", "season": 1, "episode": 3, "title": "x", "fetched_at": fresh, "urls": [hls("96", 3)]},
+        {"tmdbId": "96", "season": 1, "episode": 3, "title": "x", "fetched_at": fresh + 1, "urls": [orion(3)]},
+        {"tmdbId": "96", "season": 1, "episode": 4, "title": "x", "urls": [orion(4), hls("96", 4)]},
+    ]
+    downloaded, uploads = _pipeline_env(tmp_path, monkeypatch, entries, lambda url: ())
+    monkeypatch.setattr(d, "detect_overlays", lambda p: (_scan(), []))
+    monkeypatch.setattr(d, "TEMP_DIR", str(tmp_path / "temp"))
+    job = _ts_job(tmp_path / "temp", "96_S01E04")
+    job.update(provider="vidrock", node=orion(4), url=orion(4)["url"])
+    _write_journal([job])
+
+    d._run_pipeline()
+
+    assert sorted(key for key, _ in downloaded) == ["96_S01E01", "96_S01E03", "96_S01E04"]
+    assert all("armadilloscp" not in url for _, url in downloaded)
+    assert sorted(uploads) == ["96_S01E01", "96_S01E03", "96_S01E04"]
+    out = capsys.readouterr().out
+    assert "2 行只有已停用源（vidrock）的链接" in out
+    assert "1 集已下完、还没转封装，但来自已停用的源（vidrock）" in out
+    assert "发现 1 集已下完、还没转封装" not in out
+    assert d.load_resumable_conversions() == []
+
+
 def test_run_resumes_assets_only_pending_at_startup(tmp_path, monkeypatch):
     downloaded, _uploads = _pipeline_env(tmp_path, monkeypatch, [], lambda url: ())
     monkeypatch.setattr(d, "S3_ENABLED", True)

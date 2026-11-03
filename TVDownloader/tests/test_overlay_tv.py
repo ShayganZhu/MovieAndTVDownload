@@ -383,6 +383,7 @@ def test_pipeline_requeues_episode_after_transient_orion_failure(tmp_path, monke
              "provider": "vidrock", "type": "m3u8", "link_checked": True}
     entries = [{"tmdbId": "95", "season": 1, "episode": 1, "title": "x", "urls": [orion]}]
     downloaded, uploads = _pipeline_env(tmp_path, monkeypatch, entries, lambda url: ())
+    monkeypatch.setattr(d, "DROPPED_PROVIDERS", frozenset())   # 出厂已停用 vidrock，这里测机制本身
     monkeypatch.setattr(d, "TRANSIENT_REQUEUE_PROVIDERS", frozenset({"vidrock"}))
     monkeypatch.setattr(d, "TRANSIENT_REQUEUE_DELAY_SECONDS", 0)
     monkeypatch.setattr(d, "TRANSIENT_REQUEUE_JITTER_SECONDS", 0)
@@ -441,6 +442,7 @@ def test_expired_episode_goes_to_single_source_refetch_only_if_just_that_source_
     monkeypatch.setattr(d, "async_refetch_hook", full)
     monkeypatch.setattr(d, "provider_refetch_hook", only)
     monkeypatch.setattr(d, "PROVIDER_REFETCH_PROVIDER", "vidrock")
+    monkeypatch.setattr(d, "DROPPED_PROVIDERS", frozenset())   # 出厂已停用 vidrock，这里测机制本身
     monkeypatch.setattr(d, "dispatch_stale_entries_async", lambda batch, counts: 0)
     monkeypatch.setattr(d, "ListEntrySource", lambda es: d._ListEntrySource(es))
     monkeypatch.setattr(d, "process_one_entry", lambda entry, ids: ("96_S01E01", False, {
@@ -454,8 +456,8 @@ def test_expired_episode_goes_to_single_source_refetch_only_if_just_that_source_
     assert ("只问 vidrock" in capsys.readouterr().out) is single
 
 
-def test_shipped_provider_refetch_only_asks_vidrock():
-    assert d.PROVIDER_REFETCH_PROVIDER == "vidrock"
+def test_shipped_provider_refetch_is_off_since_vidrock_was_dropped():
+    assert d.PROVIDER_REFETCH_PROVIDER == "", "2026-11-03 随 vidrock 停用关掉"
     assert d.PROVIDER_REFETCH_WORKERS == 4
 
 

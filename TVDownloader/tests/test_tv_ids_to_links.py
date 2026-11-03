@@ -624,11 +624,12 @@ def test_vidrock_without_usable_line_is_no_source_and_errors_are_transient():
     assert not isinstance(err.value, m.NoSource)
 
 
-def test_vidrock_goes_direct_and_is_the_last_shipped_provider():
+def test_vidrock_goes_direct_but_is_no_longer_a_shipped_provider():
     assert m._route_for(m.VIDROCK_API) is m.VIDROCK_ROUTE
     assert m._route_for("https://other.example/x") is None
     assert m.VIDROCK_ROUTE.enabled is True
-    assert m.ACTIVE_PROVIDERS == ["vidup", "vidfast", "vidlink", "vidrock"]
+    # 2026-11-03 移出（用户定）：分片被 belfast 截断，成品有缺口。
+    assert m.ACTIVE_PROVIDERS == ["vidup", "vidfast", "vidlink"]
     assert "vidrock" not in m.BREAKER_BLOCKS_DEAD, "第三方接口抖动不能阻止判无源"
 
 

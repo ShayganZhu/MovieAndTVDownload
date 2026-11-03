@@ -216,7 +216,8 @@ def test_start_backfill_reads_download_ledgers_and_reports(box, monkeypatch, cap
 
 
 def test_shipped_backfill_config():
-    assert m.BACKFILL_ENABLED is True and m.BACKFILL_PROVIDER == "vidrock"
+    # 2026-11-03 随 vidrock 停用关掉（用户定），其余设置留着备恢复。
+    assert m.BACKFILL_ENABLED is False and m.BACKFILL_PROVIDER == "vidrock"
     assert m.BACKFILL_CATEGORIES[0] == "bad_vidlink" and m.BACKFILL_CATEGORIES[-1] == "no_source"
     assert m.BACKFILL_PER_MINUTE <= 120
 

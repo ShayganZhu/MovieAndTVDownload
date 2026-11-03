@@ -390,8 +390,10 @@ def test_shipped_providers_and_dead_confirm():
     path = os.path.join(os.path.dirname(m.__file__), "config.yaml")
     cfg = yaml.safe_load(open(path, encoding="utf-8"))["tv_ids_to_links"]
     assert "videasy" in m.PROVIDERS, "代码保留，要恢复就加回 providers"
-    assert cfg["providers"] == ["vidup", "vidfast", "vidlink", "vidrock"], \
-        "2026-10-30 起移出 videasy：23 号机首轮没有一集只有它有、也没有一集用它下成"
+    assert cfg["providers"] == ["vidup", "vidfast", "vidlink"], \
+        "2026-10-30 起移出 videasy：23 号机首轮没有一集只有它有、也没有一集用它下成；" \
+        "2026-11-03 移出 vidrock：分片被截断，成品有缺口"
+    assert "vidrock" in m.PROVIDERS, "代码保留，要恢复就加回 providers"
     assert cfg["dead_confirm"] is False and m.DEAD_CONFIRM is False, \
         "TV 全量关闭判死二次确认（用户 2026-10-30 定）"
     assert cfg["max_workers"] == 200, "取流是下载的上游瓶颈（2026-10-30 23 号机实测）"

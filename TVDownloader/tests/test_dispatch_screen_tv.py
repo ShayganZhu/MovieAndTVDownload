@@ -504,6 +504,30 @@ def test_vidrock_node_on_workers_dev_survives_the_fake_filter_and_is_not_a_bad_v
     assert d._normalize_url_entry(node)["headers"]["Referer"] == "https://vidrock.to/"
 
 
+def test_drop_disabled_provider_nodes_only_touches_those_providers(monkeypatch):
+    monkeypatch.setattr(d, "DROPPED_PROVIDERS", frozenset({"vidrock"}))
+    orion = {"url": FAKE, "provider": "VidRock", "type": "m3u8", "link_checked": True}
+    real = vid("33")
+    entry = ep(33, 1, [orion, real, "https://old.example/plain.m3u8"])
+    stripped, removed = d.drop_disabled_provider_nodes(entry)
+    assert removed == 1 and stripped["urls"] == [real, "https://old.example/plain.m3u8"]
+    assert len(entry["urls"]) == 3, "不改原条目"
+    assert d.drop_disabled_provider_nodes(stripped) == (stripped, 0)
+    monkeypatch.setattr(d, "DROPPED_PROVIDERS", frozenset())
+    assert d.drop_disabled_provider_nodes(entry) == (entry, 0), "没配就不动"
+
+
+def test_shipped_config_drops_vidrock_everywhere():
+    """2026-11-03 用户定停用 vidrock：取流、回扫、单源重取、稍后重排都不再用它，已有节点也不下。"""
+    import tv_ids_to_links as fetcher
+
+    assert "vidrock" not in fetcher.ACTIVE_PROVIDERS
+    assert not fetcher.BACKFILL_ENABLED
+    assert d.DROPPED_PROVIDERS == frozenset({"vidrock"})
+    assert d.PROVIDER_REFETCH_PROVIDER == ""
+    assert "vidrock" not in d.TRANSIENT_REQUEUE_PROVIDERS
+
+
 def test_episode_with_fake_node_no_longer_escapes_the_vidlink_hold(monkeypatch):
     """🔴 假节点算"别的节点"的话，bcdnxw + workers.dev 的集会绕过挂起、到点也换不到链接。"""
     monkeypatch.setattr(d, "FAKE_LINK_HOSTS", ("workers.dev",))

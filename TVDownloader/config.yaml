@@ -153,11 +153,16 @@ tv_ids_to_links:
   # 下载失败 0 集，画质通过约六成，对照组时长与已入库版本相差不到 10 秒。排在最后：码率低于其余三家。
   # 它不在 provider_breaker.blocks_dead 里，出错不阻止判死，第三方接口的抖动不拖累取流。
   # 重取换回来的新链接也按本列表来，不在列表里的话重取会把它的节点丢掉。
-  providers: [vidup, vidfast, vidlink, vidrock]
+  # 🔴 2026-11-03 移出 vidrock（用户定）：它的分片在 belfast.armadilloscp.workers.dev 上传输中被截断、
+  # Cloudflare 还把截断的缓存下来，流水线看不出来；R2 抽查 19 号机 12 集 Orion 成品每集缺 7.5~101 秒、
+  # 23 号机 8 集每集缺 4~8 秒，账本却大多记 0 缺片。已有链接也不再下（见 link_health.dropped_providers）。
+  # 代码仍保留，要恢复就加回本列表、打开 backfill、清掉 dropped_providers。
+  providers: [vidup, vidfast, vidlink]
   # 回扫（2026-11-02）：取流主流程跑完后，已有结论的集再问一遍新源，重启接着问。
   # 结果和普通取流一样入队，下载跟不上就等，所以链接拿到后很快就下。
+  # 2026-11-03 随 vidrock 一起关掉（它是唯一的回扫源）。
   backfill:
-    enabled: true
+    enabled: false
     provider: vidrock
     workers: 16
     max_per_minute: 120         # 接口每集约 5 秒；上限没测过，看到 429 就往下调
@@ -915,8 +920,9 @@ download_tv:
   # n × delay_seconds + 随机 0~jitter_seconds，避免一次熔断失败的几十集同时回去。每集每次运行最多
   # max_per_episode 次。只配 vidrock：finalsignal / bcdnxw 实测重投救不回来（见 max_rounds 的记录）。
   # providers 留空即关闭。
+  # 2026-11-03 随 vidrock 停用清空（关闭）。
   transient_requeue:
-    providers: [vidrock]
+    providers: []
     max_per_episode: 3
     delay_seconds: 120
     jitter_seconds: 180
@@ -951,6 +957,11 @@ download_tv:
     # （01~14 时），不是无源证据，同样的集过后再问约 38% 拿到真链接。整项留空即关闭。
     fake_link_hosts:
       - workers.dev
+    # 停用的取流源（2026-11-03，用户定）：results.jsonl 里这些源的节点读入时去掉，只有它们的行不算取到过链接
+    # （同集更早的别家链接照常下）；上次下完还没转封装的也不再转，ts 随 temp 清理删掉。
+    # vidrock：分片被 belfast 截断，成品有缺口，见 tv_ids_to_links.providers 的说明。用户的口径：宁可不要，
+    # 也不要完整度不高的集。
+    dropped_providers: [vidrock]
     # 签名过期时播放列表回 HTTP 500（而不是 401/403）的主机：链接年龄（从 fetched_at 算）到这么多
     # 分钟、重试耗尽仍是 500 就按过期处理、进重取闭环（电影侧 f4889f9 移植）。finalsignal 上的
     # vidup / videasy 链接约 3 小时后播放列表开始回 500，不挂重取标记的话这一集本次运行永远换不到
@@ -971,8 +982,9 @@ download_tv:
     # 2026-11-02 19 号机实测：全源重取约每分钟 8 集，一小时被上面的时长限制拒下 1,226 集，只有 90 集
     # 拿到新节点。4 线程实测约每分钟 27 集，命中 45%（线程少是因为要和回扫共用同一个接口，接口的
     # 限流没测过）。pipeline 模式才生效，provider 留空即关闭。
+    # 2026-11-03 随 vidrock 停用关闭（provider 留空）。
     provider_refetch:
-      provider: vidrock
+      provider: ""
       workers: 4
   # 画质预检样本大小（字节）：整片下载前先取头部这么多字节，用 ffprobe 读 moov
   # 判分辨率/编码/时长，码率 = Range 探测到的总长 × 8 / 时长。判定口径与下完整片

@@ -487,6 +487,13 @@ FAKE_LINK_HOSTS = tuple(
     for host in (_LINK_HEALTH_RAW.get("fake_link_hosts") or [])
     if str(host).strip()
 )
+# 停用的取流源（2026-11-03，见 config.yaml link_health.dropped_providers）：这些源的节点读入时去掉，
+# 上次下完还没转封装的也不再转。
+DROPPED_PROVIDERS = frozenset(
+    str(provider).strip().lower()
+    for provider in (_LINK_HEALTH_RAW.get("dropped_providers") or [])
+    if str(provider).strip()
+)
 # 签名过期时播放列表回 500 的主机：链接满这么久（秒）后的 500 按过期处理（见 _playlist_500_as_expired）。
 PLAYLIST_500_EXPIRED_AFTER_SECONDS = {
     str(host).strip().lower(): float(minutes) * 60
@@ -2857,16 +2864,25 @@ def load_resumable_conversions():
     except OSError:
         return []
     resumable = []
+    dropped = 0
     for job in latest.values():
         final_ts = job.get("final_ts")
         if (not isinstance(final_ts, str) or os.path.dirname(final_ts) != TEMP_DIR
                 or not isinstance(job.get("entry"), dict)):
             continue
         try:
-            if os.path.getsize(final_ts) == job.get("ts_size"):
-                resumable.append(job)
+            if os.path.getsize(final_ts) != job.get("ts_size"):
+                continue
         except OSError:
             continue
+        if str(job.get("provider") or "").strip().lower() in DROPPED_PROVIDERS:
+            # 停用源下的 ts 不转：不算接着转的集，启动清 temp 时它的 ts 一并删掉，这一集按别家节点重下。
+            dropped += 1
+            continue
+        resumable.append(job)
+    if dropped:
+        print(f"{dropped} 集已下完、还没转封装，但来自已停用的源（{'、'.join(sorted(DROPPED_PROVIDERS))}），"
+              f"不再转，ts 随 temp 清理删掉", flush=True)
     return resumable
 
 
@@ -6159,6 +6175,22 @@ def drop_fake_nodes(entry):
     return stripped, len(raw) - len(kept)
 
 
+def _is_dropped_node(item):
+    """已停用的取流源的节点（provider 在 DROPPED_PROVIDERS）。老格式字符串是 vidup，不在其列。"""
+    return isinstance(item, dict) and str(item.get("provider") or "").strip().lower() in DROPPED_PROVIDERS
+
+
+def drop_disabled_provider_nodes(entry):
+    """去掉已停用的取流源的节点。返回 (条目, 去掉了几个节点)；没去掉时原样返回同一个对象。"""
+    raw = entry.get("urls") or []
+    kept = [item for item in raw if not _is_dropped_node(item)]
+    if len(kept) == len(raw):
+        return entry, 0
+    stripped = dict(entry)
+    stripped["urls"] = kept
+    return stripped, len(raw) - len(kept)
+
+
 def strip_rejected_nodes(entry):
     """去掉这一集已检出硬字幕/水印的版本。返回 (条目, 去掉了几个节点)。
 
@@ -7871,6 +7903,7 @@ def _run_pipeline():
     invalid_input_count = 0
     skipped_processed_count = 0
     fake_only_count = 0
+    dropped_only_count = 0
     input_lines = []
     if os.path.exists(INPUT_JSONL):
         with open(INPUT_JSONL, "r", encoding="utf-8") as file:
@@ -7903,6 +7936,11 @@ def _run_pipeline():
             # 这一行只有假链接，不当它取到过链接（同集更早的真链接行不被它顶掉）。
             fake_only_count += 1
             continue
+        entry, dropped_removed = drop_disabled_provider_nodes(entry)
+        if dropped_removed and not entry["urls"]:
+            # 只有停用源的节点：同假链接，这一行不算（同集更早的别家链接行照常用）。
+            dropped_only_count += 1
+            continue
         previous = by_key.get(normalized_id)
         if previous is not None:
             duplicate_input_count += 1
@@ -7926,6 +7964,8 @@ def _run_pipeline():
         f"{duplicate_input_count} 个重复集（同集取 fetched_at 最新的一条）、"
         f"{invalid_input_count} 个缺少身份字段的条目"
         + (f"、{fake_only_count} 行只有假链接（交给取流侧重新判定）" if fake_only_count else "")
+        + (f"、{dropped_only_count} 行只有已停用源（{'、'.join(sorted(DROPPED_PROVIDERS))}）的链接"
+           if dropped_only_count else "")
     )
 
     ignored_errors = {

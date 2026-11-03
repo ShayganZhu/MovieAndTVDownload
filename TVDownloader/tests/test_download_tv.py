@@ -2225,7 +2225,7 @@ def test_shipped_trip_wait_and_requeue_settings_only_cover_orion():
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
                               encoding="utf-8"))["download_tv"]
     assert cfg["m3u8_host_circuit_wait_hosts"] == ["armadilloscp.workers.dev"]
-    assert cfg["transient_requeue"]["providers"] == ["vidrock"]
+    assert cfg["transient_requeue"]["providers"] == [], "2026-11-03 随 vidrock 停用关掉"
     assert cfg["link_health"]["playlist_404_expired_after_minutes"] == {"armadilloscp.workers.dev": 120}
 
 
