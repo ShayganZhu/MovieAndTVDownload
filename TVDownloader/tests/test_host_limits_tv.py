@@ -5,6 +5,7 @@ import threading
 import time
 
 import pytest
+import requests
 
 import download_tv as d
 
@@ -110,6 +111,124 @@ def test_download_proxy_url_specs(monkeypatch):
     assert d._download_proxy_url("residential").startswith("http://u:p@4x3h6x5m-as.dataedpt.com:")
 
 
+# ------------------------------------------------------------ 代理池按连接分 session（每条连接一个出口 IP）
+
+SESSIONS = {FINAL: {**LIMITS[FINAL], "direct": 1, "proxy": 3, "proxy_session_per_connection": True}}
+POOL = "http://alice%40corp:p%3Aw@v6.example:8000"
+
+
+def _http_error(status):
+    resp = requests.Response()
+    resp.status_code = status
+    cause = requests.HTTPError(f"{status} Client Error", response=resp)
+    try:
+        raise RuntimeError(f"请求失败: {status}") from cause
+    except RuntimeError as exc:
+        return exc
+
+
+def _session_of(route):
+    url = route["proxies"]["https"]
+    assert route["proxies"]["http"] == url
+    return url.split("-session-", 1)[1].split(":", 1)[0]
+
+
+def test_proxy_url_with_session_appends_to_the_username():
+    assert (d._proxy_url_with_session(POOL, "ab12")
+            == "http://alice%40corp-session-ab12:p%3Aw@v6.example:8000")
+    assert d._proxy_url_with_session("http://bob@p.example:1", "x") == "http://bob-session-x@p.example:1"
+    assert d._proxy_url_with_session("http://p.example:1", "x") == "http://p.example:1", "没账号就不拼"
+
+
+def test_each_concurrent_proxy_connection_gets_its_own_session():
+    conns = d.HostConnections(limits=SESSIONS, proxy_url=lambda spec: POOL)
+    routes, release, entered = [], threading.Event(), threading.Barrier(5)
+
+    def take():
+        with conns.connection(f"https://{FINAL}/seg.ts") as route:
+            routes.append(route)
+            if len(routes) <= 4:
+                entered.wait(5)
+                release.wait(5)
+
+    threads = [threading.Thread(target=take) for _ in range(5)]
+    for t in threads:
+        t.start()
+    entered.wait(5)                          # 直连 1 条 + 代理 3 条已经拿到名额
+    time.sleep(0.2)
+    assert len(routes) == 4, "第 5 个请求要等名额"
+    proxied = [r for r in routes if "proxies" in r]
+    assert len(proxied) == 3 and len({_session_of(r) for r in proxied}) == 3, "同时在用的代理连接各一个 session"
+    assert all(r["proxies"]["https"].startswith("http://alice%40corp-session-") for r in proxied)
+    release.set()
+    for t in threads:
+        t.join(5)
+    assert len(routes) == 5 and sum(conns.served.values()) == 5 and conns.served["proxy"] >= 3
+
+
+def test_a_thread_gets_its_own_session_back_to_reuse_the_tunnel():
+    conns = d.HostConnections(limits=SESSIONS, proxy_url=lambda spec: POOL)
+    with conns.connection(f"https://{FINAL}/hold.ts"):              # 直连名额先占掉
+        with conns.connection(f"https://{FINAL}/a.ts") as a:
+            first = _session_of(a)
+        with conns.connection(f"https://{FINAL}/b.ts") as b:
+            assert _session_of(b) == first, "同一线程接着拿同一个编号、同一个出口"
+        other = []
+        th = threading.Thread(target=lambda: other.append(_session_of(conns.connection(f"https://{FINAL}/c.ts").__enter__())))
+        with conns.connection(f"https://{FINAL}/d.ts") as dd:      # 本线程占着自己的编号时别的线程拿别的
+            th.start()
+            th.join(5)
+            assert other and other[0] != _session_of(dd)
+
+
+def test_429_replaces_only_that_connections_session():
+    conns = d.HostConnections(limits=SESSIONS, proxy_url=lambda spec: POOL)
+    with conns.connection(f"https://{FINAL}/hold.ts"):
+        with conns.connection(f"https://{FINAL}/a.ts") as a:
+            before = _session_of(a)
+        with pytest.raises(RuntimeError):
+            with conns.connection(f"https://{FINAL}/b.ts") as b:
+                assert _session_of(b) == before
+                raise _http_error(503)
+        with conns.connection(f"https://{FINAL}/c.ts") as c:
+            assert _session_of(c) == before, "非 429 不换 IP"
+        with pytest.raises(RuntimeError):
+            with conns.connection(f"https://{FINAL}/e.ts") as e:
+                raise _http_error(429)
+        with conns.connection(f"https://{FINAL}/f.ts") as f:
+            assert _session_of(f) != before, "这个出口被限了，换一个"
+    assert conns.rotated == {FINAL: 1}
+    assert conns.summary().endswith("（回 429 换出口 IP 1 次）")
+    # 名额都还回去了：3 个代理编号全空
+    assert conns._session_busy[FINAL] == set() and conns._in_use[(FINAL, "proxy")] == 0
+
+
+def test_without_session_flag_the_proxy_url_is_used_as_is():
+    conns = d.HostConnections(limits={FINAL: {**SESSIONS[FINAL], "proxy_session_per_connection": False}},
+                              proxy_url=lambda spec: POOL)
+    with conns.connection(f"https://{FINAL}/hold.ts"):
+        with conns.connection(f"https://{FINAL}/a.ts") as a:
+            assert a == {"proxies": {"http": POOL, "https": POOL}}
+        with pytest.raises(RuntimeError):
+            with conns.connection(f"https://{FINAL}/b.ts"):
+                raise _http_error(429)
+    assert conns.rotated == {}
+
+
+def test_session_flag_with_missing_proxy_falls_back_to_direct_only(capsys):
+    conns = d.HostConnections(limits=SESSIONS, proxy_url=lambda spec: None)
+    with conns.connection(f"https://{FINAL}/hold.ts") as a:
+        assert a == {}
+        got = []
+        th = threading.Thread(target=lambda: got.append(conns.connection(f"https://{FINAL}/b.ts").__enter__()))
+        th.start()
+        th.join(0.5)
+        assert not got, "代理没配：只有直连名额，满了就等"
+    th.join(5)
+    assert got == [{}]
+    assert "代理分流没配好" in capsys.readouterr().out
+
+
 # ------------------------------------------------------------ 集数上限：满了排队、不占槽位
 
 def test_lane_full_episodes_queue_while_other_hosts_pass(capsys):
@@ -152,8 +271,9 @@ def test_shipped_host_limits():
 
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
                               encoding="utf-8"))["download_tv"]
-    assert cfg["host_limits"] == {"finalsignal.top": {"max_episodes": 16, "direct_connections": 200,
-                                                      "proxy_connections": 600, "proxy": "residential",
+    assert cfg["host_limits"] == {"finalsignal.top": {"max_episodes": 16, "direct_connections": 16,
+                                                      "proxy_connections": 256, "proxy": "env:TV_PROXY_V6_URL",
+                                                      "proxy_session_per_connection": True,
                                                       "path_max_episodes": {"/fine/": 8}},
                                   "armadilloscp.workers.dev": {"max_episodes": 48, "source_ips": "env:TV_SOURCE_IPS",
                                                                "backfill_max_parked": 200},
@@ -161,7 +281,13 @@ def test_shipped_host_limits():
     # 🔴 belfast 不能限连接数：总速度随连接数线性增长，限 200 条时 Orion 掉了约 80%（2026-11-02）。
     orion = d._parse_host_limits(cfg["host_limits"])["armadilloscp.workers.dev"]
     assert (orion["direct"], orion["proxy"]) == (0, 0)
-    assert d._parse_host_limits(cfg["host_limits"])["finalsignal.top"]["path_max_episodes"] == {"/fine/": 8}
+    final = d._parse_host_limits(cfg["host_limits"])["finalsignal.top"]
+    assert final["path_max_episodes"] == {"/fine/": 8}
+    # 11-04 起 finalsignal 走按连接分 session 的 IPv6 代理池：集数封顶时的全部分片连接（每集 segment_concurrency 条）
+    # 直连 + 代理名额要装得下，不然分片排队等名额；直连只留少量，免得主 IPv4 吃 429。
+    assert final["proxy_session_per_connection"] and final["proxy_spec"] == "env:TV_PROXY_V6_URL"
+    assert final["direct"] + final["proxy"] >= final["max_episodes"] * cfg["segment_concurrency"]
+    assert final["direct"] <= 32
     # 集数上限必须给别的主机留出槽位，否则 finalsignal 的慢集占满全部槽位、vidlink 排不上。
     assert cfg["max_workers"] - cfg["host_limits"]["finalsignal.top"]["max_episodes"] >= 16
     assert cfg["max_workers"] - cfg["host_limits"]["armadilloscp.workers.dev"]["max_episodes"] >= 16

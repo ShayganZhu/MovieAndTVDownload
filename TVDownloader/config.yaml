@@ -829,6 +829,8 @@ download_tv:
   #     排不上，带宽两头都用不上（23 号机重启后 31 个槽位里 20 集 30 秒没长一个字节）。
   # proxy：residential = 取流那套住宅代理；env:变量名 = 从 .env 读代理 URL（换 IPv6 等别的代理用，
   # 含账号的 URL 不要写进本文件）。设 direct_connections: 0 即整段不限。
+  # proxy_session_per_connection: true = 代理是按用户名 -session-<id> 换出口的 IP 池，每条在用的代理连接
+  # 各占一个 session（一个出口 IP），回 429 就给它换一个。
   host_limits:
     # 🔴 2026-10-31 键由 sun.finalsignal.top 改为父域：新链接已换到 sun1 / sun2（同一批 Cloudflare IP），
     #    写精确主机名时这里的名额对它们全不生效。现在全部子域共用这一份名额。
@@ -840,9 +842,18 @@ download_tv:
       # 2026-11-01 临时 48 → 16：finalsignal 各路径都几乎下不动（干净 IP 上 /fine/ 单连接 0.3 Mbps、
       # /b3f8c21a/ 6 条全失败，同时 goldenkite 173 Mbps），48 个名额全耗在慢集上。恢复后调回 48。
       max_episodes: 16
-      direct_connections: 200
-      proxy_connections: 600
-      proxy: residential
+      # 2026-11-04 改走用户的 IPv6 代理池（用户定，先在 24 号机试）：finalsignal 的 429 是 Cloudflare 按出口 IP
+      # 限流（retry-after 10）。24 号机实测同一个 IP 64 / 128 条连接 11% / 30% 回 429、封顶约 500 Mbps；
+      # 每条连接一个 IP 时 0 个 429，64 / 128 条 504 / 944 Mbps。代理池固定带宽（至少 5 Gbps，用户说三台
+      # 每条连接独立 IP 也够用），按用户名 -session-<id> 换出口，200 个 session 是 200 个不同的 /64。
+      # 所以直连只留 16 条（主 IPv4 自己的量少了，播放列表请求也少吃 429），其余每条连接走一个独立 IP。
+      # 16 集 × 每集 16 条 = 256 条，直连 16 + 代理 256 名额够用、不用等。
+      # 代理 URL（带账号）在 .env 的 TV_PROXY_V6_URL；没配的机器只用直连 16 条，启动时打告警。
+      # 住宅代理（residential）对 finalsignal 单连接只有 0.73 Mbps，已不再用于这台主机。
+      direct_connections: 16
+      proxy_connections: 256
+      proxy: env:TV_PROXY_V6_URL
+      proxy_session_per_connection: true
       # 2026-10-31（用户定）/fine/ 路径单独封顶 16 集：它的分片大量 400 / 502，与连接数和出口 IP 都无关，
       # 重启后 19、24 号机在下的 finalsignal 几乎全是它。封顶后其余 32 个名额留给别的路径。
       # 2026-11-01 16 → 8：封顶路径优先派，总名额降到 16 后不留余地的话 /fine/ 会占满全部。

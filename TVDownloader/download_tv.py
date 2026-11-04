@@ -11,6 +11,7 @@ import math
 import multiprocessing
 import random
 import re
+import secrets
 import statistics
 import shutil
 import signal
@@ -32,7 +33,7 @@ from concurrent.futures import (
 )
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 import urllib3
@@ -533,6 +534,10 @@ TRANSIENT_REQUEUE_JITTER_SECONDS = max(0.0, float(_TRANSIENT_REQUEUE_RAW.get("ji
 #   proxy_connections  直连名额满了之后经代理的连接上限；0 = 不走代理、等直连名额
 #   proxy              residential = 取流那套住宅代理（tv_ids_to_links.proxy + .env 的账号）；
 #                      env:变量名 = 从 .env / 环境变量读代理 URL（含账号的 URL 别写进配置）
+#   proxy_session_per_connection  true = 代理是按用户名轮换出口的 IP 池（用户名后拼 -session-<id>，同一个 id
+#                      固定一个出口 IP，换 id 换 IP）：每条在用的代理连接各占一个 session，即各用一个出口 IP；
+#                      某条连接回 429 就给它换个 id。2026-11-04 24 号机实测 finalsignal 按 IP 限流：同一个 IP
+#                      64 / 128 条连接 11% / 30% 回 429、封顶约 500 Mbps，每条连接一个 IP 时 0 个 429、128 条 944 Mbps
 #   path_max_episodes  {路径前缀: 集数}：在 max_episodes 之内，这些路径单独封顶（2026-10-31，/fine/ 的
 #                      分片大量 400 / 502，不封顶会占满名额）；max_episodes 为 0 时不起作用
 #   backfill_max_parked 这台主机排队的集到这么多，回扫的新链接先等着（见 backfill_should_wait）；0 = 不等
@@ -578,6 +583,7 @@ def _parse_host_limits(raw):
             "direct": max(0, int(limit.get("direct_connections") or 0)),
             "proxy": max(0, int(limit.get("proxy_connections") or 0)),
             "proxy_spec": str(limit.get("proxy") or "residential").strip(),
+            "proxy_session_per_connection": bool(limit.get("proxy_session_per_connection")),
             "path_max_episodes": {
                 str(prefix): int(cap)
                 for prefix, cap in (limit.get("path_max_episodes") or {}).items() if int(cap) > 0
@@ -3825,10 +3831,24 @@ def _download_proxy_url(spec):
     return f"http://{user}:{password}@{host}:{random.randint(int(ports[0]), int(ports[-1]))}"
 
 
+def _proxy_url_with_session(url, session_id):
+    """按用户名轮换出口的代理池：用户名后拼 -session-<id>（同一个 id 固定一个出口 IP，换 id 换 IP）。
+    URL 里没有账号时原样返回。"""
+    parts = urlsplit(url)
+    userinfo, sep, hostport = parts.netloc.rpartition("@")
+    if not sep:
+        return url
+    user, colon, password = userinfo.partition(":")
+    return urlunsplit(parts._replace(netloc=f"{user}-session-{session_id}{colon}{password}@{hostport}"))
+
+
 class HostConnections:
     """限流主机（HOST_LIMITS）的分片连接名额：先用直连名额，满了用代理名额，都满就等。
 
     主机配了多个出口 IP（source_ips）时，直连挑在用连接最少的那个 IP 发出，直连名额按每个 IP 算。
+    配了 proxy_session_per_connection 时，代理名额按编号分成 proxy_connections 个 session，每条在用的
+    代理连接独占一个（即独占一个出口 IP），线程优先拿回自己上次那个编号以复用已建好的隧道；
+    这条连接回 429 就给这个编号换个 session id（换出口 IP）。
     只管 HLS 分片请求（download_single_segment）：一集的分片下载有 segment_concurrency 个线程，
     每个请求发出前拿一个名额、请求结束（不论成败）就还，退避等待期间不占名额。
     代理拼不出来（没配账号）时只用直连名额，首次打一行告警。线程安全。
@@ -3840,8 +3860,13 @@ class HostConnections:
         self._cond = threading.Condition()
         self._in_use = Counter()
         self._proxies = {}
+        self._session_ids = {}        # host → {编号: session id}
+        self._session_busy = {}       # host → 在用的编号
+        self._session_proxies = {}    # (host, 编号) → (session id, proxies)
+        self._local = threading.local()
         self.served = Counter()
         self.served_ips = Counter()
+        self.rotated = Counter()
 
     def _proxy_for(self, host, limit):
         if host not in self._proxies:
@@ -3851,6 +3876,28 @@ class HostConnections:
                 print(f"⚠️ {host} 的代理分流没配好（proxy: {limit['proxy_spec']}），只用直连名额",
                       flush=True)
         return self._proxies[host]
+
+    def _take_session(self, host, limit):
+        """（持锁调用）挑一个空闲的 session 编号：本线程上次那个空着就用它，否则用编号最小的空闲的。
+        调用前已确认在用的代理连接数 < proxy_connections，所以一定有空闲编号。"""
+        busy = self._session_busy.setdefault(host, set())
+        slots = self._local.__dict__.setdefault("slots", {})
+        index = slots.get(host)
+        if index is None or index in busy or index >= limit["proxy"]:
+            index = next(i for i in range(limit["proxy"]) if i not in busy)
+        busy.add(index)
+        slots[host] = index
+        ids = self._session_ids.setdefault(host, {})
+        if index not in ids:
+            ids[index] = secrets.token_hex(6)
+            if len(ids) == 1:
+                print(f"🌐 {host} 的代理按连接分 session：每条代理连接一个出口 IP，最多 {limit['proxy']} 个",
+                      flush=True)
+        cached = self._session_proxies.get((host, index))
+        if cached is None or cached[0] != ids[index]:
+            url = _proxy_url_with_session(self._proxy_for(host, limit)["https"], ids[index])
+            cached = self._session_proxies[(host, index)] = (ids[index], {"http": url, "https": url})
+        return index, cached[1]
 
     @contextmanager
     def connection(self, url):
@@ -3862,6 +3909,7 @@ class HostConnections:
         if not limit or not (limit["direct"] or source_ips):
             yield {}
             return
+        session_index = None
         with self._cond:
             while True:
                 ip = min(source_ips or (None,), key=lambda i: self._in_use[(host, "direct", i)])
@@ -3869,7 +3917,12 @@ class HostConnections:
                     slot, request = (host, "direct", ip), ({"source_ip": ip} if ip else {})
                 elif (limit["proxy"] and self._in_use[(host, "proxy")] < limit["proxy"]
                       and self._proxy_for(host, limit)):
-                    slot, request = (host, "proxy"), {"proxies": self._proxy_for(host, limit)}
+                    slot = (host, "proxy")
+                    if limit.get("proxy_session_per_connection"):
+                        session_index, proxies = self._take_session(host, limit)
+                    else:
+                        proxies = self._proxy_for(host, limit)
+                    request = {"proxies": proxies}
                 else:
                     if interrupted.is_set():
                         raise DownloadInterrupted(f"等 {host} 连接名额时{_INTERRUPTED_ERROR}")
@@ -3882,9 +3935,18 @@ class HostConnections:
                 break
         try:
             yield request
+        except Exception as exc:
+            # 按 IP 限流的主机：这个出口 IP 被限了，给这个编号换个 session（下次用它就是新 IP）。
+            if session_index is not None and _status_in_chain(exc) == 429:
+                with self._cond:
+                    self._session_ids[host][session_index] = secrets.token_hex(6)
+                    self.rotated[host] += 1
+            raise
         finally:
             with self._cond:
                 self._in_use[slot] -= 1
+                if session_index is not None:
+                    self._session_busy[host].discard(session_index)
                 self._cond.notify()
 
     def summary(self):
@@ -3892,7 +3954,9 @@ class HostConnections:
         if not (direct or proxy):
             return ""
         ips = "、".join(f"{ip} {n} 次" for ip, n in self.served_ips.items())
-        return f"限流主机分片请求：直连 {direct} 次{f'（{ips}）' if ips else ''}、经代理 {proxy} 次"
+        rotated = sum(self.rotated.values())
+        return (f"限流主机分片请求：直连 {direct} 次{f'（{ips}）' if ips else ''}、经代理 {proxy} 次"
+                + (f"（回 429 换出口 IP {rotated} 次）" if rotated else ""))
 
 
 HOST_CONNECTIONS = HostConnections()
