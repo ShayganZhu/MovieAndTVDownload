@@ -277,7 +277,8 @@ def test_shipped_host_limits():
                                                       "path_max_episodes": {"/fine/": 8}},
                                   "armadilloscp.workers.dev": {"max_episodes": 48, "source_ips": "env:TV_SOURCE_IPS",
                                                                "backfill_max_parked": 200},
-                                  "hakunaymatata.com": {"max_episodes": 64}}
+                                  "hakunaymatata.com": {"max_episodes": 64, "source_ips": "env:TV_VIDLINK_SOURCE_IPS",
+                                                        "direct_connections": "env:TV_VIDLINK_MAX_CONNECTIONS"}}
     # 🔴 belfast 不能限连接数：总速度随连接数线性增长，限 200 条时 Orion 掉了约 80%（2026-11-02）。
     orion = d._parse_host_limits(cfg["host_limits"])["armadilloscp.workers.dev"]
     assert (orion["direct"], orion["proxy"]) == (0, 0)
@@ -681,3 +682,101 @@ def test_bound_session_really_sends_from_the_source_ip():
     assert adapter.poolmanager.connection_pool_kw["source_address"] == ("127.0.0.1", 0)
     assert d.get_session("127.0.0.1") is not d.get_session(), "默认出口的会话不受影响"
     assert "source_address" not in d.get_session().get_adapter("https://example.com").poolmanager.connection_pool_kw
+
+
+# ------------------------------------------------------------ vidlink mp4 也按 host_limits 挑出口 IP、受连接上限约束
+
+VID = "bcdn.hakunaymatata.com"
+
+
+class _Resp:
+    def __init__(self, status, body=b""):
+        self.status_code, self.content, self.headers = status, body, {"Content-Range": f"bytes 0-0/{len(body) or 1000}"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code}", response=self)
+
+    def iter_content(self, chunk_size=None):
+        yield self.content
+
+
+def _fake_sessions(monkeypatch, calls, body=b"\x00" * 16):
+    class _S:
+        def __init__(self, ip):
+            self.ip = ip
+
+        def request(self, method, url, **kw):
+            calls.append((self.ip, "proxies" in kw))
+            return _Resp(206, body)
+
+        def get(self, url, **kw):
+            calls.append((self.ip, "proxies" in kw))
+            return _Resp(206, body)
+
+    def get_session(source_ip=None):
+        return _S(source_ip)
+
+    monkeypatch.setattr(d, "get_session", get_session)
+
+
+def test_int_setting_reads_env_and_defaults_to_unlimited(monkeypatch):
+    monkeypatch.setenv("TEST_CAP", "64")
+    assert d._int_setting("env:TEST_CAP") == 64
+    monkeypatch.delenv("TEST_CAP")
+    assert d._int_setting("env:TEST_CAP") == 0
+    assert (d._int_setting(16), d._int_setting(None), d._int_setting("x"), d._int_setting(-3)) == (16, 0, 0, 0)
+
+
+def test_shipped_vidlink_limits_follow_env(monkeypatch):
+    import os
+
+    import yaml
+
+    raw = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
+                              encoding="utf-8"))["download_tv"]["host_limits"]
+    monkeypatch.delenv("TV_VIDLINK_SOURCE_IPS", raising=False)
+    monkeypatch.delenv("TV_VIDLINK_MAX_CONNECTIONS", raising=False)
+    plain = d._parse_host_limits(raw)["hakunaymatata.com"]
+    assert (plain["source_ips"], plain["direct"], plain["max_episodes"]) == ([], 0, 64), "没配的机器与原来一样"
+    monkeypatch.setenv("TV_VIDLINK_SOURCE_IPS", "127.0.0.1")
+    monkeypatch.setenv("TV_VIDLINK_MAX_CONNECTIONS", "64")
+    on19 = d._parse_host_limits(raw)["hakunaymatata.com"]
+    assert (on19["source_ips"], on19["direct"], on19["max_episodes"], on19["extra_episodes"]) == (["127.0.0.1"], 64, 64, 0)
+    assert on19["proxy"] == 0, "vidlink 不走代理"
+
+
+def test_mp4_chunk_probe_and_caption_go_out_from_the_source_ip(monkeypatch):
+    limits = {"hakunaymatata.com": {"max_episodes": 64, "direct": 2, "proxy": 0, "proxy_spec": "",
+                                    "source_ips": ["10.0.0.9"]}}
+    monkeypatch.setattr(d, "HOST_CONNECTIONS", d.HostConnections(limits=limits))
+    monkeypatch.setattr(d, "validate_segment_content", lambda content, url: None)
+    calls = []
+    _fake_sessions(monkeypatch, calls, body=b"\x00" * 16)
+    assert d._download_mp4_chunk(f"https://{VID}/a.mp4", {}, 0, 15, 0) == b"\x00" * 16
+    d._mp4_probe_total_size(f"https://{VID}/a.mp4", {}, None)
+    d._fetch_caption_text({"url": f"https://{VID}/a.vtt"})
+    d._download_mp4_chunk("https://other.example/a.mp4", {}, 0, 15, 0)
+    assert calls == [("10.0.0.9", False)] * 3 + [(None, False)], "限流主机走配好的出口 IP，别的主机照旧"
+    assert d.HOST_CONNECTIONS._in_use[("hakunaymatata.com", "direct", "10.0.0.9")] == 0, "名额都还了"
+
+
+def test_mp4_chunks_wait_for_the_connection_cap():
+    limits = {"hakunaymatata.com": {"max_episodes": 64, "direct": 1, "proxy": 0, "proxy_spec": "",
+                                    "source_ips": ["10.0.0.9"]}}
+    conns = d.HostConnections(limits=limits, proxy_url=lambda spec: pytest.fail("vidlink 不该走代理"))
+    got = []
+    with conns.connection(f"https://{VID}/a.mp4") as first:
+        assert first == {"source_ip": "10.0.0.9"}
+        th = threading.Thread(target=lambda: got.append(conns.connection(f"https://{VID}/b.mp4").__enter__()))
+        th.start()
+        th.join(0.5)
+        assert not got, "上限 1 条：第二块等着"
+    th.join(5)
+    assert got == [{"source_ip": "10.0.0.9"}]

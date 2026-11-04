@@ -886,6 +886,13 @@ download_tv:
     # 触发它全局 429 的 ~1400 条。64 集 × 16 = 1024 条，与提槽位之前的上限相同。
     hakunaymatata.com:
       max_episodes: 64
+      # 2026-11-04（用户定，只在 19 号机配）：hakunaymatata 按客户端 IP 限速，19 号机重启后主 IP 拉同一条
+      # 链接 8 MB 只有 0.6 Mbps（读超时 14 → 353 次、0 集上传），第二个 IP 是 104.6 Mbps、24 号机 37 Mbps。
+      # 19 号机 .env 写 TV_VIDLINK_SOURCE_IPS=<第二个 IP>（只走它）、TV_VIDLINK_MAX_CONNECTIONS=64
+      # （用户要求并发调低：主 IP 被限时有 245 条连接在它上面）。没配这两个变量的机器与原来完全一样（不限、默认 IP）。
+      # 写一个 IP 时集数上限不变；写两个 IP 会按 IP 翻倍集数并另加槽位（见 source_ips 说明），这里别那样配。
+      source_ips: env:TV_VIDLINK_SOURCE_IPS
+      direct_connections: env:TV_VIDLINK_MAX_CONNECTIONS
   # 派发闸门里因主机集数上限排队的集最多这么多，满了就不再从来源往外拿（取流随之降速）。
   max_parked_episodes: 20000
   # 🔴 2026-10-30 由 8 提到 30：sun.finalsignal.top 过载时会成片回 502（连接一多就有），8 次连续

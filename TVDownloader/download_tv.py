@@ -530,7 +530,8 @@ TRANSIENT_REQUEUE_JITTER_SECONDS = max(0.0, float(_TRANSIENT_REQUEUE_RAW.get("ji
 # 键可以写父域（见 _host_rule_key）：finalsignal.top 管 sun / sun1 / sun2 等全部子域，共用一份名额。
 #   max_episodes       同时在下这台主机的集数上限（按条目的第一个节点算），满了的集在派发闸门里
 #                      排队、不占下载槽位，其余槽位留给别的主机（vidlink 的 mp4）；0 = 不限
-#   direct_connections 分片直连的连接上限（不出 502 的量）；0 = 不限（也不走代理）
+#   direct_connections 分片直连的连接上限（不出 502 的量）；0 = 不限（也不走代理）。可写 env:变量名 从 .env 读
+#                      （没配 = 0），只想在某台机器上限的时候用。mp4 直链（探测、预检、分块）同样占这里的名额
 #   proxy_connections  直连名额满了之后经代理的连接上限；0 = 不走代理、等直连名额
 #   proxy              residential = 取流那套住宅代理（tv_ids_to_links.proxy + .env 的账号）；
 #                      env:变量名 = 从 .env / 环境变量读代理 URL（含账号的 URL 别写进配置）
@@ -570,6 +571,16 @@ def _source_ips(spec):
     return ips
 
 
+def _int_setting(value):
+    """整数配置项；写成 env:变量名 时从 .env / 环境变量读，没配或不是数字按 0（= 不限）。"""
+    if isinstance(value, str) and value.strip().startswith("env:"):
+        value = os.environ.get(value.strip()[4:].strip(), "")
+    try:
+        return max(0, int(str(value).strip() or 0))
+    except ValueError:
+        return 0
+
+
 def _parse_host_limits(raw):
     limits = {}
     for host, limit in (raw or {}).items():
@@ -580,7 +591,7 @@ def _parse_host_limits(raw):
             "max_episodes": max_episodes * max(1, len(source_ips)),
             "extra_episodes": max_episodes * max(0, len(source_ips) - 1),
             "source_ips": source_ips,
-            "direct": max(0, int(limit.get("direct_connections") or 0)),
+            "direct": _int_setting(limit.get("direct_connections")),
             "proxy": max(0, int(limit.get("proxy_connections") or 0)),
             "proxy_spec": str(limit.get("proxy") or "residential").strip(),
             "proxy_session_per_connection": bool(limit.get("proxy_session_per_connection")),
@@ -3052,8 +3063,9 @@ def _fetch_caption_text(caption):
     # headers 与各自源站的 CDN 鉴权强绑定（peakstorm 要 Referer、
     # hakunaymatata 拒绝 Referer），取流侧已按源站算好，此处原样带上。
     headers = dict(caption.get("headers") or {})
-    with get_session().get(
-        url, timeout=SUBTITLE_TIMEOUT, headers=headers or None, stream=True
+    # vidlink 的字幕也在 hakunaymatata 上：与 mp4 一样按 host_limits 挑出口 IP（19 号机主 IP 被它限速）。
+    with HOST_CONNECTIONS.connection(url) as route, _mp4_route_session(route).get(
+        url, timeout=SUBTITLE_TIMEOUT, headers=headers or None, stream=True, **_route_proxies(route)
     ) as response:
         response.raise_for_status()
         chunks = []
@@ -4514,6 +4526,17 @@ def _probe_duration(path):
         return None
 
 
+def _mp4_route_session(route):
+    """HostConnections 给的出口：source_ip 就用从这个本机 IP 发出的线程 Session，否则用默认的。"""
+    ip = route.get("source_ip")
+    return get_session(ip) if ip else get_session()
+
+
+def _route_proxies(route):
+    """HostConnections 给了代理就带上；没给时不传 proxies（与旧版完全一致）。"""
+    return {"proxies": route["proxies"]} if route.get("proxies") else {}
+
+
 def _mp4_probe_total_size(url, headers, declared_size):
     """用 Range: bytes=0-0 探测直链总长并验证 Range 支持。
 
@@ -4528,14 +4551,13 @@ def _mp4_probe_total_size(url, headers, declared_size):
         raise RuntimeError(
             f"{_MP4_HOST_BLOCKED_MARKER}（{_host_of(url)}），跳过该节点: {url}"
         )
-    session = get_session()
     request_headers = dict(HEADERS)
     request_headers.update(headers)
     request_headers["Range"] = "bytes=0-0"
     range_ok = False
     try:
-        with session.request(
-            "GET", url, headers=request_headers, timeout=30, stream=True
+        with HOST_CONNECTIONS.connection(url) as route, _mp4_route_session(route).request(
+            "GET", url, headers=request_headers, timeout=30, stream=True, **_route_proxies(route)
         ) as response:
             status = response.status_code
             if status in (403, 410):
@@ -4591,11 +4613,12 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
         if _aborted():
             raise RuntimeError(f"直链块 {index + 1} 已取消（整片已判失败）")
         try:
-            session = get_session()
             merged = dict(HEADERS)
             merged.update(request_headers)
-            with session.request(
-                "GET", url, headers=merged, timeout=60
+            # 限流主机（host_limits）的直链块也占连接名额、按 source_ips 挑出口 IP（2026-11-04，19 号机主 IP
+            # 被 hakunaymatata 限到 0.6 Mbps，第二个 IP 104 Mbps）；没配的主机原样直连。
+            with HOST_CONNECTIONS.connection(url) as route, _mp4_route_session(route).request(
+                "GET", url, headers=merged, timeout=60, **_route_proxies(route)
             ) as response:
                 status = response.status_code
                 if status in (403, 410):
