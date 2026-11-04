@@ -409,12 +409,35 @@ def test_backfill_result_stops_waiting_on_shutdown(monkeypatch):
 
 # ------------------------------------------------- main 的接线
 
-def test_recheck_dead_is_rejected_in_pipeline_mode(monkeypatch):
-    """--recheck-dead 只复查历史真无源集、不产出新任务，与流水线语义冲突。"""
+def test_recheck_dead_runs_in_pipeline_mode_and_streams_results(monkeypatch):
+    """2026-11-04：--recheck-dead 透传给取流侧，重问到的链接经 on_result 当场进下载队列。"""
     monkeypatch.setattr(p.sys, "argv", ["pipeline.py", "--recheck-dead"])
-    with pytest.raises(SystemExit) as ei:
-        p.main()
-    assert "--recheck-dead" in str(ei.value)
+    seen = {}
+
+    def fake_fetch(argv=None, on_result=None, stop_event=None):
+        seen["argv"] = argv
+        on_result(_ep("7", 1, 3))
+
+    monkeypatch.setattr(p.fetcher, "main", fake_fetch)
+    got = []
+
+    def fake_download_main():
+        source = p.downloader.ListEntrySource([])
+        deadline = time.time() + 5
+        while time.time() < deadline and not got:
+            kind, entry = source.poll()
+            if kind == "item":
+                got.append(entry)
+            elif kind == "done":
+                break
+            else:
+                time.sleep(0.01)
+
+    monkeypatch.setattr(p.downloader, "main", fake_download_main)
+    p.main()
+
+    assert seen["argv"] == ["--recheck-dead"]
+    assert [e["tmdbId"] for e in got] == ["7"]
 
 
 def test_bad_argv_fails_before_any_thread_starts(monkeypatch):

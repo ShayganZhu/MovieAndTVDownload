@@ -603,13 +603,9 @@ def stop_on_interrupt(stop_event, interrupted, poll_seconds=0.5):
 
 def main():
     argv = sys.argv[1:]
-    if "--recheck-dead" in argv:
-        raise SystemExit(
-            "pipeline 模式不支持 --recheck-dead（它是串行模式下的人工补救入口，"
-            "只复查历史真无源集、不产出新任务）。\n"
-            "请单独运行 python tv_ids_to_links.py --recheck-dead，"
-            "跑完后再用 pipeline 或 download_tv 消费结果。"
-        )
+    # --recheck-dead（2026-11-04 起允许，用户定）：取流侧只重问 fail.txt 里集级无源的集，原样透传过去；
+    # 重问到的链接经 on_result 当场入队下载，不必等单独跑完再消费——vidup / vidfast 的链接几小时就过期，
+    # 单独跑一两天下来大多得再重取一遍。仍无源的不重复写 fail.txt。到期重取、异步重取照常工作。
 
     # ⚠️ 必须在起线程**之前**校验参数。argv 是原样透传给取流侧的，若等到取流
     # 线程里 argparse 才发现打错（如 --typo），那时下载侧已经开跑了：它会拿着
