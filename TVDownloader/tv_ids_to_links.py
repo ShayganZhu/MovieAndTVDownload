@@ -2328,6 +2328,15 @@ def _parse_args(argv):
     return parser.parse_args(argv)
 
 
+def fetch_max_workers():
+    """取流并发：.env / 环境变量 TV_FETCH_MAX_WORKERS（正整数）覆盖 config 的 max_workers。
+    只想在某台机器上调时用（2026-11-05 19 号机 --recheck-dead 用 64，用户要求比 200 低）；没配照旧。"""
+    raw = os.environ.get("TV_FETCH_MAX_WORKERS", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return _CFG.get("max_workers", 50)
+
+
 def main(argv=None, on_result=None, stop_event=None):
     """取流主流程。
 
@@ -2450,8 +2459,9 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
         print("All episodes processed.")
         return
 
-    max_workers = _CFG.get("max_workers", 50)
+    max_workers = fetch_max_workers()
     max_rounds = _CFG.get("max_rounds", 8)
+    print(f"取流并发 {max_workers}", flush=True)
 
     # ---- 内嵌多轮捞回：首轮跑全部，之后每轮只重跑上一轮“瞬时耗尽”的集 ----
     pending = to_process

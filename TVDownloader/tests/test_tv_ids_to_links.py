@@ -2033,3 +2033,15 @@ def test_process_episode_carries_tmdb_episode_runtime(monkeypatch):
     monkeypatch.setattr(m, "_EPISODE_RUNTIMES", {})
     status, other = m.process_episode("42", 2, 3)
     assert status == "ok" and "episode_runtime_minutes" not in other
+
+
+def test_fetch_max_workers_env_overrides_config(monkeypatch):
+    import tv_ids_to_links as t
+
+    monkeypatch.delenv("TV_FETCH_MAX_WORKERS", raising=False)
+    assert t.fetch_max_workers() == t._CFG.get("max_workers", 50), "没配照旧用 config"
+    monkeypatch.setenv("TV_FETCH_MAX_WORKERS", "64")
+    assert t.fetch_max_workers() == 64
+    for bad in ("0", "-5", "abc", " "):
+        monkeypatch.setenv("TV_FETCH_MAX_WORKERS", bad)
+        assert t.fetch_max_workers() == t._CFG.get("max_workers", 50), f"非法值 {bad!r} 不生效"
