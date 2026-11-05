@@ -231,7 +231,7 @@ def test_shipped_config():
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(d.__file__), "config.yaml"),
                               encoding="utf-8"))["download_tv"]
     assert cfg["host_circuit_hold_max_per_episode"] == 20
-    assert cfg["link_health"]["vidlink_cache_roll_hours"] == 49
+    assert cfg["link_health"]["vidlink_cache_roll_hours"] == 24
     assert cfg["link_health"]["broken_vidlink_hosts"] == ["bcdnxw.hakunaymatata.com"]
     assert cfg["link_health"]["signed_link_max_age_hours"] == {"bcdn4.hakunaymatata.com": 24}
 
