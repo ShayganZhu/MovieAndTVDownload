@@ -1814,6 +1814,29 @@ def load_dead_episodes(results_file, fail_file):
     return dead_eps - _load_ok_keys(results_file)
 
 
+def load_recheck_asked(ledger, max_age_hours, now=None):
+    """--recheck-dead 进度账本里 max_age_hours 小时内问过、仍无源的集（2026-11-05）。
+
+    复查仍无源的集不写 fail.txt（旧行已在），别处没有痕迹；没有这本账，重启就得从头再问一遍
+    （每台 45 万集、按 ids.txt 顺序，跑了 10 小时的进度全白费）。账本每行 "tid\\ts\\te\\t时间戳"，
+    格式坏的行跳过。max_age_hours ≤ 0 表示不跳过。"""
+    asked = set()
+    if max_age_hours <= 0 or not ledger.exists():
+        return asked
+    cutoff = (time.time() if now is None else now) - max_age_hours * 3600
+    with open(ledger, encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 4:
+                continue
+            try:
+                if float(parts[3]) >= cutoff:
+                    asked.add((parts[0], int(parts[1]), int(parts[2])))
+            except ValueError:
+                continue
+    return asked
+
+
 def _is_unaired(air_date, today, ended, grace_days=None):
     """判断一集是否尚未播出 / 尚在上架宽限期（源站必然或大概率无源，本次跳过、不写 fail.txt，下次运行再纳入）。
     - air_date + grace_days 晚于今天 → 未播出（含刚播出但源站尚未上架的窗口）
@@ -1898,13 +1921,14 @@ def append_result(results_file, result):
 
 
 def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True,
-              on_result=None, stop_event=None, deferred_out=None):
+              on_result=None, stop_event=None, deferred_out=None, recheck_ledger=None):
     """并发处理一批集，实时落盘 ok/dead，返回本批“瞬时耗尽”待重跑的三元组列表。
     deferred_out（可选 dict）：因源熔断推迟的集（见 process_episode 的 deferred）写进这里，
     键为 (tid, s, e)、值为熔断中没问到的源列表。它们既不落 fail.txt、也不计入连续判死，
     由 _main_impl 在源恢复后放回下一轮、跑完仍推迟的写进 provider_down_file。
     不传时推迟的集按 retry 收集（与电影侧同口径）。
-    write_dead=False（--recheck-dead 模式）：仍无源的集不再重复写 fail.txt（旧行已在），且不启用熔断。
+    write_dead=False（--recheck-dead 模式）：仍无源的集不再重复写 fail.txt（旧行已在），且不启用熔断；
+    给了 recheck_ledger 就改记进这本进度账（见 load_recheck_asked），重启时跳过。
     熔断：连续 DEAD_STREAK_BREAKER 集 dead（无任何成功间隔）→ 暂停落盘、复探金丝雀；
     金丝雀存活或无法判断则清零继续，明确失败则回滚窗口内 fail 行并抛 DeadStreakBreaker。
 
@@ -2010,6 +2034,9 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True,
                 if write_dead:
                     with open(fail_file, 'a', encoding='utf-8') as f:
                         f.write(f"{tid}\t{s}\t{e}\n")
+                elif recheck_ledger is not None:
+                    with open(recheck_ledger, 'a', encoding='utf-8') as f:
+                        f.write(f"{tid}\t{s}\t{e}\t{int(time.time())}\n")
                 print(f"❌ DEAD: {label}")
                 if breaker_on:
                     dead_streak.append(item)
@@ -2367,6 +2394,7 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
     fail_file = _resolve(_CFG.get("fail_file", "fail.txt"))
     provider_down_file = _resolve(_CFG.get("provider_down_file", "provider_down.txt"))
     cache_file = _resolve(_CFG.get("seasons_cache", "seasons_cache.jsonl"))
+    recheck_ledger = _resolve(_CFG.get("recheck_ledger", "recheck_dead_asked.tsv"))
 
     if not ids_file.exists():
         print(f"{ids_file} not found!")
@@ -2449,6 +2477,13 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
              if k[0] in order and k[0] not in dead_shows),
             key=lambda k: (order[k[0]], k[1], k[2]),
         )
+        skip_hours = float(_CFG.get("recheck_skip_hours", 168))
+        asked = load_recheck_asked(recheck_ledger, skip_hours)
+        if asked:
+            before = len(to_process)
+            to_process = [k for k in to_process if k not in asked]
+            print(f"[recheck-dead] {recheck_ledger.name} 里 {skip_hours:g} 小时内已问过、仍无源："
+                  f"{before - len(to_process)} 集，跳过")
         print(f"[recheck-dead] 待复查真无源集: {len(to_process)}")
 
     print(f"Total shows: {len(ids)} | Total episodes: {total_eps} | "
@@ -2483,7 +2518,8 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
             retry_items = run_batch(pending, results_file, fail_file, max_workers,
                                     write_dead=not args.recheck_dead,
                                     on_result=on_result, stop_event=stop_event,
-                                    deferred_out=deferred)
+                                    deferred_out=deferred,
+                                    recheck_ledger=recheck_ledger if args.recheck_dead else None)
         except DeadStreakBreaker as e:
             print(f"\n{'!' * 70}\n==> 熔断退出：{e}\n"
                   f"    本窗口的 fail 行已回滚，其余未结算的集下次运行自动续跑；"

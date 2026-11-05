@@ -199,6 +199,10 @@ tv_ids_to_links:
   dead_streak_breaker: 500
   # 死集复查：源站后补上架或历史误判的集，可运行 `python tv_ids_to_links.py --recheck-dead`
   # 只重探 fail_file 中集级真无源且至今未成功的集；成功追加 output，仍无源不重复写 fail_file。
+  # 进度账本（2026-11-05）：复查仍无源的集记一行进 recheck_ledger，重启时跳过 recheck_skip_hours
+  # 小时内问过的集（它们不写 fail_file，没有账本的话重启会从头再问）。要整轮重来就删账本或把小时数设 0。
+  recheck_ledger: recheck_dead_asked.tsv
+  recheck_skip_hours: 168
   # ---- 多轮捞回：整批跑完后对“瞬时耗尽”的集自动重跑，直到清零或达上限 ----
   #   - 单集在 process_episode 内换 IP 重试 max_retries 次仍失败(瞬时耗尽) → 下一轮重跑；
   #   - 真无源404 → 永久排除，绝不再抓（注意：是“这一集”无源，不影响同剧其它集）；

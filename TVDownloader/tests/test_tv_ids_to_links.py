@@ -3,6 +3,7 @@
 import json
 import os
 import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -1721,6 +1722,99 @@ def test_main_recheck_dead_mode(tmp_path, monkeypatch):
     m.main(["--recheck-dead"])
     assert calls == [([("1", 1, 2), ("1", 1, 9)], False)]
     assert names == {"1": "One"}   # 复查模式仍填充 title 回退表
+
+
+def test_main_recheck_dead_skips_episodes_in_ledger(tmp_path, monkeypatch):
+    """重启续跑：进度账本里 recheck_skip_hours 内问过的集跳过，过期的照常重问，账本路径传给 run_batch。"""
+    ids = tmp_path / "ids.txt"
+    ids.write_text("1\n", encoding="utf-8")
+    results = tmp_path / "r.jsonl"
+    fail = tmp_path / "f.txt"
+    fail.write_text("1\t1\t1\n1\t1\t2\n1\t1\t3\n", encoding="utf-8")
+    ledger = tmp_path / "asked.tsv"
+    now = int(time.time())
+    ledger.write_text(f"1\t1\t1\t{now - 60}\n1\t1\t2\t{now - 3 * 3600}\n", encoding="utf-8")
+    monkeypatch.setattr(m, "_CFG", {
+        "input": str(ids), "output": str(results), "fail_file": str(fail),
+        "seasons_cache": str(tmp_path / "c.jsonl"), "recheck_ledger": str(ledger),
+        "recheck_skip_hours": 2,
+    })
+    monkeypatch.setattr(m, "expand_seasons", lambda *a, **kw: {
+        "1": {"tmdbId": "1", "name": "One", "seasons": [{"season": 1, "episodes": [1, 2, 3]}]}})
+    monkeypatch.setattr(m, "_SERIES_META", {})
+    monkeypatch.setattr(m, "_TMDB_NAMES", {})
+    calls = []
+
+    def fake_batch(pending, rf, ff, mw, write_dead=True, recheck_ledger=None, **kw):
+        calls.append((list(pending), write_dead, recheck_ledger))
+        return []
+
+    monkeypatch.setattr(m, "run_batch", fake_batch)
+    m.main(["--recheck-dead"])
+    # 1:1:1 一分钟前问过 → 跳过；1:1:2 三小时前问过，超出 2 小时窗口 → 重问；1:1:3 没问过 → 重问
+    assert calls == [([("1", 1, 2), ("1", 1, 3)], False, ledger)]
+
+
+def test_main_normal_mode_passes_no_ledger(tmp_path, monkeypatch):
+    ids = tmp_path / "ids.txt"
+    ids.write_text("1\n", encoding="utf-8")
+    monkeypatch.setattr(m, "_CFG", {
+        "input": str(ids), "output": str(tmp_path / "r.jsonl"), "fail_file": str(tmp_path / "f.txt"),
+        "seasons_cache": str(tmp_path / "c.jsonl"), "recheck_ledger": str(tmp_path / "asked.tsv"),
+    })
+    monkeypatch.setattr(m, "expand_seasons", lambda *a, **kw: {
+        "1": {"tmdbId": "1", "name": "One", "seasons": [{"season": 1, "episodes": [1]}]}})
+    monkeypatch.setattr(m, "_SERIES_META", {})
+    monkeypatch.setattr(m, "_TMDB_NAMES", {})
+    calls = []
+
+    def fake_batch(pending, rf, ff, mw, write_dead=True, recheck_ledger=None, **kw):
+        calls.append((write_dead, recheck_ledger))
+        return []
+
+    monkeypatch.setattr(m, "run_batch", fake_batch)
+    m.main([])
+    assert calls == [(True, None)]
+
+
+def test_load_recheck_asked_window_and_bad_lines(tmp_path):
+    ledger = tmp_path / "asked.tsv"
+    now = 1_800_000_000
+    ledger.write_text(
+        f"1\t1\t1\t{now - 10}\n"          # 窗口内
+        f"1\t1\t2\t{now - 7200}\n"        # 窗口外（1 小时窗口）
+        "1\t1\t3\n"                        # 少一列
+        f"1\tx\t4\t{now}\n"                # 季不是整数
+        "1\t1\t5\tnot-a-time\n"            # 时间戳坏了
+        f"2\t3\t4\t{now}\n",
+        encoding="utf-8")
+    assert m.load_recheck_asked(ledger, 1, now=now) == {("1", 1, 1), ("2", 3, 4)}
+    assert m.load_recheck_asked(ledger, 0, now=now) == set()
+    assert m.load_recheck_asked(tmp_path / "missing.tsv", 1, now=now) == set()
+
+
+def test_run_batch_recheck_writes_progress_ledger(tmp_path, monkeypatch):
+    """复查仍无源的集记进账本（不写 fail.txt）；有链接的集不记（它们在 results.jsonl 里）。"""
+    results = tmp_path / "r.jsonl"
+    fail = tmp_path / "f.txt"
+    fail.write_text("1\t1\t1\n1\t1\t2\n", encoding="utf-8")
+    ledger = tmp_path / "asked.tsv"
+
+    def fake(tid, s, e):
+        if e == 2:
+            return "ok", {"urls": [{"url": "https://x/y.m3u8"}], "tmdbId": tid, "season": s,
+                          "episode": e, "title": "T"}
+        return "dead", None
+
+    monkeypatch.setattr(m, "process_episode", fake)
+    before = int(time.time())
+    m.run_batch([("1", 1, 1), ("1", 1, 2)], results, fail, max_workers=1, write_dead=False,
+                recheck_ledger=ledger)
+    rows = [line.split("\t") for line in ledger.read_text(encoding="utf-8").splitlines()]
+    assert [r[:3] for r in rows] == [["1", "1", "1"]]
+    assert int(rows[0][3]) >= before
+    assert fail.read_text(encoding="utf-8") == "1\t1\t1\n1\t1\t2\n"
+    assert m.load_recheck_asked(ledger, 1) == {("1", 1, 1)}
 
 
 def test_run_batch_recheck_does_not_rewrite_dead(tmp_path, monkeypatch):
